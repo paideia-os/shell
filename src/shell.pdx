@@ -1,0 +1,228 @@
+// src/shell.pdx -- shell.M1-001 (paideia-os/shell#1)
+//
+// Shell module: top-level scaffold + constants + stats.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The M1 substrate for the shell binary. Owns:
+//
+//   * KIND ordinal mirrors (SH_KIND_*) so shell modules do not need to
+//     link paideia-os's kernel .o graph to name the KINDs the shell
+//     handles. Redeclared here for the same reason libpdx-elevate
+//     mirrors ELV_* -- the M4 smoke matrix catches any drift between
+//     the mirrored values here and the authoritative kernel values.
+//
+//   * The shell's error band (SH_* 0xFFFFECxx). Disjoint from the
+//     libpdx-cap band (0xFFFFFFxx), the libpdx-elevate band
+//     (0xFFFFEAxx / 0xFFFFE5Exx), and the kernel errno band
+//     (-EFAULT = 0xFFFFFFFFFFFFFFF2 ...). The high two bytes of the
+//     return tell a downstream consumer which layer refused.
+//
+//   * An eight-slot _shell_stats counter table with bounded increment
+//     + bounded read (shell_note, shell_stat). Same shape as
+//     ElevateBroker._elevate_broker_stats (paideia-os
+//     src/kernel/core/ipc/elevate_broker.pdx:70) and libpdx-elevate's
+//     _elevate_client_stats. Cache-line aligned so a future SMP
+//     variant of the counter path does not straddle a line.
+//
+//   * shell_reset() -- clears the counter table. Startup + teardown
+//     only.
+//
+// =============================================================================
+// WHAT M1 IS DELIBERATELY NOT
+// =============================================================================
+//
+// M1 does NOT ship the _start entry frame -- the loader convention that
+// binds argv/envp/InitCap to a userspace binary lands with the R14b
+// paideia-os bootstrap; the shell repo's _start lands at M2 alongside
+// the pipeline mint (M2-002). M1 ships the three modules the run loop
+// calls, so a later _start is a wiring job, not a design job.
+//
+// M1 does NOT allocate. Every buffer is caller-owned. Every counter
+// lives in .bss. This mirrors libpdx-cap M1 discipline -- the shell's
+// M1 has no reason to differ.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Shell`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (SH_ST_MAX = 8 fits
+//     easily; the KIND ordinals and error codes are `mov rax, imm32`
+//     emissions, not compares).
+//   - r11 is scratch (paideia-as conformance) and appears in every
+//     `lea r11, [rip + sym]` .bss reach.
+//   - No byte reads in this module; the `xor rax, rax; mov_b rax, [ptr]`
+//     pattern lands at M2 when line_reader consumes KIND_TTY bytes.
+//   - shell_reset and shell_note / shell_stat are leaf functions --
+//     no push/pop parity to preserve.
+
+module Shell = structure {
+
+  // ==========================================================================
+  // KIND ordinal mirrors
+  //
+  // Mirror the authoritative values in paideia-os:
+  //   SH_KIND_IPC_ENDPOINT      src/kernel/core/cap/kind.pdx:72
+  //   SH_KIND_USER              src/kernel/core/cap/kind_user.pdx:122
+  //   SH_KIND_ELEVATE_CHANNEL   src/kernel/core/cap/kind_elevate_channel.pdx:80
+  //   SH_KIND_PDXFS_FILE        src/kernel/core/cap/kind_pdxfs_file.pdx:82
+  //   SH_KIND_SHELL_SESSION     allocated at shell.M2-001 (derived over USER)
+  //   SH_KIND_TTY               placeholder ordinal 0x196 -- reserved for
+  //                             the KIND_TTY landing in a paideia-os round
+  //                             adjacent to R49 (kind_tty.pdx has not
+  //                             landed at HEAD 2026-08-21). The shell
+  //                             repo's caps.decl names it symbolically,
+  //                             and this constant is the numeric hook
+  //                             the M2 InitCap sidecar builder will
+  //                             stamp into the wire record. Softarch
+  //                             pins the real ordinal at the KIND_TTY
+  //                             substrate PR; a mismatch is caught at
+  //                             M4 by the smoke matrix.
+  // ==========================================================================
+  pub let SH_KIND_IPC_ENDPOINT    : u64 = 5
+  pub let SH_KIND_USER            : u64 = 0x190
+  pub let SH_KIND_ELEVATE_CHANNEL : u64 = 0x191
+  pub let SH_KIND_SHELL_SESSION   : u64 = 0x194
+  pub let SH_KIND_PDXFS_FILE      : u64 = 0x195
+  pub let SH_KIND_TTY             : u64 = 0x196    // provisional, pin at substrate PR
+
+  // ==========================================================================
+  // Return-code band 0xFFFFECxx (shell layer)
+  //
+  // High two bytes = 0xFFFFEC identify the shell layer to a
+  // downstream consumer. Full table in design/architecture.md §5.
+  // ==========================================================================
+
+  // Generic success -- unused at M1; reserved so consumers can spell
+  // `SH_OK` at their call sites now and get real semantics at M2.
+  pub let SH_OK                  : u64 = 0xFFFFEC00
+
+  // LineReader stubs and errors (0xFFFFEC1x)
+  pub let LR_STUB                : u64 = 0xFFFFEC10   // M1: validated, no live read
+  pub let LR_ERR_BAD_BUF         : u64 = 0xFFFFEC11   // buf == 0 or buf_len == 0
+  pub let LR_ERR_TTY_UNBOUND     : u64 = 0xFFFFEC12   // M2+: KIND_TTY(read) missing
+  pub let LR_ERR_EOF             : u64 = 0xFFFFEC13   // M2+: sys_read returned 0 unexpectedly
+
+  // Exec stubs and errors (0xFFFFEC2x)
+  pub let EX_STUB                : u64 = 0xFFFFEC20   // M1: validated, no live spawn
+  pub let EX_ERR_BAD_ARGV        : u64 = 0xFFFFEC21   // argv == 0 or argv_count == 0
+  pub let EX_ERR_EXECVE_FAIL     : u64 = 0xFFFFEC22   // M2+: sys_execve refused
+  pub let EX_ERR_WAIT_FAIL       : u64 = 0xFFFFEC23   // M2+: sys_wait4 refused
+
+  // ==========================================================================
+  // Session-level stats -- eight u64 slots, cache-line aligned.
+  //
+  // Slot map (M1):
+  //   0 SH_ST_PROMPTS  line_reader_read_line entries
+  //   1 SH_ST_LINES    line_reader_read_line successful returns (M2+)
+  //   2 SH_ST_SPAWNS   exec_spawn_and_wait entries
+  //   3 SH_ST_EXITS    exec_spawn_and_wait successful returns (M2+)
+  //   4 SH_ST_ERRORS   any error / reject path from any shell module
+  //   5..7 reserved    for M2 (pipeline mints, session mints, ...)
+  //
+  // Cache-line alignment matches _elevate_broker_stats / _elevate_
+  // client_stats -- keeps a future SMP counter path a mechanical
+  // widening rather than a re-layout.
+  // ==========================================================================
+  pub let mut _shell_stats : [u64; 8] = uninit @align(64)
+
+  pub let SH_ST_PROMPTS : u64 = 0
+  pub let SH_ST_LINES   : u64 = 1
+  pub let SH_ST_SPAWNS  : u64 = 2
+  pub let SH_ST_EXITS   : u64 = 3
+  pub let SH_ST_ERRORS  : u64 = 4
+  pub let SH_ST_MAX     : u64 = 8
+
+  // ==========================================================================
+  // shell_reset() -> ()
+  //
+  // Clear the eight-word _shell_stats counter table. Called by _start
+  // (M2+) before the run loop, and by tests before each fixture. A
+  // live counter reset would race any concurrent shell_note, so this
+  // is startup + teardown only -- same discipline as
+  // elevate_broker_stats_reset and elevate_client_stats_reset.
+  //
+  // Register plan (leaf):
+  //   r10 = base pointer (loaded once via lea)
+  //   rcx = loop index (0..8)
+  //   rax = zero constant
+  // ==========================================================================
+  pub let shell_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M1-001 (#1): clear the eight-word session stats table. Startup + teardown only; a live counter reset would race any concurrent shell_note (same discipline as elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70, and elevate_client_stats_reset libpdx-elevate/src/elevate_client.pdx). Loop: r10 base, rcx index 0..8, rax = 0. `cmp rcx, 8` uses imm <= 0x7FFFFFFF (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed sh_rs_.",
+      block: {
+        lea r10, [rip + _shell_stats];
+        xor rax, rax;
+        xor rcx, rcx;
+      sh_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  sh_rs_loop;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shell_note(which) -> ()
+  //
+  // Bounded increment of _shell_stats[which]. `which >= SH_ST_MAX` is
+  // a no-op (not an error) so a caller passing a slot from a newer
+  // library snapshot against an older binary snapshot cannot corrupt
+  // live counters. Same shape as elevate_client_note (libpdx-elevate
+  // src/elevate_client.pdx).
+  //
+  // Register plan (leaf):
+  //   rdi = which (input; preserved through jae)
+  //   r10 = base pointer
+  //   rax = counter load / +1 accumulator
+  // ==========================================================================
+  pub let shell_note : (u64) -> () !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M1-001 (#1): bounded increment; out-of-range which is a no-op (not an error sentinel -- a slot that never got incremented reads as 0, which is also the correct 'never touched' value). Same shape as elevate_client_note libpdx-elevate/src/elevate_client.pdx. `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed sh_nt_.",
+      block: {
+        cmp rdi, 8;
+        jae sh_nt_out;
+        lea r10, [rip + _shell_stats];
+        mov rax, [r10 + rdi * 8];
+        add rax, 1;
+        mov [r10 + rdi * 8], rax;
+      sh_nt_out:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shell_stat(which) -> u64
+  //
+  // Bounded read of _shell_stats[which]. `which >= SH_ST_MAX` returns
+  // 0 (not an error sentinel -- see shell_note rationale). Same shape
+  // as elevate_client_stat.
+  //
+  // Register plan (leaf):
+  //   rdi = which
+  //   r10 = base pointer
+  //   rax = return value
+  // ==========================================================================
+  pub let shell_stat : (u64) -> u64 !{mem} @{} =
+    fn (which: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M1-001 (#1): bounded read; out-of-range which returns 0 (0 is both the 'never touched' value and the 'out of range' value -- an explicit sentinel would force the caller to two loads for a distinction they never need). Same shape as elevate_client_stat libpdx-elevate/src/elevate_client.pdx. `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function. Labels prefixed sh_st_.",
+      block: {
+        cmp rdi, 8;
+        jae sh_st_zero;
+        lea r10, [rip + _shell_stats];
+        mov rax, [r10 + rdi * 8];
+        ret;
+      sh_st_zero:
+        xor rax, rax;
+        ret
+      }
+    }
+}

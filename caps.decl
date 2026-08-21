@@ -1,0 +1,57 @@
+# shell — caps.decl
+#
+# Wave: R49 (Wave 1)
+# Doc:  design/tooling/r49-r50-plan.md §5.2 in the paideia-os repo.
+#
+# The shell is the process that reads user commands, spawns tool
+# processes with the caller's cap environment narrowed per each
+# callee's caps.decl, and threads text-and-schema layers through
+# pipes. Its cap footprint at M1 is the minimum a running interactive
+# prompt needs, mirroring the substrate the design doc names in §5.2:
+#
+#   * KIND_USER (0x190, paideia-os src/kernel/core/cap/kind_user.pdx)
+#     — the shell runs as a delegated user; every child inherits the
+#     caller's user identity by default (I6 capability handoff).
+#   * KIND_TTY — the terminal-render binding; the shell holds
+#     KIND_TTY(write) and delegates a sub-cap to each child. The
+#     ordinal is TBD — kind_tty.pdx has not landed at HEAD (2026-08-21
+#     kernel), so the shell M1 caps.decl names KIND_TTY symbolically;
+#     libpdx-cap's caps_decl parser is textual and accepts the name
+#     verbatim. shell.M2-001 pins the ordinal when the KIND lands.
+#   * KIND_IPC_ENDPOINT (5, paideia-os src/kernel/core/cap/kind.pdx:72)
+#     — the pipe substrate the shell mints one of per '|' at M2-002.
+#     M1 declares the requirement so the exec-time manifest_verify
+#     call at M2 does not need a signature change.
+#   * KIND_SHELL_SESSION (0x194, allocated by this repo at M2-001,
+#     derived over KIND_USER) — the shell mints this at session start
+#     and hands sub-caps to `mux` splits and nested `remote`-shell
+#     processes at R56+. M1 pre-declares the requirement so downstream
+#     tooling (audit journal at M3, session lookup at M5) can already
+#     see it in the manifest.
+#
+# InitCap sidecar note. The R20b.M4-001 loader-side InitCap sidecar
+# (paideia-os src/kernel/core/loader/init_caps.pdx) is not itself a
+# KIND — it is the wire format the loader uses to seed a process's
+# cap_table at exec. The shell relies on the sidecar (a child receives
+# its argv-parallel caps that way at M2-002) but does not need to
+# declare it here; the sidecar is a producer of caps, and the caps
+# themselves are what caps.decl names.
+requires:
+- KIND_USER(read)
+- KIND_TTY(write)
+- KIND_IPC_ENDPOINT(mint)
+- KIND_SHELL_SESSION(mint)
+
+# Declared output schemas — the shell emits three schemas over the
+# semantic-pipe substrate. All three are formalised at M3 (schema
+# passthrough + tab completion + audit); M1 pre-declares the names
+# so downstream tooling (query, pipeviz at R59+) can already see
+# them in the manifest.
+#
+# - ShellPromptRecord — one record per interactive prompt (M3-001)
+# - CommandCompletion — one array per tab-completion request (M3-002)
+# - ShellCommandRecord — one record per command exec + wait (M3-003)
+declares_output_schemas:
+- ShellPromptRecord
+- CommandCompletion
+- ShellCommandRecord
