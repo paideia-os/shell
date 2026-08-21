@@ -1,0 +1,166 @@
+// src/line_reader.pdx -- shell.M1-002 (paideia-os/shell#2)
+//
+// LineReader module: interactive line reader against KIND_TTY (skeleton).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The shell's interactive line reader. At full ripeness (M2) this is
+// the loop that reads one keypress at a time from KIND_TTY(read),
+// dispatches it through the semterm engine's line editor
+// (paideia-os src/kernel/core/semterm/line_editor.pdx, R41.M4-002),
+// echoes the resulting screen state to KIND_TTY(write), and returns
+// the committed line to the shell's exec dispatch when the user
+// presses Enter.
+//
+// M1 is the SKELETON. It ships the entry-point signature, the
+// argument-gating (buf non-null, buf_len non-zero), and the
+// counter-bumping so the Shell stats table records every prompt
+// entry / error the way the M2 body will. On the happy path it
+// returns LR_STUB (0xFFFFEC10) -- the "we validated the args, we
+// would render a prompt and read bytes if the KIND_TTY substrate
+// existed, but it doesn't yet" signal. This mirrors
+// libpdx-elevate's ELVC_STUB idiom (see libpdx-elevate/src/
+// elevate_client.pdx §"WHY STUB IS THE HAPPY PATH AT M1"):
+//
+//   * KIND_TTY has not landed in paideia-os at HEAD (2026-08-21);
+//     kind_tty.pdx does not exist. Faking a byte source at M1 would
+//     mean either linking against a canned test buffer (which the
+//     M2 body then has to un-do) or manufacturing bytes the shell
+//     did not actually observe. Neither is defensible under D3
+//     audit-first -- a shell that "reads" a line it didn't read
+//     lies to its own audit journal.
+//
+//   * A skeleton that returns LR_STUB validates every part of the
+//     call graph that is not the substrate boundary: the caller's
+//     buffer, the counter dispatch, the return-code plumbing. M2
+//     flips the KIND_TTY(read) call in one place; every consumer
+//     already spells the entry point correctly.
+//
+// =============================================================================
+// M2 CALL GRAPH (documented, not yet built)
+// =============================================================================
+//
+// At M2, line_reader_read_line will:
+//
+//   (1) Reset the semterm line editor: `call led_reset` (from
+//       paideia-os semterm/line_editor.pdx). This zeroes the buffer,
+//       clears the kill register, primes the history cursor.
+//   (2) Render the prompt into KIND_TTY(write) using shell's
+//       ShellPromptRecord schema (semantic-pipe emission at M3-001;
+//       plain-text echo for M2).
+//   (3) Loop:
+//         - sys_read one byte from KIND_TTY(read) into a 1-byte
+//           scratch slot on the shell's own stack;
+//         - dispatch by byte:
+//             printable ASCII [0x20, 0x7E] -> led_insert(byte);
+//             '\n' (0x0A)                   -> led_history_push;
+//                                              copy led buffer to
+//                                              caller's buf; return
+//                                              copied length.
+//             '\b' (0x08) / 0x7F (DEL)      -> led_backspace;
+//             Ctrl-D (0x04) on empty line   -> return 0 (EOF);
+//             ESC-[ sequences               -> led_left / led_right /
+//                                              led_home / led_end /
+//                                              led_history_up /
+//                                              led_history_down;
+//             Ctrl-K (0x0B)                 -> led_kill_line;
+//             Ctrl-Y (0x19)                 -> led_yank;
+//             any other control byte        -> silently discarded
+//                                              (M3 lands the
+//                                              CommandCompletion tab
+//                                              dispatch on Tab 0x09).
+//         - after each dispatch, redraw the buffer to KIND_TTY(write)
+//           using led_get_at + led_buf_len (or a diff-emit at M3).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`LineReader`), no directory prefix.
+//   - No `test` mnemonic.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares are
+//     `cmp r12, 0` (buf non-null) and `cmp r13, 0` (buf_len non-zero).
+//   - r11 is scratch; not used in M1 (no .bss reach from this module).
+//   - No byte reads; the `xor rax, rax; mov_b rax, [ptr]` pattern
+//     lands at M2 once the sys_read loop consumes KIND_TTY bytes.
+//   - Two callee-save pushes (r12, r13) preserved through one nested
+//     call (shell_note). `sub rsp, 8` on entry balances rsp % 16 for
+//     the SysV call; matched `add rsp, 8` before pop. Same idiom as
+//     libpdx-elevate elevate_client_lookup_broker.
+
+module LineReader = structure {
+
+  // ==========================================================================
+  // line_reader_read_line(buf, buf_len) -> u64
+  //
+  // Signature: line_reader_read_line : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): buf     -- caller-owned scratch, at least buf_len bytes
+  // RSI (input): buf_len -- max bytes to write to buf (recommended 256)
+  // RAX (output): bytes written 0..buf_len, or 0 on EOF, or LR_STUB /
+  //               LR_ERR_* on error.
+  //
+  // M1 semantics (skeleton):
+  //   buf == 0 || buf_len == 0 -> LR_ERR_BAD_BUF
+  //   else                     -> LR_STUB
+  //
+  // Bumps SH_ST_PROMPTS on every entry. Bumps SH_ST_ERRORS on any
+  // reject path so the shell's own stats table records the failure
+  // without needing the caller to touch a journal.
+  //
+  // Register plan:
+  //   r12 = buf       (callee-save; preserved through shell_note)
+  //   r13 = buf_len   (callee-save; preserved through shell_note)
+  //   rdi = which     (bumped between calls)
+  //   rax = return value
+  //
+  // Two pushes + `sub rsp, 8` = 24 bytes of prologue; the sub aligns
+  // rsp % 16 == 0 for the shell_note call. Same idiom as
+  // elevate_client_lookup_broker in libpdx-elevate.
+  // ==========================================================================
+  pub let line_reader_read_line : (u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64) (buf_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M1-002 (#2): the line-reader skeleton. Two callee-save pushes (r12=buf, r13=buf_len) preserve the args across three nested shell_note calls at PROMPTS / ERRORS / (M2+) LINES so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the nested SysV call, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx). The buf == 0 / buf_len == 0 gates use `cmp reg, 0` (paideia-as no-test-mnemonic discipline; small immediate 0 fits imm32 window). LR_STUB (0xFFFFEC10) is the M1 happy-path sentinel -- KIND_TTY has not landed in the paideia-os kernel at HEAD (2026-08-21), and manufacturing bytes we did not actually observe would defeat D3 audit-first (see design/architecture.md §3.2). M2 replaces the LR_STUB tail with the sys_read + led_insert dispatch loop; every consumer already spells the entry point correctly. Labels prefixed lr_rl_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                          // align rsp % 16 for shell_note
+
+        mov r12, rdi;                        // buf
+        mov r13, rsi;                        // buf_len
+
+        // Bump SH_ST_PROMPTS unconditionally so the counter records
+        // every ATTEMPT, not every success -- the failed-arg case is
+        // still a prompt entry the shell wants to see in its stats.
+        mov rdi, 0;                          // SH_ST_PROMPTS
+        call shell_note;
+
+        // Gate: buf non-null.
+        cmp r12, 0;
+        je  lr_rl_bad_buf;
+
+        // Gate: buf_len non-zero.
+        cmp r13, 0;
+        je  lr_rl_bad_buf;
+
+        // M1 happy path: LR_STUB. M2 replaces this tail with the real
+        // sys_read + led_insert loop.
+        mov rax, 0xFFFFEC10;                 // LR_STUB
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      lr_rl_bad_buf:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC11;                 // LR_ERR_BAD_BUF
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
