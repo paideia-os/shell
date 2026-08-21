@@ -1,0 +1,156 @@
+// src/exec.pdx -- shell.M1-003 (paideia-os/shell#3)
+//
+// Exec module: minimal exec + wait + exit-code print (skeleton).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The shell's exec path. At full ripeness (M2) this is the sequence
+// that binds a child's InitCap sidecar, calls sys_execve, blocks on
+// sys_wait4, and returns the child's exit code. At M1 it ships the
+// entry-point signature, the argv gating (argv non-null, argv_count
+// non-zero), and the counter dispatch so the Shell stats table
+// records every spawn attempt / error the way the M2 body will. On
+// the happy path it returns EX_STUB (0xFFFFEC20) -- the "we
+// validated the args, we would call sys_execve if we had a userspace
+// syscall wrapper linked, but we don't yet" signal.
+//
+// This mirrors libpdx-elevate's ELVC_STUB idiom for the same reason
+// LineReader does (see line_reader.pdx §SCOPE): manufacturing a
+// spawn we did not actually perform would lie to the shell's own
+// audit journal at M3, so M1 stops one step short of the substrate
+// boundary rather than fabricating an outcome. The design accepts
+// this at M1 -- see design/tooling/r49-r50-plan.md §5.2:
+//
+//   M1 -- Design + skeleton. [...] the smallest exec path
+//   (`sh -c '/bin/echo hi'` finds /bin/echo in the InitCap-seeded
+//   path, calls sys_execve, waits, prints exit code). No pipeline
+//   support yet.
+//
+// -- but the sys_execve call itself lands at M2 alongside the
+// pipeline mint (M2-002), because M2 is where libpdx-cap.M2 lands
+// (cap narrowing at exec) and libpdx-argv.M2 lands (children's
+// argv). M1 owns the signature + gates; M2 owns the syscall body.
+//
+// =============================================================================
+// M2 CALL GRAPH (documented, not yet built)
+// =============================================================================
+//
+// At M2, exec_spawn_and_wait will:
+//
+//   (1) Parse argv into (path, argv_ptrs, argv_len) using
+//       libpdx-argv's own parser (its M2 lands the child-side argv
+//       walker; the shell-side call is symmetric).
+//   (2) Resolve `path` against the InitCap-seeded PATH cap set
+//       (the loader's InitCap sidecar carries the caller's PATH cap
+//       for each directory; the shell searches them in order).
+//   (3) Build an InitCap sidecar for the child (16-byte records per
+//       paideia-os src/kernel/core/loader/init_caps.pdx; the wire
+//       layout matches libpdx-cap's Cap wire format at src/cap.pdx
+//       -- one on-wire vocabulary for loader-seeded caps and for
+//       sys_cap_transfer alike). Each entry is:
+//         [+0]  u16 slot        target cap_table slot in the child
+//         [+2]  u16 kind        KIND_* the caller narrows to
+//         [+4]  u32 rights      RIGHTS_* mask narrowed per callee
+//         [+8]  u64 target_ptr  kind-specific tail
+//   (4) Call libpdx-cap::cap_manifest_verify(child_decl, sidecar,
+//       sidecar_count) so a child that would receive a cap not
+//       named in its caps.decl is refused BEFORE sys_execve.
+//   (5) Call sys_execve(path, argv_ptrs, envp, sidecar). Refusal
+//       maps to EX_ERR_EXECVE_FAIL.
+//   (6) Call sys_wait4(pid, wstatus, 0, 0). Refusal maps to
+//       EX_ERR_WAIT_FAIL. wstatus low byte is the exit code.
+//   (7) Print `"[<exit>]"` to KIND_TTY(write) at the shell's
+//       verbose level (M2 emits plain text; M3 emits a
+//       ShellCommandRecord semantic-pipe record via libpdx-audit's
+//       close-of-audit hook).
+//   (8) Return the exit code (0..255) in rax.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Exec`), no directory prefix.
+//   - No `test` mnemonic.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares
+//     are `cmp r12, 0` (argv non-null) and `cmp r13, 0` (argv_count
+//     non-zero).
+//   - r11 is scratch; not used in M1 (no .bss reach from this module).
+//   - No byte reads in M1.
+//   - Two callee-save pushes (r12, r13) + one `sub rsp, 8` for
+//     alignment across the nested shell_note calls; matched
+//     `add rsp, 8` before pop. Same idiom as LineReader and as
+//     elevate_client_lookup_broker in libpdx-elevate.
+
+module Exec = structure {
+
+  // ==========================================================================
+  // exec_spawn_and_wait(argv, argv_count) -> u64
+  //
+  // Signature: exec_spawn_and_wait : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): argv        -- VA of the argv[] array (caller-owned)
+  // RSI (input): argv_count  -- number of pointers in argv[]
+  // RAX (output): child exit code (0..255) at M2+, or EX_STUB (M1),
+  //               or EX_ERR_* on error.
+  //
+  // M1 semantics (skeleton):
+  //   argv == 0 || argv_count == 0 -> EX_ERR_BAD_ARGV
+  //   else                         -> EX_STUB
+  //
+  // Bumps SH_ST_SPAWNS on every entry. Bumps SH_ST_ERRORS on any
+  // reject path.
+  //
+  // Register plan:
+  //   r12 = argv         (callee-save; preserved through shell_note)
+  //   r13 = argv_count   (callee-save; preserved through shell_note)
+  //   rdi = which        (bumped between calls)
+  //   rax = return value
+  //
+  // Two pushes + `sub rsp, 8` = 24 bytes of prologue; the sub aligns
+  // rsp % 16 == 0 for the shell_note call.
+  // ==========================================================================
+  pub let exec_spawn_and_wait : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv: u64) (argv_count: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M1-003 (#3): the exec-path skeleton. Two callee-save pushes (r12=argv, r13=argv_count) preserve the args across the nested shell_note calls at SPAWNS / ERRORS so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the SysV call, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx). The argv == 0 / argv_count == 0 gates use `cmp reg, 0` (paideia-as no-test-mnemonic discipline). EX_STUB (0xFFFFEC20) is the M1 happy-path sentinel -- there is no userspace sys_execve wrapper in the tree yet (the InitCap sidecar builder lands with libpdx-cap.M2 cap-narrowing + libpdx-argv.M2 argv-walker at M2); manufacturing a spawn we did not actually perform would defeat the D3 audit-first invariant M3 formalises (see design/architecture.md §4.2). M2 replaces the EX_STUB tail with the real sys_execve + sys_wait4 dispatch. Labels prefixed ex_sw_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;                          // align rsp % 16 for shell_note
+
+        mov r12, rdi;                        // argv
+        mov r13, rsi;                        // argv_count
+
+        // Bump SH_ST_SPAWNS unconditionally -- see line_reader.pdx
+        // for the "attempt not success" rationale.
+        mov rdi, 2;                          // SH_ST_SPAWNS
+        call shell_note;
+
+        // Gate: argv non-null.
+        cmp r12, 0;
+        je  ex_sw_bad_argv;
+
+        // Gate: argv_count non-zero.
+        cmp r13, 0;
+        je  ex_sw_bad_argv;
+
+        // M1 happy path: EX_STUB. M2 replaces this tail with the
+        // real sys_execve + sys_wait4 dispatch.
+        mov rax, 0xFFFFEC20;                 // EX_STUB
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret;
+
+      ex_sw_bad_argv:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}
