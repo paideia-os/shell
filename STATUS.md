@@ -1,7 +1,7 @@
 # shell — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M2 (core implementation) — complete
+**Current milestone:** M3 (semantic-pipe + audit) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.2 in paideia-os for the full
 breakdown.
@@ -61,6 +61,35 @@ breakdown.
 - `src/shell.pdx`: stats table extended with `SH_ST_SESSIONS = 5`,
   `SH_ST_PIPELINES = 6`, `SH_ST_HISTORY = 7`.
 
+## M3 — semantic-pipe + audit integration (complete)
+
+- `src/pipe_passthrough.pdx` (issue #9, M3-001): `PipePassthrough`
+  module — `pipe_passthrough_forward(src, src_len, dst, dst_max)`
+  copies one R20b frame (8-byte header + payload_len bytes) from
+  src to dst verbatim. D2-literal semantic-pipe passthrough — the
+  shell does not decode, re-hash, or otherwise touch the schema
+  bytes. `passthrough_bytes_forwarded` singleton records the copy
+  size for the caller's cursor advance.
+- `src/completion.pdx` (issue #10, M3-002): `Completion` module —
+  `completion_encode_record(dst, dst_len, name_ptr, name_len,
+  kind, score)` builds one `CommandCompletion` record per SH-D7
+  (16-byte fused header + UTF-8 name + 0..7 zero pad). Kind
+  vocabulary closed at M3: COMMAND/FILE/DIR/OPTION/SCHEMA.
+- `src/command_record.pdx` (issue #11, M3-003): `CommandRecord`
+  module — two-phase audit encoder. `command_record_begin` writes
+  the OPEN record (48-byte header with `CMDR_EXIT_PENDING =
+  0xFFFFFFFF` sentinel + argv text + pad) BEFORE sys_execve;
+  `command_record_close` updates ts_end_ns + exit_code + CLOSED
+  (+ HAS_ERROR when exit != 0) AFTER sys_wait4. Per D3 audit-first:
+  the begin record must be durable before the child emits any
+  user-visible output.
+- `src/shell.pdx`: stats table grew from 8 to 16 slots (still
+  cache-line aligned; two lines). Three new counters:
+  `SH_ST_PASSTHRU = 8`, `SH_ST_COMPLETIONS = 9`, `SH_ST_AUDITS =
+  10`. Reserved slots 11..15 are zero-initialised for M4/M5.
+  `shell_reset`, `shell_note`, `shell_stat` bound compares widened
+  from 8 to 16.
+
 ## Return-code band 0xFFFFECxx
 
 | Code       | Name              | Meaning                                                    |
@@ -89,6 +118,18 @@ breakdown.
 | 0xFFFFEC60 | HIST_ERR_BAD_ARGS | History.M2: dst == 0, dst_len == 0, or cmd_ptr NUL w/ len  |
 | 0xFFFFEC61 | HIST_ERR_TOO_LONG | History.M2: cmd_len > 4096 (HIST_CMD_MAX)                  |
 | 0xFFFFEC62 | HIST_ERR_TRUNCATED| History.M2: dst_len < required record size                 |
+| 0xFFFFEC70 | PP_ERR_BAD_ARGS   | PipePassthrough.M3: src/dst null, dst_max 0, or src_len<8  |
+| 0xFFFFEC71 | PP_ERR_TRUNCATED  | PipePassthrough.M3: src_len < 8+payload_len                |
+| 0xFFFFEC72 | PP_ERR_DST_OVERFLOW | PipePassthrough.M3: dst_max < 8+payload_len              |
+| 0xFFFFEC73 | PP_ERR_OVERSIZED  | PipePassthrough.M3: payload_len > 0x7FFFFFF7               |
+| 0xFFFFEC80 | COMP_ERR_BAD_ARGS | Completion.M3: dst/name null or kind/score out of range    |
+| 0xFFFFEC81 | COMP_ERR_TOO_LONG | Completion.M3: name_len > 512 (COMP_NAME_MAX)              |
+| 0xFFFFEC82 | COMP_ERR_TRUNCATED| Completion.M3: dst_len < required record size              |
+| 0xFFFFEC83 | COMP_ERR_EMPTY_NAME | Completion.M3: name_len == 0                             |
+| 0xFFFFEC90 | CMDR_ERR_BAD_ARGS | CommandRecord.M3: dst null, audit_id 0, or argv null w/len |
+| 0xFFFFEC91 | CMDR_ERR_TOO_LONG | CommandRecord.M3: argv_bytes > 8192 (CMDR_ARGV_MAX)        |
+| 0xFFFFEC92 | CMDR_ERR_TRUNCATED| CommandRecord.M3: dst_len < required record size           |
+| 0xFFFFEC93 | CMDR_ERR_BAD_EXIT | CommandRecord.M3: exit_code > 255 (close only)             |
 
 ## Milestone rollup
 
@@ -102,6 +143,9 @@ breakdown.
 | M2-003 (#6)     | caps environment propagation via libpdx-cap (narrow per callee caps.decl) | LANDED |
 | M2-004 (#7)     | .pds script executor per design/terminal/pds-format.md           | LANDED |
 | M2-005 (#8)     | ~/.history/ persistence via KIND_PDXFS_FILE(write) CoW journal   | LANDED |
+| M3-001 (#9)     | semantic-pipe passthrough: child schema forwarded unchanged (D2 literal) | LANDED |
+| M3-002 (#10)    | CommandCompletion[] schema for tab-completion (SH-D7)            | LANDED |
+| M3-003 (#11)    | ShellCommandRecord via libpdx-audit before sys_execve; close on wait | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 
@@ -125,7 +169,7 @@ breakdown.
 - libpdx-audit.M2 — audit sender path
 - libpdx-elevate.M2 — auto-approve + human-approve + Cap<> with lifetime
 
-**Substrate gaps M2 continues to defer to M3:**
+**Substrate gaps M3 continues to defer to M4/M5:**
 
 - `KIND_TTY` — not landed at HEAD; `kind_tty.pdx` does not exist in
   `src/kernel/core/cap/`. shell caps.decl names it symbolically; the
@@ -134,24 +178,33 @@ breakdown.
   catch this drift and softarch pins the real KIND_TTY ordinal at
   substrate PR time (outside the 0x190–0x196 R42/R48 range).
 - Userspace `sys_execve` / `sys_wait4` wrapper — the kernel side lands
-  at R17; the M2 shell keeps `exec_spawn_and_wait` at the EX_STUB
+  at R17; the shell keeps `exec_spawn_and_wait` at the EX_STUB
   skeleton and pairs it with the standalone
-  `exec_narrow_child_caps` helper. M3 wires them together.
+  `exec_narrow_child_caps` helper. M4 wires them together against
+  the M3-003 CommandRecord begin/close pair.
 - Userspace `sys_ipc_recv` / endpoint-mint wrapper — needed to turn
   M2's placeholder pipe ids in `pipeline_plan` into real endpoint
-  ids. M3 substrate wiring.
+  ids. M4 substrate wiring; the M3-001 PipePassthrough encoder is
+  ready to consume real endpoints once they exist.
 - Userspace PdxFS-write path — needed to persist the bytes
-  `history_encode_record` produces. M3 substrate wiring against
+  `history_encode_record` produces. M4 substrate wiring against
   `svc.pdxfs-journal`.
-- Cross-repo linkage (shell → libpdx-cap symbols like
-  `cap_pack_narrowed`) — deferred to M3 when the semantic-pipe /
-  audit path also needs the cross-repo link resolved. Shell M2
-  modules stay self-contained.
+- Userspace `sys_ipc_send` to `svc.audit-journal` — needed to
+  actually append the bytes M3-003 CommandRecord produces to
+  `/system/audit/user-events/`. M4 substrate wiring against
+  libpdx-audit's M2 sender path.
+- Schema registry for M3-002 tab-completion driver — the encoder
+  ships at M3, but the registry walk + score compute + candidate
+  ranking lives at M4 alongside the tab-key binding in
+  line_reader.
+- Cross-repo linkage (shell → libpdx-cap / libpdx-semantic-pipe /
+  libpdx-audit symbols) — M4 pulls all sides into one build for
+  the smoke matrix.
 
 ## Next
 
-M3 — semantic-pipe passthrough + `libpdx-audit` integration +
-tab-completion (`CommandCompletion[]` schema) + interactive prompt
-schema (`ShellPromptRecord`). Depends on libpdx-semantic-pipe.M2
-(passthrough shape) and libpdx-audit.M2 (both landed today; M3 can
-open).
+M4 — tests + smoke matrix. Caps-narrowing violation matrix
+(shell.M4-001), audit-first invariant test (shell.M4-002), QEMU
+smoke: login → prompt → `ls | cat` → history persists across
+reboot (shell.M4-003). All three depend on the substrate gaps
+above landing in a paideia-os round adjacent to R49.

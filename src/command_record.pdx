@@ -1,0 +1,513 @@
+// src/command_record.pdx -- shell.M3-003 (paideia-os/shell#11)
+//
+// CommandRecord module: ShellCommandRecord audit encoder + closer.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Every command the shell executes journals a `ShellCommandRecord`
+// to the audit journal at `/system/audit/user-events/` via
+// libpdx-audit. Per design/tooling/r49-r50-plan.md §5.2 M3 line:
+// "Every command journals ShellCommandRecord via libpdx-audit
+// before sys_execve; exit-code closes the record after wait."
+//
+// The record is written in TWO PHASES:
+//
+//   1. BEGIN (before sys_execve) -- command_record_begin populates
+//      the record's header with the audit_id (issued by libpdx-audit's
+//      audit_begin), the begin timestamp, argv bytes, and an OPEN
+//      flag. Exit code is left as CMDR_EXIT_PENDING (0xFFFFFFFF, a
+//      sentinel meaning "wait has not returned yet"), ts_end_ns is
+//      0. The record is durable at this point -- libpdx-audit's D3
+//      audit-first invariant requires the record to reach the journal
+//      before the child can emit any user-visible output.
+//   2. CLOSE (after sys_wait4) -- command_record_close updates the
+//      record's ts_end_ns and exit_code fields, sets the CLOSED
+//      flag, and optionally sets HAS_ERROR when exit_code != 0. The
+//      caller then re-writes the mutated record bytes to the audit
+//      journal (or, in the M4+ substrate, calls libpdx-audit's
+//      audit_commit(audit_id, exit_code) which computes the same
+//      end-state).
+//
+// M3-003 lands both encoders as pure buffer manipulations. The
+// libpdx-audit BEGIN/COMMIT syscall pair is the substrate deferral
+// consistent with M2's pattern (History encoder without PdxFS
+// write, Session mint without loader-side wiring). The M4+ shell
+// exec dispatcher calls this pair around every sys_execve/wait.
+//
+// =============================================================================
+// WIRE FORMAT (ShellCommandRecord)
+// =============================================================================
+//
+// Fixed 48-byte header + variable-length argv bytes (null-separated)
+// + zero padding to an 8-byte boundary:
+//
+//   +0    u32 magic        = CMDR_MAGIC = 0x52444d43 ("CMDR" LE:
+//                            bytes 'C','M','D','R' at addresses 0..3)
+//   +4    u32 record_len   total bytes; always an 8-multiple
+//   +8    u64 audit_id     the id issued by libpdx-audit's audit_begin
+//   +16   u64 ts_begin_ns  wall-clock timestamp at begin (caller-supplied)
+//   +24   u64 ts_end_ns    wall-clock timestamp at close (0 while open)
+//   +32   u32 argv_bytes   total bytes of argv text (<= CMDR_ARGV_MAX)
+//   +36   u32 exit_code    child's exit status; CMDR_EXIT_PENDING
+//                            (0xFFFFFFFF) while the record is open
+//   +40   u32 flags        bit 0 = CLOSED, bit 1 = HAS_ERROR
+//                            (bits 2..31 reserved; must read as zero)
+//   +44   u32 reserved     zero-padded to 8-byte header alignment
+//   +48   u8[argv_bytes]   argv text (null-byte separated); e.g.
+//                            "ls\0-l\0/tmp\0"
+//   +...  u8[pad] zero_pad 0..7 zero bytes to align total to 8 bytes
+//
+// The header divides into six qwords (0..5); each of the six is a
+// single MOV on a happy-path begin. On close, only qword2 (ts_end_ns)
+// and qword5 (exit_code | flags | reserved fused; a single qword
+// update) change -- two 8-byte stores atomic against a reader
+// observing the same qwords.
+//
+// The header size 48 = 6 qwords is 8-multiple-aligned; argv_bytes
+// zero-padded to align total to 8 mirrors History's discipline.
+//
+// =============================================================================
+// EXIT CODE SENTINEL
+// =============================================================================
+//
+// CMDR_EXIT_PENDING = 0xFFFFFFFF distinguishes "record open, wait
+// has not returned yet" from a legitimate exit code (0..255). A
+// reader that sees exit_code == 0xFFFFFFFF and the CLOSED flag
+// unset knows the child is still running; either the audit journal
+// captured a partial record (shell crashed between begin and close)
+// or a live wait is still pending. Both are diagnosable states, not
+// silent corruption. The sentinel value 0xFFFFFFFF cannot collide
+// with a legal exit code because sys_wait4 returns wstatus with
+// the low byte holding the exit status (0..255), not a 32-bit value.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`CommandRecord`).
+//   - No `test` mnemonic; `cmp reg, 0` for zero-checks.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. CMDR_ARGV_MAX is
+//     8192; all header-size / offset compares fit trivially.
+//   - Large immediates (CMDR_MAGIC = 0x52444d43, CMDR_EXIT_PENDING
+//     = 0xFFFFFFFF, error codes 0xFFFFEC90..0xFFFFEC93) emitted via
+//     mov r10, imm32.
+//   - r11 unused in the encode body (no .bss reach; the module is
+//     stateless because both begin and close operate entirely on
+//     the caller-owned dst buffer -- unlike History / Completion /
+//     PipePassthrough, there is no per-invocation output count to
+//     stash in a singleton, since the caller already has record_len
+//     in hand via the compute formula).
+//   - Byte reads / writes use `xor rax, rax; mov_b rax, [ptr]` and
+//     `mov_b [ptr], rax` in the argv-copy loop and the zero-pad
+//     loop, matching History's pattern.
+//   - command_record_begin: 5 pushes (rbx, r12, r13, r14, r15) +
+//     `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 for shell_note.
+//   - command_record_close: 3 pushes (r12, r13, r14) + `sub rsp, 8`
+//     = 32 bytes prologue; rsp % 16 == 0 for shell_note. The close
+//     path does not scan argv (it only touches header fields) so
+//     rbx and r15 are unnecessary.
+
+module CommandRecord = structure {
+
+  // ==========================================================================
+  // Format constants
+  // ==========================================================================
+
+  // Header size in bytes (fixed 48-byte header).
+  pub let CMDR_HEADER_SIZE : u64 = 48
+
+  // Maximum argv byte count. 8192 = two pages; a command with more
+  // than 8 KiB of joined argv text is almost certainly a paste error
+  // (a real command line rarely exceeds a few hundred bytes even
+  // with generous file arguments). Fits imm <= 0x7FFFFFFF.
+  pub let CMDR_ARGV_MAX : u64 = 8192
+
+  // Magic constant. Little-endian layout of bytes 'C'(0x43),
+  // 'M'(0x4D), 'D'(0x44), 'R'(0x52) reads back as u32 0x52444d43.
+  pub let CMDR_MAGIC : u64 = 0x52444d43
+
+  // Exit-code sentinel: "record open, wait has not returned yet".
+  // 0xFFFFFFFF cannot collide with a legal wstatus low byte (0..255).
+  pub let CMDR_EXIT_PENDING : u64 = 0xFFFFFFFF
+
+  // Flag bits.
+  pub let CMDR_FLAG_CLOSED    : u64 = 0x1
+  pub let CMDR_FLAG_HAS_ERROR : u64 = 0x2
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEC9x (CommandRecord module)
+  // ==========================================================================
+
+  // Success sentinel = 0.
+  pub let CMDR_OK             : u64 = 0
+
+  // dst == 0, dst_len == 0, or argv_ptr == 0 while argv_bytes > 0.
+  // audit_id == 0 is also refused -- libpdx-audit's audit_begin
+  // never issues id 0 (0 is reserved as "no active audit").
+  pub let CMDR_ERR_BAD_ARGS   : u64 = 0xFFFFEC90
+
+  // argv_bytes > CMDR_ARGV_MAX. Refused before touching dst.
+  pub let CMDR_ERR_TOO_LONG   : u64 = 0xFFFFEC91
+
+  // dst_len < required-record-size (48 + argv_bytes + padding).
+  // Refused before touching dst so the caller can enlarge and retry.
+  pub let CMDR_ERR_TRUNCATED  : u64 = 0xFFFFEC92
+
+  // command_record_close only: exit_code > 255 (wstatus low byte is
+  // 0..255 by POSIX/paideia-os convention; a caller passing a value
+  // outside that range is corrupting the audit trail). The
+  // CMDR_EXIT_PENDING sentinel (0xFFFFFFFF) is deliberately outside
+  // the legal range so it cannot be confused with a real exit.
+  pub let CMDR_ERR_BAD_EXIT   : u64 = 0xFFFFEC93
+
+  // ==========================================================================
+  // command_record_begin(dst, dst_len, argv_ptr, argv_bytes,
+  //                      audit_id, ts_begin_ns) -> u64
+  //
+  // Signature: command_record_begin : (u64, u64, u64, u64, u64, u64)
+  //                                   -> u64 !{mem} @{}
+  // RDI (input): dst           -- VA of the destination audit buffer
+  // RSI (input): dst_len       -- bytes available in dst
+  // RDX (input): argv_ptr      -- VA of the joined argv text (UTF-8;
+  //                                null-byte separated). Must be
+  //                                non-null iff argv_bytes > 0.
+  // RCX (input): argv_bytes    -- argv byte length (0..CMDR_ARGV_MAX;
+  //                                0 is allowed -- shell may audit
+  //                                an "Enter on empty prompt" event
+  //                                for D3 audit-first)
+  // R8  (input): audit_id      -- id returned by libpdx-audit's
+  //                                audit_begin (must be non-zero)
+  // R9  (input): ts_begin_ns   -- wall-clock at begin (caller-supplied)
+  // RAX (output): CMDR_OK on success (record_len computable by the
+  //               caller: (48 + argv_bytes + 7) & ~7), else
+  //               CMDR_ERR_BAD_ARGS | CMDR_ERR_TOO_LONG |
+  //               CMDR_ERR_TRUNCATED.
+  //
+  // Writes the fixed 48-byte header + argv bytes + 0..7 zero-padding
+  // bytes to dst. Header fields:
+  //   qword0: magic | (record_len << 32)
+  //   qword1: audit_id
+  //   qword2: ts_begin_ns
+  //   qword3: 0 (ts_end_ns; filled by close)
+  //   qword4: argv_bytes | (CMDR_EXIT_PENDING << 32) -- exit_code
+  //           starts as pending
+  //   qword5: 0 (flags | reserved; close sets flags)
+  //
+  // Fail-fast on all gates; dst is NOT touched on any reject path.
+  //
+  // Bumps SH_ST_AUDITS (slot 10) on every entry. Bumps SH_ST_ERRORS
+  // on every reject.
+  //
+  // Register plan:
+  //   r12 = dst              (callee-save)
+  //   r13 = argv_ptr         (callee-save)
+  //   r14 = record_len cache (callee-save; needed after byte-copy)
+  //   r15 = audit_id cache   (callee-save; single-MOV write later)
+  //   rbx = i for copy loop  (callee-save)
+  //   rax = temp / return
+  //   r10 = magic / large-imm scratch
+  //   -- inputs stay in rsi (dst_len), rcx (argv_bytes), r9 (ts_begin_ns)
+  //
+  // Prologue: 5 pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` =
+  // 48 bytes; rsp % 16 == 0 for shell_note. Matched epilogue.
+  // ==========================================================================
+  pub let command_record_begin : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (argv_ptr: u64) (argv_bytes: u64) (audit_id: u64) (ts_begin_ns: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M3-003 (#11): serialise one ShellCommandRecord in the OPEN state (before sys_execve). Wire per §4c: 48-byte header (six fused qwords: magic|record_len, audit_id, ts_begin_ns, ts_end_ns=0, argv_bytes|CMDR_EXIT_PENDING, flags=0), then argv_bytes bytes of null-separated argv text, then 0..7 zero bytes to align total to 8. Every header qword is a single MOV so a torn write between fields inside one qword is impossible on x86-64. Cross-qword tearing possible; a reader detects partial writes via CLOSED flag + exit_code == CMDR_EXIT_PENDING sentinel discrimination. Byte-copy loop uses the #1248 pattern (`xor rax, rax; mov_b rax, [r13 + rbx]` then `mov_b [r12 + <hdr> + rbx], rax`); same idiom as history.pdx and completion.pdx. Fail-fast gates: dst != 0, dst_len > 0, audit_id != 0 (0 is reserved 'no active audit' in libpdx-audit), argv_ptr non-null iff argv_bytes > 0 (argv_bytes == 0 allowed for D3 audit-first of an empty prompt Enter), argv_bytes <= CMDR_ARGV_MAX (8192), dst_len >= record_len. record_len = (48 + argv_bytes + 7) / 8 * 8 via shr/shl (no large-imm mask). CMDR_EXIT_PENDING (0xFFFFFFFF) is baked into the header at begin so a reader of an unclosed record sees the sentinel distinctly from any legal exit (0..255 low byte of wstatus). 5 pushes (rbx, r12 dst, r13 argv_ptr, r14 record_len, r15 audit_id) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 for shell_note. r11 unused in the body (no .bss reach). All large immediates via mov r10, imm32. Labels prefixed cr_bg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rdx;                        // argv_ptr
+        mov r15, r8;                         // audit_id (cache)
+        // dst_len stays in rsi; argv_bytes stays in rcx; ts_begin_ns in r9
+
+        // Bump SH_ST_AUDITS (slot 10) unconditionally.
+        mov rdi, 10;                         // SH_ST_AUDITS
+        call shell_note;
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  cr_bg_bad_args;
+        // Gate: dst_len non-zero.
+        cmp rsi, 0;
+        je  cr_bg_bad_args;
+        // Gate: audit_id non-zero.
+        cmp r15, 0;
+        je  cr_bg_bad_args;
+
+        // Gate: argv_ptr non-null iff argv_bytes > 0.
+        cmp rcx, 0;
+        je  cr_bg_check_dst_len;             // argv_bytes == 0: skip
+        cmp r13, 0;
+        je  cr_bg_bad_args;
+
+      cr_bg_check_dst_len:
+        // Gate: argv_bytes <= CMDR_ARGV_MAX.
+        cmp rcx, 8192;                       // CMDR_ARGV_MAX
+        ja  cr_bg_too_long;
+
+        // Compute record_len = (48 + argv_bytes + 7) & ~7 via shr/shl.
+        // CMDR_HEADER_SIZE (48) is already 8-multiple.
+        mov rax, rcx;
+        add rax, 48;                         // + header size
+        add rax, 7;                          // + rounding constant
+        shr rax, 3;                          // drop low 3 bits
+        shl rax, 3;                          // padded to next 8-mul
+        mov r14, rax;                        // r14 = record_len
+
+        // Gate: dst_len >= record_len.
+        cmp rsi, r14;
+        jb  cr_bg_truncated;
+
+        // --- Write qword0 = magic | (record_len << 32) ------------
+        mov rax, r14;
+        shl rax, 32;                         // rax = record_len << 32
+        mov r10, 0x52444d43;                 // CMDR_MAGIC
+        or  rax, r10;                        // rax = magic | (record_len << 32)
+        mov [r12 + 0], rax;
+
+        // --- Write qword1 = audit_id ------------------------------
+        mov [r12 + 8], r15;
+
+        // --- Write qword2 = ts_begin_ns ---------------------------
+        mov [r12 + 16], r9;
+
+        // --- Write qword3 = 0 (ts_end_ns; close will fill this) --
+        xor rax, rax;
+        mov [r12 + 24], rax;
+
+        // --- Write qword4 = argv_bytes | (CMDR_EXIT_PENDING << 32)
+        // argv_bytes fits u32 (<= 8192). CMDR_EXIT_PENDING = 0xFFFFFFFF.
+        mov rax, rcx;                        // argv_bytes (low 32)
+        mov r10, 0xFFFFFFFF;                 // CMDR_EXIT_PENDING
+        shl r10, 32;                         // r10 = pending << 32
+        or  rax, r10;                        // fused
+        mov [r12 + 32], rax;
+
+        // --- Write qword5 = 0 (flags | reserved; close sets flags)
+        xor rax, rax;
+        mov [r12 + 40], rax;
+
+        // --- Byte-copy argv text (skip if argv_bytes == 0) --------
+        cmp rcx, 0;
+        je  cr_bg_pad;
+
+        xor rbx, rbx;                        // i = 0
+      cr_bg_copy_head:
+        cmp rbx, rcx;
+        jae cr_bg_copy_done;
+        xor rax, rax;
+        mov_b rax, [r13 + rbx];              // #1248 byte load
+        mov_b [r12 + rbx + 48], rax;         // byte store at hdr + i
+        add rbx, 1;
+        jmp cr_bg_copy_head;
+      cr_bg_copy_done:
+
+      cr_bg_pad:
+        // Zero-pad from dst[48 + argv_bytes] to dst[record_len - 1].
+        mov rbx, rcx;
+        add rbx, 48;                         // rbx = cursor
+      cr_bg_pad_head:
+        cmp rbx, r14;
+        jae cr_bg_pad_done;
+        xor rax, rax;
+        mov_b [r12 + rbx], rax;              // zero byte
+        add rbx, 1;
+        jmp cr_bg_pad_head;
+      cr_bg_pad_done:
+
+        xor rax, rax;                        // CMDR_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cr_bg_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC90;                 // CMDR_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cr_bg_too_long:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC91;                 // CMDR_ERR_TOO_LONG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cr_bg_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC92;                 // CMDR_ERR_TRUNCATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // command_record_close(dst, dst_len, ts_end_ns, exit_code) -> u64
+  //
+  // Signature: command_record_close : (u64, u64, u64, u64) -> u64
+  //                                   !{mem} @{}
+  // RDI (input): dst        -- VA of the record produced by
+  //                             command_record_begin (caller must
+  //                             have kept the same pointer)
+  // RSI (input): dst_len    -- bytes available in dst (must be >=
+  //                             CMDR_HEADER_SIZE; the close path
+  //                             does not touch the argv tail)
+  // RDX (input): ts_end_ns  -- wall-clock timestamp at close
+  // RCX (input): exit_code  -- child's exit status (0..255)
+  // RAX (output): CMDR_OK on success, else CMDR_ERR_BAD_ARGS |
+  //               CMDR_ERR_BAD_EXIT.
+  //
+  // Updates the OPEN record's ts_end_ns (qword2 at offset 24) and
+  // exit_code|flags fields (qword4 at offset 32 keeps argv_bytes but
+  // replaces the CMDR_EXIT_PENDING sentinel with the real exit_code;
+  // qword5 at offset 40 sets the CLOSED flag and, when exit_code
+  // != 0, also the HAS_ERROR flag).
+  //
+  // The close does NOT re-verify magic, record_len, or argv_bytes
+  // -- the caller is expected to pass the same dst it passed to
+  // begin. Re-verifying would double the work and force a load-
+  // compare of the header on every close; the trust model is that
+  // the shell's exec dispatcher pairs begin/close inside one stack
+  // frame and does not lose the pointer between them.
+  //
+  // Fail-fast on the two gates (dst != 0, dst_len >= CMDR_HEADER_SIZE,
+  // exit_code <= 255); on reject the record stays OPEN and the caller
+  // must retry or discard.
+  //
+  // Bumps SH_ST_AUDITS (slot 10) on every entry (both begin and
+  // close contribute to the audit-writes count -- a paired begin +
+  // close is 2 events, which correctly counts the two round trips
+  // to the audit journal in the M4+ substrate). Bumps SH_ST_ERRORS
+  // on reject.
+  //
+  // Register plan:
+  //   r12 = dst              (callee-save)
+  //   r13 = exit_code        (callee-save)
+  //   r14 = ts_end_ns        (callee-save)
+  //   rax = temp / return
+  //   r10 = existing qword4 load, flags assembly
+  //
+  // Prologue: 3 pushes (r12, r13, r14) + `sub rsp, 8` = 32 bytes;
+  // rsp % 16 == 0 for shell_note. Matched epilogue.
+  // ==========================================================================
+  pub let command_record_close : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (ts_end_ns: u64) (exit_code: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M3-003 (#11): close a ShellCommandRecord after sys_wait4. Update ts_end_ns (qword2 at offset 24), replace the CMDR_EXIT_PENDING sentinel in the high 32 bits of qword4 (offset 32) with the real exit_code while preserving argv_bytes in the low 32 bits, and set CLOSED (+ HAS_ERROR when exit_code != 0) in qword5 (offset 40). Three qword-atomic stores; a reader observing the same qwords cannot see a torn field inside any of them. Cross-qword tearing between ts_end and exit_code is possible but the CLOSED flag serves as the memory-order fence at the schema level -- a reader that sees CLOSED can trust the other three fields (readers not seeing CLOSED treat the record as pending, regardless of what the other qwords hold). The close does NOT re-verify magic / record_len / argv_bytes; the trust model pairs begin/close in one stack frame. Fail-fast: dst != 0, dst_len >= CMDR_HEADER_SIZE (48), exit_code <= 255 (wstatus low byte range; CMDR_EXIT_PENDING at 0xFFFFFFFF is deliberately above the ceiling so it cannot be confused with a legal exit and a caller passing it explicitly gets CMDR_ERR_BAD_EXIT). qword4 update: load existing qword4 -> mask off high 32 (shl 32; shr 32) -> or with exit_code << 32 -> store. All large immediates via mov r10, imm32. 3 pushes (r12 dst, r13 exit_code cache, r14 ts_end_ns cache) + `sub rsp, 8` = 32 bytes prologue; rsp % 16 == 0 for shell_note. r11 unused. Labels prefixed cr_cl_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rcx;                        // exit_code
+        mov r14, rdx;                        // ts_end_ns
+        // dst_len stays in rsi
+
+        // Bump SH_ST_AUDITS (slot 10).
+        mov rdi, 10;                         // SH_ST_AUDITS
+        call shell_note;
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  cr_cl_bad_args;
+        // Gate: dst_len >= CMDR_HEADER_SIZE.
+        cmp rsi, 48;                         // CMDR_HEADER_SIZE
+        jb  cr_cl_bad_args;
+        // Gate: exit_code <= 255.
+        cmp r13, 255;
+        ja  cr_cl_bad_exit;
+
+        // --- Update qword2 (ts_end_ns) at offset 24 --------------
+        mov [r12 + 24], r14;
+
+        // --- Update qword4 at offset 32 --------------------------
+        // Preserve argv_bytes in the low 32 bits; replace the
+        // CMDR_EXIT_PENDING (0xFFFFFFFF) sentinel in the high 32 with
+        // the real exit_code. Approach:
+        //   1. Load existing qword4 into rax.
+        //   2. Zero the high 32 by shl 32 then shr 32.
+        //   3. Compute exit_code << 32 in r10; OR into rax.
+        //   4. Store rax back.
+        mov rax, [r12 + 32];
+        shl rax, 32;                         // drop high 32
+        shr rax, 32;                         // rax = argv_bytes (low 32)
+        mov r10, r13;                        // exit_code
+        shl r10, 32;                         // exit_code << 32
+        or  rax, r10;
+        mov [r12 + 32], rax;
+
+        // --- Update qword5 (flags | reserved) at offset 40 -------
+        // Compute flags = CMDR_FLAG_CLOSED (0x1); if exit_code != 0
+        // additionally set CMDR_FLAG_HAS_ERROR (0x2).
+        mov rax, 1;                          // CMDR_FLAG_CLOSED
+        cmp r13, 0;
+        je  cr_cl_write_flags;               // exit == 0: flags = CLOSED
+        or  rax, 2;                          // + CMDR_FLAG_HAS_ERROR
+
+      cr_cl_write_flags:
+        // qword5 = flags | (reserved=0 << 32). rax already holds the
+        // flags in the low 32; the high 32 stay zero.
+        mov [r12 + 40], rax;
+
+        xor rax, rax;                        // CMDR_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      cr_cl_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC90;                 // CMDR_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      cr_cl_bad_exit:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC93;                 // CMDR_ERR_BAD_EXIT
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

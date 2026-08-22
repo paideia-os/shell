@@ -413,6 +413,191 @@ narrows this cap per-session to the invoker's own history subtree
 via libpdx-cap's `cap_pack_narrowed` at session start; children
 never receive this cap (history subtree is the shell's own state).
 
+## 4c. `PipePassthrough` module (src/pipe_passthrough.pdx) — M3-001
+
+### 4c.1 Contract
+
+```
+pipe_passthrough_forward(src: u64, src_len: u64,
+                         dst: u64, dst_max: u64) -> u64
+pipe_passthrough_reset() -> ()
+```
+
+Given one R20b frame in `src` (8-byte header + `payload_len` bytes
+of payload — schema_hash prefix + record body included if the
+child set the R20b "typed" flag), copy it verbatim to `dst`. The
+number of bytes forwarded (always `8 + payload_len` on success)
+lands in the `.bss` singleton `passthrough_bytes_forwarded` so
+both endpoint cursors advance by the same amount.
+
+### 4c.2 Passthrough discipline
+
+The shell does NOT decode the schema, does NOT re-hash the
+schema_hash prefix, and does NOT touch any byte of the payload.
+This is D2 literal from `design/tooling/plan.md`: the shell
+forwards typed pipes; it does not schema-erase them into byte
+streams the downstream cannot re-type. The module deliberately does
+NOT link libpdx-semantic-pipe — the passthrough must be correct
+against a schema the shell has never seen, so a child at R56+ that
+ships a new schema needs no shell rebuild to be pipeable to.
+
+### 4c.3 R20b frame header
+
+Mirror of paideia-os `src/kernel/core/ipc/frame.pdx`:
+
+```
++0  u8   op           opcode (SEND=1, RECV=2, ...; preserved as-is)
++1  u8   ver          version (currently 1)
++2  u16  flags LE     bit 0 = typed record follows
++4  u32  payload_len  bytes of payload after the header
+```
+
+The 8 bytes are loaded as one aligned qword; `payload_len` is
+extracted from bits 32..63 via `shr rax, 32`.
+
+### 4c.4 Error codes
+
+- `PP_ERR_BAD_ARGS` (0xFFFFEC70) — `src == 0`, `dst == 0`,
+  `dst_max == 0`, or `src_len < 8`.
+- `PP_ERR_TRUNCATED` (0xFFFFEC71) — `src_len < 8 + payload_len`
+  (source buffer does not contain the whole frame).
+- `PP_ERR_DST_OVERFLOW` (0xFFFFEC72) — `dst_max < 8 + payload_len`.
+- `PP_ERR_OVERSIZED` (0xFFFFEC73) — `payload_len > PP_MAX_PAYLOAD`
+  (0x7FFFFFF7). Malformed frame on the wire.
+
+All four are fail-fast — `dst` is not touched on any reject path.
+
+## 4d. `Completion` module (src/completion.pdx) — M3-002
+
+### 4d.1 Contract
+
+```
+completion_encode_record(dst: u64, dst_len: u64,
+                         name_ptr: u64, name_len: u64,
+                         kind: u64, score: u64) -> u64
+completion_reset() -> ()
+```
+
+Serialise one `CommandCompletion` record (per SH-D7 in
+`design/terminal/semantic-shell.md`) into a caller-owned buffer.
+The byte count lands in the `.bss` singleton
+`completion_bytes_written`.
+
+### 4d.2 Wire format
+
+Fixed 16-byte header + variable name bytes + 0..7 zero pad:
+
+```
++0    u32 magic         = 0x504d4f43 ("COMP" LE)
++4    u32 record_len    total bytes; always an 8-multiple
++8    u16 kind          COMP_KIND_* (1..5)
++10   u16 score         match score 0..1000
++12   u32 name_len      candidate byte length
++16   u8[name_len]      UTF-8 candidate name (not null-terminated)
++...  0..7 zero bytes   padding to align record_len to 8
+```
+
+Each header qword is a single MOV — atomic against a reader
+observing the same qword.
+
+### 4d.3 Kind vocabulary
+
+- `COMP_KIND_COMMAND = 1` — installed tool.
+- `COMP_KIND_FILE    = 2` — file candidate.
+- `COMP_KIND_DIR     = 3` — directory candidate.
+- `COMP_KIND_OPTION  = 4` — `--long` / `--json` etc.
+- `COMP_KIND_SCHEMA  = 5` — schema-typed field.
+
+Closed at M3; extending is a schema-version bump. Reserved values
+0 and 6..65535 fall back to plain-text rendering.
+
+### 4d.4 Error codes
+
+- `COMP_ERR_BAD_ARGS` (0xFFFFEC80) — `dst == 0`, `dst_len == 0`,
+  `name_ptr == 0`, `kind == 0`, `kind > COMP_KIND_MAX`, or
+  `score > COMP_SCORE_MAX`.
+- `COMP_ERR_TOO_LONG` (0xFFFFEC81) — `name_len > COMP_NAME_MAX`
+  (512).
+- `COMP_ERR_TRUNCATED` (0xFFFFEC82) — `dst_len` less than required.
+- `COMP_ERR_EMPTY_NAME` (0xFFFFEC83) — `name_len == 0`. Distinct
+  from BAD_ARGS so a caller-side ranker bug is diagnosable.
+
+All four are fail-fast — `dst` is not touched on any reject path.
+
+## 4e. `CommandRecord` module (src/command_record.pdx) — M3-003
+
+### 4e.1 Contract
+
+```
+command_record_begin(dst: u64, dst_len: u64,
+                     argv_ptr: u64, argv_bytes: u64,
+                     audit_id: u64, ts_begin_ns: u64) -> u64
+command_record_close(dst: u64, dst_len: u64,
+                     ts_end_ns: u64, exit_code: u64) -> u64
+```
+
+Two-phase encoder for the audit journal's `ShellCommandRecord`.
+Per D3 audit-first, the shell's exec dispatcher:
+
+1. Calls `command_record_begin` BEFORE `sys_execve`. Record is
+   written durable; child cannot emit until the record hits the
+   journal.
+2. Calls `command_record_close` AFTER `sys_wait4`. Updates
+   `ts_end_ns`, `exit_code` (replacing the `CMDR_EXIT_PENDING =
+   0xFFFFFFFF` sentinel), and sets `CMDR_FLAG_CLOSED` (+
+   `CMDR_FLAG_HAS_ERROR` if `exit_code != 0`).
+
+### 4e.2 Wire format
+
+Fixed 48-byte header (six qwords) + variable argv bytes (null-
+separated) + 0..7 zero pad:
+
+```
++0    u32 magic        = 0x52444d43 ("CMDR" LE)
++4    u32 record_len   total bytes; always an 8-multiple
++8    u64 audit_id     issued by libpdx-audit's audit_begin
++16   u64 ts_begin_ns  wall-clock at begin
++24   u64 ts_end_ns    wall-clock at close (0 while open)
++32   u32 argv_bytes   argv text length
++36   u32 exit_code    child status; CMDR_EXIT_PENDING while open
++40   u32 flags        bit 0 CLOSED, bit 1 HAS_ERROR
++44   u32 reserved     0
++48   u8[argv_bytes]   argv text (null-byte separated)
++...  0..7 zero bytes  padding to align record_len to 8
+```
+
+Each header qword is a single MOV. On close only two qwords change
+(qword2 ts_end_ns, qword4 exit_code | argv_bytes, qword5 flags).
+
+### 4e.3 Exit-code sentinel
+
+`CMDR_EXIT_PENDING = 0xFFFFFFFF` marks "record open, wait has not
+returned yet". A reader seeing `exit_code == 0xFFFFFFFF` and
+`CLOSED` unset knows the child is still running or the record was
+truncated (shell crashed between begin and close). `0xFFFFFFFF`
+cannot collide with a legal exit (wstatus low byte 0..255).
+
+### 4e.4 Error codes
+
+- `CMDR_ERR_BAD_ARGS` (0xFFFFEC90) — `dst == 0`, `dst_len == 0`,
+  `audit_id == 0`, or `argv_ptr == 0 && argv_bytes > 0`.
+- `CMDR_ERR_TOO_LONG` (0xFFFFEC91) — `argv_bytes > CMDR_ARGV_MAX`
+  (8192).
+- `CMDR_ERR_TRUNCATED` (0xFFFFEC92) — `dst_len < record_len`.
+- `CMDR_ERR_BAD_EXIT` (0xFFFFEC93) — `close` only: `exit_code >
+  255`. `CMDR_EXIT_PENDING` deliberately above the ceiling so it
+  cannot be confused with a real exit.
+
+### 4e.5 Substrate deferral (libpdx-audit)
+
+The M3 module builds the wire bytes. The M4+ substrate wiring
+calls libpdx-audit's `audit_begin`/`audit_commit` around the
+begin/close encoder pair, writing the bytes to
+`/system/audit/user-events/` via `sys_ipc_send(svc.audit-journal,
+encoded_bytes)`. libpdx-audit has landed M2 (per STATUS.md
+sibling-libraries list); the cross-repo linkage lands with M4 when
+the smoke matrix pulls both sides into one build.
+
 ## 5. Return-code band `0xFFFFECxx`
 
 ```
@@ -440,6 +625,18 @@ never receive this cap (history subtree is the shell's own state).
 0xFFFFEC60  HIST_ERR_BAD_ARGS   History.M2: dst == 0 or cmd_ptr == 0
 0xFFFFEC61  HIST_ERR_TOO_LONG   History.M2: cmd_len > HIST_CMD_MAX
 0xFFFFEC62  HIST_ERR_TRUNCATED  History.M2: dst_len < required
+0xFFFFEC70  PP_ERR_BAD_ARGS     PipePassthrough.M3: src/dst null or src_len<8
+0xFFFFEC71  PP_ERR_TRUNCATED    PipePassthrough.M3: src_len < 8+payload_len
+0xFFFFEC72  PP_ERR_DST_OVERFLOW PipePassthrough.M3: dst_max < 8+payload_len
+0xFFFFEC73  PP_ERR_OVERSIZED    PipePassthrough.M3: payload_len > PP_MAX_PAYLOAD
+0xFFFFEC80  COMP_ERR_BAD_ARGS   Completion.M3: dst/name null, kind/score OOR
+0xFFFFEC81  COMP_ERR_TOO_LONG   Completion.M3: name_len > COMP_NAME_MAX
+0xFFFFEC82  COMP_ERR_TRUNCATED  Completion.M3: dst_len < required
+0xFFFFEC83  COMP_ERR_EMPTY_NAME Completion.M3: name_len == 0
+0xFFFFEC90  CMDR_ERR_BAD_ARGS   CommandRecord.M3: dst null or audit_id == 0
+0xFFFFEC91  CMDR_ERR_TOO_LONG   CommandRecord.M3: argv_bytes > CMDR_ARGV_MAX
+0xFFFFEC92  CMDR_ERR_TRUNCATED  CommandRecord.M3: dst_len < required
+0xFFFFEC93  CMDR_ERR_BAD_EXIT   CommandRecord.M3: exit_code > 255 (close)
 ```
 
 The band sits below libpdx-elevate's `0xFFFFEA00..0xFFFFEA0F` and
