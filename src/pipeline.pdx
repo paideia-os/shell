@@ -304,8 +304,8 @@ module Pipeline = structure {
         // (scale 32 is not a native SIB scale; compute the base ptr).
         mov r10, rbx;
         shl r10, 5;                          // r10 = rbx * 32
-        mov [r12 + r10 + 0], rax;            // wire[0..7] of writer
-        mov [r12 + r10 + 8], rbx;            // wire[8..15] = pipe id
+        mov [r12 + r10 * 1 + 0], rax;            // wire[0..7] of writer (U1606: index needs explicit *1 scale)
+        mov [r12 + r10 * 1 + 8], rbx;            // wire[8..15] = pipe id
 
         // Entry 2p+1: downstream READER.
         //   qword0 = PL_STDIN_SLOT (0)
@@ -321,8 +321,8 @@ module Pipeline = structure {
 
         mov r10, rbx;
         shl r10, 5;                          // r10 = rbx * 32
-        mov [r12 + r10 + 16], rax;           // wire[0..7] of reader
-        mov [r12 + r10 + 24], rbx;           // wire[8..15] = pipe id
+        mov [r12 + r10 * 1 + 16], rax;           // wire[0..7] of reader
+        mov [r12 + r10 * 1 + 24], rbx;           // wire[8..15] = pipe id
 
         // Advance.
         add rbx, 1;

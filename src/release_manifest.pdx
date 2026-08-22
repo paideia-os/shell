@@ -563,8 +563,8 @@ module ReleaseManifest = structure {
         cmp rbx, r15;
         jae rm_kv_done;
         xor rax, rax;
-        mov_b rax, [r13 + rbx];              // #1248 byte load
-        mov_b [r14 + rbx + 4], rax;
+        mov_b rax, [r13 + rbx * 1];              // #1248 byte load (U1606: index needs explicit *1 scale)
+        mov_b [r14 + rbx * 1 + 4], rax;
         add rbx, 1;
         jmp rm_kv_copy_head;
 
@@ -721,8 +721,8 @@ module ReleaseManifest = structure {
         cmp rbx, r15;
         jae rm_sb_done;
         xor rax, rax;
-        mov_b rax, [r13 + rbx];
-        mov_b [r14 + rbx + 4], rax;
+        mov_b rax, [r13 + rbx * 1];              // U1606: index needs explicit *1 scale
+        mov_b [r14 + rbx * 1 + 4], rax;
         add rbx, 1;
         jmp rm_sb_copy_head;
 
@@ -732,7 +732,7 @@ module ReleaseManifest = structure {
         cmp rbx, r15;
         jae rm_sb_done;
         xor rax, rax;
-        mov_b [r14 + rbx + 4], rax;
+        mov_b [r14 + rbx * 1 + 4], rax;
         add rbx, 1;
         jmp rm_sb_zero_head;
 

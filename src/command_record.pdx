@@ -306,8 +306,8 @@ module CommandRecord = structure {
         cmp rbx, rcx;
         jae cr_bg_copy_done;
         xor rax, rax;
-        mov_b rax, [r13 + rbx];              // #1248 byte load
-        mov_b [r12 + rbx + 48], rax;         // byte store at hdr + i
+        mov_b rax, [r13 + rbx * 1];              // #1248 byte load (U1606: index needs explicit *1 scale)
+        mov_b [r12 + rbx * 1 + 48], rax;         // byte store at hdr + i
         add rbx, 1;
         jmp cr_bg_copy_head;
       cr_bg_copy_done:
@@ -320,7 +320,7 @@ module CommandRecord = structure {
         cmp rbx, r14;
         jae cr_bg_pad_done;
         xor rax, rax;
-        mov_b [r12 + rbx], rax;              // zero byte
+        mov_b [r12 + rbx * 1], rax;              // zero byte
         add rbx, 1;
         jmp cr_bg_pad_head;
       cr_bg_pad_done:

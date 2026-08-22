@@ -286,9 +286,9 @@ module History = structure {
         jae hs_er_copy_done;
         // Read one byte from cmd_ptr[i] via #1248 pattern.
         xor rax, rax;
-        mov_b rax, [r13 + rbx];
+        mov_b rax, [r13 + rbx * 1];              // U1606: index needs explicit *1 scale
         // Write it at dst[HIST_HEADER_SIZE + i] = dst[24 + i].
-        mov_b [r12 + rbx + 24], rax;
+        mov_b [r12 + rbx * 1 + 24], rax;
         add rbx, 1;
         jmp hs_er_copy_head;
       hs_er_copy_done:
@@ -304,7 +304,7 @@ module History = structure {
         cmp rbx, r14;
         jae hs_er_pad_done;
         xor rax, rax;
-        mov_b [r12 + rbx], rax;              // zero byte
+        mov_b [r12 + rbx * 1], rax;              // zero byte
         add rbx, 1;
         jmp hs_er_pad_head;
       hs_er_pad_done:

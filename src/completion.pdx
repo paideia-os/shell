@@ -324,9 +324,9 @@ module Completion = structure {
         jae cp_er_copy_done;
         // Read one byte from name_ptr[i] via #1248 pattern.
         xor rax, rax;
-        mov_b rax, [r13 + rbx];
+        mov_b rax, [r13 + rbx * 1];              // U1606: index needs explicit *1 scale
         // Write it at dst[COMP_HEADER_SIZE + i] = dst[16 + i].
-        mov_b [r12 + rbx + 16], rax;
+        mov_b [r12 + rbx * 1 + 16], rax;
         add rbx, 1;
         jmp cp_er_copy_head;
       cp_er_copy_done:
@@ -340,7 +340,7 @@ module Completion = structure {
         cmp rbx, r14;
         jae cp_er_pad_done;
         xor rax, rax;
-        mov_b [r12 + rbx], rax;              // zero byte
+        mov_b [r12 + rbx * 1], rax;              // zero byte
         add rbx, 1;
         jmp cp_er_pad_head;
       cp_er_pad_done:

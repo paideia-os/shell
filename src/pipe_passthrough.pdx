@@ -278,8 +278,8 @@ module PipePassthrough = structure {
         cmp rbx, r14;
         jae pp_fw_copy_done;
         xor rax, rax;
-        mov_b rax, [r12 + rbx];              // #1248 byte load
-        mov_b [r13 + rbx], rax;              // byte store
+        mov_b rax, [r12 + rbx * 1];              // #1248 byte load (U1606: index needs explicit *1 scale)
+        mov_b [r13 + rbx * 1], rax;              // byte store
         add rbx, 1;
         jmp pp_fw_copy_head;
       pp_fw_copy_done:
