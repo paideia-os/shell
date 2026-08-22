@@ -1,18 +1,64 @@
 # tests/
 
-Empty at M1 by design. The correctness matrix — pipeline
-correctness (2-stage, 3-stage, cross-schema, schema-mismatch),
-caps-narrowing violation (child receives cap not in its caps.decl →
-reject), audit-first invariant (child cannot emit before audit
-record is durable), `.pds` script test suite, and the QEMU
-interactive smoke (login → prompt → `ls | cat` → history persists
-across reboot) — lands with `shell.M4-001` through `shell.M4-003`
-per `design/tooling/r49-r50-plan.md` §5.2 in paideia-os.
+M4 landed here (issues #12, #13, #14 per
+`design/tooling/r49-r50-plan.md` §5.2 in paideia-os). Every fixture
+is a pure-function driver against a shell-repo encoder / narrower;
+no substrate calls, no QEMU, no live filesystem. The three modules
+compile against paideia-as and expose a `*_run_all` entry each that
+returns 0 on all-pass or a distinct `0xFFFFED*x` fail code otherwise.
 
-The M1 skeleton wired here (Shell / LineReader / Exec) is validated
-against its own return-code contract at M2, when the pipeline
-substrate lands and the `_start` frame binds the run loop. Every M1
-entry point already returns its documented `LR_STUB` / `EX_STUB` /
-`LR_ERR_BAD_BUF` / `EX_ERR_BAD_ARGV` sentinels so the M2 tests can
-diff a live run against the M1 skeleton with a mechanical rule
-(`if rc == LR_STUB: still on M1; if rc == LR_OK: M2 live`).
+## Files
+
+- `test_caps_narrow.pdx` (shell.M4-001, issue #12) — `TestCapsNarrow`
+  module: 8 test cases against `Exec.exec_narrow_child_caps` (M2-003).
+  Covers HAPPY, NARROWING, MISSING, WIDENING, SIDECAR_FULL, ZERO_DECL,
+  and two BAD_ARGV null-pointer cases. Fail code band 0xFFFFED0x.
+  Driver: `tcn_run_all()`.
+
+- `test_audit_first.pdx` (shell.M4-002, issue #13) — `TestAuditFirst`
+  module: 8 test cases against `CommandRecord.command_record_begin`
+  and `command_record_close` (M3-003). Covers BEGIN_OK, CLOSE_EXIT0,
+  CLOSE_EXIT1, CLOSE_NO_BEGIN, CLOSE_EXIT_OOR, BEGIN_ID_ZERO,
+  CLOSE_PENDING, and a load-bearing ORDERING round-trip. Fail code
+  band 0xFFFFED1x. Driver: `taf_run_all()`.
+
+- `test_smoke_matrix.pdx` (shell.M4-003, issue #14) — `TestSmokeMatrix`
+  module: 4 encoder-half fixtures for the `ls | cat` QEMU smoke.
+  Produces + validates the golden wire bytes for a 2-stage pipeline,
+  two ShellCommandRecords, and one HistoryEntry. The substrate half
+  (booted QEMU + serial-console-scripted interactive `login → prompt
+  → ls | cat → reboot → history`) is a paideia-os-side script gated
+  on this module's `tsm_run_all()` returning 0. Fail code band
+  0xFFFFED2x.
+
+## Driver entry points
+
+Each `*_run_all` returns:
+
+- `0` — all cases in that module passed.
+- `0xFFFFED0x` — first failing case in test_caps_narrow.
+- `0xFFFFED1x` — first failing case in test_audit_first.
+- `0xFFFFED2x` — first failing case in test_smoke_matrix.
+
+The three bands are disjoint from the shell's own 0xFFFFECxx band
+so an operator reading a test-run log can distinguish "SUT rejected
+input" from "test framework detected the SUT did the wrong thing"
+by the high two bytes of the return alone.
+
+## What is NOT here
+
+- **Live QEMU smoke.** The `login → prompt → ls | cat → history
+  persists across reboot` interactive run lives on the paideia-os
+  side, gated by `tsm_run_all()` as its pre-QEMU checker. See
+  `.plans/m4-003-notes.md` for the substrate gaps.
+- **Fuzzers.** M4 rubric names "pre-release fuzzers"; the encoder-
+  half here is deterministic-fixture-driven, sufficient for the
+  8-case matrix + 8-case matrix + 4-case matrix that M4-001/002/003
+  spec. Fuzz-corpus generation lands at M5 (release-prep) when
+  libpdx-cap's caps.decl fuzzer generates cross-tool cap manifests
+  for the caps_narrow SUT.
+- **libpdx-* cross-repo integration.** The shell tests use the
+  shell's own encoders only. libpdx-audit / libpdx-cap / libpdx-
+  semantic-pipe / libpdx-argv have their own test modules; the
+  cross-repo linkage lands with paideia-os smoke harness pulling
+  all sides into one build.

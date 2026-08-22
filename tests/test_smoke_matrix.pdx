@@ -1,0 +1,795 @@
+// tests/test_smoke_matrix.pdx -- shell.M4-003 (paideia-os/shell#14)
+//
+// TestSmokeMatrix module: composite fixture for the QEMU smoke run
+// "login -> prompt -> ls | cat -> history persists across reboot".
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Per design/tooling/r49-r50-plan.md §5.2 M4-003: the shell must
+// pass a QEMU interactive smoke where the operator logs in, is
+// presented with the shell prompt, runs `ls | cat`, and observes the
+// history persist across a reboot. The smoke run itself lives in the
+// paideia-os side (a paideia-os tools/verify-user-shell.sh + a
+// tools/run-qemu.sh boot script that scripts a serial-console
+// interaction), because that is where a full QEMU harness exists.
+// The shell repo cannot boot itself; the substrate gaps documented
+// in STATUS.md ("Userspace sys_execve / sys_wait4 wrapper", "Userspace
+// sys_ipc_recv / endpoint-mint wrapper", "Userspace PdxFS-write path",
+// "Userspace sys_ipc_send to svc.audit-journal") mean the local
+// build produces only the encoder halves.
+//
+// What this module DOES ship:
+//
+//   * The composite in-shell BYTE FIXTURES for the smoke scenario --
+//     a 2-stage pipeline sidecar, two paired ShellCommandRecords
+//     (ls and cat), and one HistoryEntry for the "ls | cat" line.
+//   * A `tsm_produce_all` entry that populates each fixture from the
+//     shell's own encoders (pipeline_plan + command_record_begin/close
+//     + history_encode_record). The result is a stream of bytes that,
+//     when fed to the paideia-os side's smoke checker, byte-matches
+//     the golden fingerprint the QEMU run should produce.
+//   * A `tsm_golden_pipeline` / `tsm_golden_cmdrec_ls` / `tsm_golden_
+//     cmdrec_cat` / `tsm_golden_hist` set of verifier entries that
+//     compare each fixture region against a HAND-COMPUTED expected
+//     value. The hand computation lives in the justification block
+//     for each verifier so a reader can re-derive it from the wire
+//     format specs alone.
+//
+// What this module DOES NOT ship (and why not):
+//
+//   * A live sys_execve dispatch to actually spawn `ls` and `cat`.
+//     That is the M4+ substrate-wiring job -- the shell needs a
+//     userspace-side sys_execve wrapper that the paideia-os R17
+//     kernel API already exposes but the shell repo has not yet
+//     linked. This test's role is to prove the encoders produce the
+//     right bytes; the substrate test proves the syscalls carry
+//     them through.
+//   * A reboot cycle. The persistence half of the smoke ("history
+//     persists across reboot") is a paideia-os side check: after
+//     shutdown + boot, the ~/.history/<session>-<ts>.pdxhist file
+//     must still exist with the "ls | cat" HistoryEntry inside it.
+//     The test here proves the ENCODED record has the shape a re-
+//     read would recognise; the ACTUAL persistence test lives in
+//     paideia-os tools/verify-user-shell.sh alongside the pdxfs-lite
+//     e2e smoke.
+//
+// The M4+ smoke harness in paideia-os invokes this module's
+// tsm_run_all() as one of its pre-QEMU gates: if the encoders don't
+// even produce the golden bytes at a local build, there is no point
+// booting the guest.
+//
+// =============================================================================
+// SCENARIO (the "ls | cat" run)
+// =============================================================================
+//
+// Sequence of shell events the smoke observes:
+//
+//   (1) shell mints its session cap (session_mint at slot=3,
+//       session_id=0xDEADBEEF cafe). [not fixture'd here; covered by
+//       Session tests at library level -- this scenario begins after
+//       the session is minted.]
+//   (2) shell reads the line "ls | cat\n" from KIND_TTY. Line reader
+//       returns 8 bytes ("ls | cat"). [not fixture'd; smoke concern.]
+//   (3) shell plans a 2-stage pipeline (stages_count = 2). One `|`
+//       operator produces 2 sidecar entries (WRITE for ls stdout,
+//       READ for cat stdin), both carrying pipe id 0.
+//   (4) shell calls command_record_begin for `ls` (audit_id = 0x1001).
+//   (5) shell would call sys_execve for `ls` at this point (M4+ substrate).
+//   (6) shell calls command_record_begin for `cat` (audit_id = 0x1002).
+//   (7) shell would call sys_execve for `cat` at this point (M4+ substrate).
+//   (8) shell waits for both children. `ls` exits 0; `cat` exits 0.
+//   (9) shell calls command_record_close for `ls` (exit=0, ts=0x2001...).
+//   (10) shell calls command_record_close for `cat` (exit=0, ts=0x2002...).
+//   (11) shell calls history_encode_record with the line "ls | cat"
+//        (cmd_len = 8), ts=0x1000..., flags=0.
+//   (12) shell would write the history record to ~/.history/... via
+//        PdxFS-write (M4+ substrate).
+//
+// The M4-003 module produces the bytes for steps 3, 4/9, 6/10, and 11
+// into four separate .bss regions the smoke checker can memcmp against
+// its golden fingerprints.
+//
+// =============================================================================
+// FIXTURE LAYOUT
+// =============================================================================
+//
+//   _tsm_pipe    64 bytes  -- 4 wire records but only 2 written by
+//                              pipeline_plan(stages_count=2)
+//   _tsm_ls_rec  128 bytes -- ShellCommandRecord for "ls", argv "ls\0"
+//   _tsm_cat_rec 128 bytes -- ShellCommandRecord for "cat", argv "cat\0"
+//   _tsm_hist    64 bytes  -- HistoryEntry for "ls | cat" (8 bytes cmd)
+//   _tsm_ls_argv 8 bytes   -- "ls\0" (3 bytes, rest zero)
+//   _tsm_cat_argv 8 bytes  -- "cat\0" (4 bytes, rest zero)
+//   _tsm_hist_cmd 16 bytes -- "ls | cat" (8 bytes, rest zero)
+//
+// The 128-byte record buffers over-provision for header (48) + argv
+// (<=4) + pad (<=7) = 59 bytes actual; the extra 69 bytes let the
+// encoder padding-zero loop go without a truncation gate misfire.
+//
+// =============================================================================
+// GOLDEN VALUES (derived from the wire format specs)
+// =============================================================================
+//
+// Pipeline (2 stages, 1 pipe, target_ptr = pipe id 0, stdout slot 1,
+// stdin slot 0):
+//   entry[0] qword0 = 1 | (5 << 16) | (0x2 << 32) = 0x00000002_00050001
+//   entry[0] qword1 = 0 (pipe id)
+//   entry[1] qword0 = 0 | (5 << 16) | (0x1 << 32) = 0x00000001_00050000
+//   entry[1] qword1 = 0 (same pipe id)
+//
+// Ls CommandRecord (audit_id=0x1001, ts_begin=0x1001..., ts_end=
+// 0x2001..., argv_bytes=3 for "ls\0", exit=0):
+//   qword0 = magic 0x52444d43 | (record_len 56 << 32) = 0x00000038_52444d43
+//     -- record_len = (48 + 3 + 7) & ~7 = 56.
+//   qword1 = 0x1001
+//   qword2 = 0x1001000000000000
+//   qword3 = 0x2001000000000000  (after close)
+//   qword4 = 3 | (0 << 32) = 3  (after close; argv_bytes preserved, exit=0)
+//   qword5 = 1 (CLOSED, no HAS_ERROR)
+//
+// Cat CommandRecord (audit_id=0x1002, ts_begin=0x1002..., ts_end=
+// 0x2002..., argv_bytes=4 for "cat\0", exit=0):
+//   qword0 = magic | (56 << 32) = 0x00000038_52444d43  (same: 48+4+7)&~7 = 56)
+//   qword1 = 0x1002
+//   qword2 = 0x1002000000000000
+//   qword3 = 0x2002000000000000
+//   qword4 = 4
+//   qword5 = 1
+//
+// HistoryEntry (magic 0x54534948 "HIST", cmd_len=8 for "ls | cat",
+// ts=0x1000..., flags=0):
+//   record_len = (24 + 8 + 7) & ~7 = 32
+//   qword0 = magic | (record_len << 32) = 0x00000020_54534948
+//   qword1 = ts = 0x1000000000000000
+//   qword2 = cmd_len 8 | (flags 0 << 32) = 8
+//
+// =============================================================================
+// RETURN CODES
+// =============================================================================
+//
+//   0            TSM_PASS               all fixtures + verifiers passed
+//   0xFFFFED21   TSM_FAIL_PIPELINE      pipeline_plan or verifier failed
+//   0xFFFFED22   TSM_FAIL_LS_BEGIN      ls command_record_begin/close failed
+//   0xFFFFED23   TSM_FAIL_CAT_BEGIN     cat command_record_begin/close failed
+//   0xFFFFED24   TSM_FAIL_HIST          history_encode_record failed
+//   0xFFFFED25   TSM_FAIL_PIPELINE_GLD  pipeline bytes != golden
+//   0xFFFFED26   TSM_FAIL_LS_GOLDEN     ls record bytes != golden
+//   0xFFFFED27   TSM_FAIL_CAT_GOLDEN    cat record bytes != golden
+//   0xFFFFED28   TSM_FAIL_HIST_GOLDEN   history bytes != golden
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestSmokeMatrix`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF; large-imm compares
+//     move the expected value into r11 first (`mov r11, imm64; cmp
+//     rax, r11`).
+//   - r11 scratch for .bss reach + large-imm compare temporaries.
+//   - Byte writes for argv/cmd fixtures use mov_b (destination-write
+//     side of #1248 pattern).
+//   - Every non-leaf entry has 6 pushes + `sub rsp, 8` = 56 bytes
+//     prologue; rsp % 16 == 0 for the SysV encoder calls.
+
+module TestSmokeMatrix = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED2x band)
+  // ==========================================================================
+  pub let TSM_PASS               : u64 = 0
+  pub let TSM_FAIL_PIPELINE      : u64 = 0xFFFFED21
+  pub let TSM_FAIL_LS_BEGIN      : u64 = 0xFFFFED22
+  pub let TSM_FAIL_CAT_BEGIN     : u64 = 0xFFFFED23
+  pub let TSM_FAIL_HIST          : u64 = 0xFFFFED24
+  pub let TSM_FAIL_PIPELINE_GLD  : u64 = 0xFFFFED25
+  pub let TSM_FAIL_LS_GOLDEN     : u64 = 0xFFFFED26
+  pub let TSM_FAIL_CAT_GOLDEN    : u64 = 0xFFFFED27
+  pub let TSM_FAIL_HIST_GOLDEN   : u64 = 0xFFFFED28
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  // ==========================================================================
+  pub let mut _tsm_pipe     : [u64; 8]  = uninit @align(16)
+  pub let mut _tsm_ls_rec   : [u64; 16] = uninit @align(16)
+  pub let mut _tsm_cat_rec  : [u64; 16] = uninit @align(16)
+  pub let mut _tsm_hist     : [u64; 8]  = uninit @align(8)
+  pub let mut _tsm_ls_argv  : [u64; 1]  = uninit @align(8)
+  pub let mut _tsm_cat_argv : [u64; 1]  = uninit @align(8)
+  pub let mut _tsm_hist_cmd : [u64; 2]  = uninit @align(8)
+
+  // ==========================================================================
+  // tsm_reset()
+  //
+  // Zero every fixture and re-populate the argv / cmd byte fixtures:
+  //   _tsm_ls_argv  = "ls\0"       (3 bytes; bytes 3..7 zero)
+  //   _tsm_cat_argv = "cat\0"      (4 bytes; bytes 4..7 zero)
+  //   _tsm_hist_cmd = "ls | cat"   (8 bytes; bytes 8..15 zero)
+  //
+  // The zero-fill loops run first; the argv writes then overwrite the
+  // low bytes. This produces a deterministic fixture for each run and
+  // lets the encoders run against clean input.
+  //
+  // Leaf function; r10 base, rcx index, rax byte constant.
+  // ==========================================================================
+  pub let tsm_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-003 (#14): zero all 7 fixture buffers and populate the argv+cmd byte fixtures with 'ls\\0' / 'cat\\0' / 'ls | cat'. Leaf function; loop bounds all fit imm <= 0x7FFFFFFF. Labels prefixed tsm_rs_.",
+      block: {
+        // Zero _tsm_pipe (8 qwords).
+        lea r10, [rip + _tsm_pipe];
+        xor rax, rax;
+        xor rcx, rcx;
+      tsm_rs_p_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  tsm_rs_p_loop;
+
+        // Zero _tsm_ls_rec (16 qwords).
+        lea r10, [rip + _tsm_ls_rec];
+        xor rcx, rcx;
+      tsm_rs_lr_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tsm_rs_lr_loop;
+
+        // Zero _tsm_cat_rec (16 qwords).
+        lea r10, [rip + _tsm_cat_rec];
+        xor rcx, rcx;
+      tsm_rs_cr_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tsm_rs_cr_loop;
+
+        // Zero _tsm_hist (8 qwords).
+        lea r10, [rip + _tsm_hist];
+        xor rcx, rcx;
+      tsm_rs_h_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 8;
+        jb  tsm_rs_h_loop;
+
+        // Zero + populate _tsm_ls_argv: "ls\0" (3 bytes).
+        lea r10, [rip + _tsm_ls_argv];
+        mov [r10 + 0], rax;                   // zero qword
+        mov rax, 0x6c;                        // 'l'
+        mov_b [r10 + 0], rax;
+        mov rax, 0x73;                        // 's'
+        mov_b [r10 + 1], rax;
+        xor rax, rax;
+        mov_b [r10 + 2], rax;                 // 0
+
+        // Zero + populate _tsm_cat_argv: "cat\0" (4 bytes).
+        lea r10, [rip + _tsm_cat_argv];
+        mov [r10 + 0], rax;                   // zero qword
+        mov rax, 0x63;                        // 'c'
+        mov_b [r10 + 0], rax;
+        mov rax, 0x61;                        // 'a'
+        mov_b [r10 + 1], rax;
+        mov rax, 0x74;                        // 't'
+        mov_b [r10 + 2], rax;
+        xor rax, rax;
+        mov_b [r10 + 3], rax;                 // 0
+
+        // Zero + populate _tsm_hist_cmd: "ls | cat" (8 bytes).
+        lea r10, [rip + _tsm_hist_cmd];
+        mov [r10 + 0], rax;                   // zero qword0
+        mov [r10 + 8], rax;                   // zero qword1
+        mov rax, 0x6c;                        // 'l'
+        mov_b [r10 + 0], rax;
+        mov rax, 0x73;                        // 's'
+        mov_b [r10 + 1], rax;
+        mov rax, 0x20;                        // ' '
+        mov_b [r10 + 2], rax;
+        mov rax, 0x7c;                        // '|'
+        mov_b [r10 + 3], rax;
+        mov rax, 0x20;                        // ' '
+        mov_b [r10 + 4], rax;
+        mov rax, 0x63;                        // 'c'
+        mov_b [r10 + 5], rax;
+        mov rax, 0x61;                        // 'a'
+        mov_b [r10 + 6], rax;
+        mov rax, 0x74;                        // 't'
+        mov_b [r10 + 7], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tsm_case_pipeline() -> u64
+  //
+  // Call pipeline_plan(dst=_tsm_pipe, stages_count=2, dst_max=4,
+  // first_slot=0). Expect PL_OK (0), pipeline_entries_written == 2.
+  // Verify golden bytes at [_tsm_pipe]:
+  //   qword0 = 1 | (5 << 16) | (0x2 << 32) = 0x00000002_00050001
+  //   qword1 = 0 (pipe id 0)
+  //   qword2 = 0 | (5 << 16) | (0x1 << 32) = 0x00000001_00050000
+  //   qword3 = 0
+  // ==========================================================================
+  pub let tsm_case_pipeline : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-003 (#14): the pipeline half of the ls|cat smoke. pipeline_plan with stages_count=2 must produce 2 wire entries: entry[0] is the ls-side WRITE cap for pipe 0 (kind=5, rights=0x2, slot=1); entry[1] is the cat-side READ cap for the same pipe (kind=5, rights=0x1, slot=0). If the SUT emits mismatched pipe ids in target_ptr, the loader-side validator (in paideia-os R20b.M4) would refuse the pairing and the two children would exec on unpaired endpoints -- the smoke would silently hang on the reader. This test proves the encoder pairs pipe ids correctly. 6 pushes prologue; labels prefixed tsm_pl_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tsm_reset;
+
+        // pipeline_plan(_tsm_pipe, 2, 4, 0).
+        lea rdi, [rip + _tsm_pipe];
+        mov rsi, 2;                          // stages_count
+        mov rdx, 4;                          // dst_max_entries
+        mov rcx, 0;                          // first_slot (unused at M2)
+        call pipeline_plan;
+        cmp rax, 0;
+        jne tsm_pl_fail;
+
+        // Verify pipeline_entries_written == 2.
+        lea r10, [rip + pipeline_entries_written];
+        mov rax, [r10];
+        cmp rax, 2;
+        jne tsm_pl_fail;
+
+        // Verify golden bytes.
+        lea r12, [rip + _tsm_pipe];
+
+        // entry[0] qword0 = 0x00000002_00050001 (slot=1, kind=5, rights=WRITE).
+        mov rax, [r12 + 0];
+        mov r11, 0x0000000200050001;
+        cmp rax, r11;
+        jne tsm_pl_gld_fail;
+
+        // entry[0] qword1 = 0 (pipe id).
+        mov rax, [r12 + 8];
+        cmp rax, 0;
+        jne tsm_pl_gld_fail;
+
+        // entry[1] qword0 = 0x00000001_00050000 (slot=0, kind=5, rights=READ).
+        mov rax, [r12 + 16];
+        mov r11, 0x0000000100050000;
+        cmp rax, r11;
+        jne tsm_pl_gld_fail;
+
+        // entry[1] qword1 = 0 (same pipe id).
+        mov rax, [r12 + 24];
+        cmp rax, 0;
+        jne tsm_pl_gld_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_pl_fail:
+        mov rax, 0xFFFFED21;                 // TSM_FAIL_PIPELINE
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_pl_gld_fail:
+        mov rax, 0xFFFFED25;                 // TSM_FAIL_PIPELINE_GLD
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tsm_case_ls_cmdrec() -> u64
+  //
+  // command_record_begin then close for `ls` (audit_id=0x1001,
+  // argv="ls\0", exit=0). Verify final header state.
+  // ==========================================================================
+  pub let tsm_case_ls_cmdrec : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-003 (#14): the ls-half of the smoke's paired ShellCommandRecords. Begin + close round-trip against argv 'ls\\0' (3 bytes), audit_id 0x1001, ts_begin 0x1001...0, ts_end 0x2001...0, exit=0. record_len must be (48+3+7)&~7 = 56. Post-close: qword0 fuses magic and record_len; qword4 = argv_bytes=3 with exit=0 in the high 32 (0 << 32 = 0, so qword4 = 3); qword5 = CLOSED (0x1) with no HAS_ERROR (exit was 0). If any byte deviates, the paideia-os smoke checker will find a byte-mismatch in the audit journal for ls's record and fail the smoke. 6 pushes prologue; labels prefixed tsm_lr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tsm_reset;
+
+        // begin.
+        lea rdi, [rip + _tsm_ls_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _tsm_ls_argv];
+        mov rcx, 3;                          // argv_bytes ("ls\0")
+        mov r8,  0x1001;                     // audit_id
+        mov r9,  0x1001000000000000;         // ts_begin
+        call command_record_begin;
+        cmp rax, 0;
+        jne tsm_lr_fail;
+
+        // close(ts_end=0x2001...0, exit=0).
+        lea rdi, [rip + _tsm_ls_rec];
+        mov rsi, 128;
+        mov rdx, 0x2001000000000000;
+        mov rcx, 0;
+        call command_record_close;
+        cmp rax, 0;
+        jne tsm_lr_fail;
+
+        // Verify golden bytes.
+        lea r12, [rip + _tsm_ls_rec];
+
+        // qword0 = magic 0x52444d43 | (record_len 56 << 32) = 0x00000038_52444d43.
+        mov rax, [r12 + 0];
+        mov r11, 0x0000003852444d43;
+        cmp rax, r11;
+        jne tsm_lr_gld_fail;
+
+        // qword1 = audit_id 0x1001.
+        mov rax, [r12 + 8];
+        cmp rax, 0x1001;
+        jne tsm_lr_gld_fail;
+
+        // qword2 = ts_begin.
+        mov rax, [r12 + 16];
+        mov r11, 0x1001000000000000;
+        cmp rax, r11;
+        jne tsm_lr_gld_fail;
+
+        // qword3 = ts_end.
+        mov rax, [r12 + 24];
+        mov r11, 0x2001000000000000;
+        cmp rax, r11;
+        jne tsm_lr_gld_fail;
+
+        // qword4 = argv_bytes 3 | (exit 0 << 32) = 3.
+        mov rax, [r12 + 32];
+        cmp rax, 3;
+        jne tsm_lr_gld_fail;
+
+        // qword5 = CLOSED (1); no HAS_ERROR (exit=0).
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne tsm_lr_gld_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_lr_fail:
+        mov rax, 0xFFFFED22;                 // TSM_FAIL_LS_BEGIN
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_lr_gld_fail:
+        mov rax, 0xFFFFED26;                 // TSM_FAIL_LS_GOLDEN
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tsm_case_cat_cmdrec() -> u64
+  //
+  // Same shape as tsm_case_ls_cmdrec but for `cat` (audit=0x1002,
+  // argv="cat\0", record_len 56 too because (48+4+7)&~7 = 56).
+  // ==========================================================================
+  pub let tsm_case_cat_cmdrec : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-003 (#14): the cat-half of the paired ShellCommandRecords. Symmetric to tsm_case_ls_cmdrec but with argv 'cat\\0' (4 bytes) -- record_len is the same 56 because 48+4+7 rounds to 56 too. audit_id 0x1002 distinguishes cat from ls in the audit journal; a smoke run must observe both records with distinct IDs. 6 pushes prologue; labels prefixed tsm_cr_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tsm_reset;
+
+        lea rdi, [rip + _tsm_cat_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _tsm_cat_argv];
+        mov rcx, 4;                          // argv_bytes ("cat\0")
+        mov r8,  0x1002;
+        mov r9,  0x1002000000000000;
+        call command_record_begin;
+        cmp rax, 0;
+        jne tsm_cr_fail;
+
+        lea rdi, [rip + _tsm_cat_rec];
+        mov rsi, 128;
+        mov rdx, 0x2002000000000000;
+        mov rcx, 0;
+        call command_record_close;
+        cmp rax, 0;
+        jne tsm_cr_fail;
+
+        lea r12, [rip + _tsm_cat_rec];
+
+        // qword0 = magic | (56 << 32).
+        mov rax, [r12 + 0];
+        mov r11, 0x0000003852444d43;
+        cmp rax, r11;
+        jne tsm_cr_gld_fail;
+
+        // qword1 = audit_id 0x1002.
+        mov rax, [r12 + 8];
+        cmp rax, 0x1002;
+        jne tsm_cr_gld_fail;
+
+        // qword2 = ts_begin.
+        mov rax, [r12 + 16];
+        mov r11, 0x1002000000000000;
+        cmp rax, r11;
+        jne tsm_cr_gld_fail;
+
+        // qword3 = ts_end.
+        mov rax, [r12 + 24];
+        mov r11, 0x2002000000000000;
+        cmp rax, r11;
+        jne tsm_cr_gld_fail;
+
+        // qword4 = 4 (argv_bytes) | 0.
+        mov rax, [r12 + 32];
+        cmp rax, 4;
+        jne tsm_cr_gld_fail;
+
+        // qword5 = CLOSED.
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne tsm_cr_gld_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_cr_fail:
+        mov rax, 0xFFFFED23;                 // TSM_FAIL_CAT_BEGIN
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_cr_gld_fail:
+        mov rax, 0xFFFFED27;                 // TSM_FAIL_CAT_GOLDEN
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tsm_case_hist() -> u64
+  //
+  // Call history_encode_record(dst=_tsm_hist, dst_len=64,
+  // cmd=_tsm_hist_cmd, cmd_len=8 for "ls | cat", ts=0x1000...0,
+  // flags=0). Expect HIST_OK (0), history_bytes_written == 32 (record_len).
+  // Verify golden:
+  //   qword0 = magic 0x54534948 | (32 << 32) = 0x00000020_54534948
+  //   qword1 = ts 0x1000000000000000
+  //   qword2 = cmd_len 8 | (flags 0 << 32) = 8
+  //   bytes[24..31] = "ls | cat" (8 bytes)
+  // ==========================================================================
+  pub let tsm_case_hist : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-003 (#14): the history persistence half. After ls and cat both exit, the shell encodes 'ls | cat' as one HistoryEntry (magic 'HIST', cmd_len=8, ts=0x1000...0, flags=0). record_len = (24+8+7)&~7 = 32. The M4+ substrate wiring would then append these 32 bytes to ~/.history/<session>-<ts>.pdxhist via PdxFS-write; a subsequent boot reads the file and displays the entry in `history` output. This test proves the encoder produces the exact 32 bytes the persistence-across-reboot half of the smoke depends on -- if the encoder is off by one byte, the smoke's post-reboot `history` output would either drop the entry or read into padding. 6 pushes prologue; labels prefixed tsm_hs_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tsm_reset;
+
+        // history_encode_record(dst, dst_len, cmd_ptr, cmd_len, ts_ns, flags).
+        lea rdi, [rip + _tsm_hist];
+        mov rsi, 64;
+        lea rdx, [rip + _tsm_hist_cmd];
+        mov rcx, 8;                          // cmd_len ("ls | cat")
+        mov r8,  0x1000000000000000;         // ts_ns
+        mov r9,  0;                          // flags
+        call history_encode_record;
+        cmp rax, 0;
+        jne tsm_hs_fail;
+
+        // Verify history_bytes_written == 32.
+        lea r10, [rip + history_bytes_written];
+        mov rax, [r10];
+        cmp rax, 32;
+        jne tsm_hs_fail;
+
+        lea r12, [rip + _tsm_hist];
+
+        // qword0 = magic 0x54534948 | (32 << 32) = 0x00000020_54534948.
+        mov rax, [r12 + 0];
+        mov r11, 0x0000002054534948;
+        cmp rax, r11;
+        jne tsm_hs_gld_fail;
+
+        // qword1 = ts 0x1000000000000000.
+        mov rax, [r12 + 8];
+        mov r11, 0x1000000000000000;
+        cmp rax, r11;
+        jne tsm_hs_gld_fail;
+
+        // qword2 = cmd_len 8 | (flags 0 << 32) = 8.
+        mov rax, [r12 + 16];
+        cmp rax, 8;
+        jne tsm_hs_gld_fail;
+
+        // Verify the 8 command bytes at offset 24.
+        xor rax, rax;
+        mov_b rax, [r12 + 24];
+        cmp rax, 0x6c;                       // 'l'
+        jne tsm_hs_gld_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 25];
+        cmp rax, 0x73;                       // 's'
+        jne tsm_hs_gld_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 26];
+        cmp rax, 0x20;                       // ' '
+        jne tsm_hs_gld_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 27];
+        cmp rax, 0x7c;                       // '|'
+        jne tsm_hs_gld_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 28];
+        cmp rax, 0x20;                       // ' '
+        jne tsm_hs_gld_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 29];
+        cmp rax, 0x63;                       // 'c'
+        jne tsm_hs_gld_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 30];
+        cmp rax, 0x61;                       // 'a'
+        jne tsm_hs_gld_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 31];
+        cmp rax, 0x74;                       // 't'
+        jne tsm_hs_gld_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_hs_fail:
+        mov rax, 0xFFFFED24;                 // TSM_FAIL_HIST
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tsm_hs_gld_fail:
+        mov rax, 0xFFFFED28;                 // TSM_FAIL_HIST_GOLDEN
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tsm_run_all() -> u64
+  //
+  // Drive all 4 cases in sequence order (pipeline plan, ls record,
+  // cat record, history entry). Stop-on-first-fail. Return 0 on
+  // all-pass.
+  //
+  // The M4+ paideia-os smoke harness calls this as one pre-QEMU gate;
+  // a non-zero return means the encoder's golden fingerprint has
+  // drifted from what the smoke matrix's post-boot checker expects,
+  // and the smoke run itself is not attempted.
+  // ==========================================================================
+  pub let tsm_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-003 (#14): drive all 4 smoke-fixture cases in sequence (pipeline, ls cmdrec, cat cmdrec, history). Order matches the runtime sequence of a real `ls | cat` invocation: pipeline plan first (needed at exec time), ls begin/close, cat begin/close, history append. Prologue: 1 push + `sub rsp, 8` = 16 bytes; rsp % 16 == 0 for SysV calls. Labels prefixed tsm_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call tsm_case_pipeline;
+        cmp rax, 0;
+        jne tsm_ra_done;
+
+        call tsm_case_ls_cmdrec;
+        cmp rax, 0;
+        jne tsm_ra_done;
+
+        call tsm_case_cat_cmdrec;
+        cmp rax, 0;
+        jne tsm_ra_done;
+
+        call tsm_case_hist;
+
+      tsm_ra_done:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}

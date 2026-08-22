@@ -665,17 +665,107 @@ Every function in shell src/ obeys the constraints in
   `add rsp, 8` bracket around the nested call for 16-byte stack
   alignment — same idiom as `elevate_client_lookup_broker`).
 
-## 7. Testing
+## 7. Testing (M4 landed)
 
-Tests land at M4 (per §5.2 M4 in the plan doc). M1 ships
-`tests/README.md` as a placeholder describing the fixture matrix M4
-will populate:
+Three test modules ship under `tests/`, each covering one M4 issue:
 
-- Pipeline correctness matrix (2-stage, 3-stage, cross-schema).
-- Caps-narrowing test (child receives no cap not declared in its
-  caps.decl).
-- Audit-first invariant (child cannot emit before audit record is
-  durable).
-- `.pds` script test suite (per `design/terminal/pds-format.md`).
-- QEMU smoke: interactive login → prompt → `ls | cat` →
-  history-persist.
+### 7.1 `tests/test_caps_narrow.pdx` — shell.M4-001 (#12)
+
+`TestCapsNarrow` module drives 8 test cases against
+`Exec.exec_narrow_child_caps` (M2-003). Each case is a pure-function
+driver: build wire-form fixtures in .bss via MOV constants, call the
+narrower, verify return code (and, for OK cases, verify dst bytes;
+for reject cases, verify the poison sentinel 0xDEADBEEF at dst[0]
+survives).
+
+The 8 cases exhaust the equivalence classes the narrower must
+distinguish:
+
+- HAPPY, NARROWING (rights intersected downward), MISSING_CAP
+  (child asks for a KIND parent doesn't hold), WIDENING (child
+  asks for rights parent doesn't hold), SIDECAR_FULL (dst too
+  small), ZERO_DECL (child needs only ambient session cap; valid),
+  BAD_ARGV_PARENT (null parent pointer), BAD_ARGV_DECL (null decl
+  pointer).
+
+Umbrella driver `tcn_run_all` returns 0 on all-pass or the first
+`TCN_FAIL_*` (0xFFFFED0x band) on failure.
+
+### 7.2 `tests/test_audit_first.pdx` — shell.M4-002 (#13)
+
+`TestAuditFirst` module drives 8 test cases against
+`CommandRecord.command_record_begin` and `command_record_close`
+(M3-003). Each case exercises one gate or one round-trip property.
+
+The load-bearing case is `taf_case_ordering`: begin then close then
+verify every one of the six header qwords AND the argv tail bytes.
+This case proves the encoder pair round-trips correctly — OPEN →
+CLOSED with the mutable fields (ts_end, exit_code, flags) updated
+and the immutable fields (magic, record_len, audit_id, ts_begin,
+argv_bytes, argv tail) preserved. The remaining 7 cases isolate
+individual gates so a failure names the specific one.
+
+The `taf_case_close_pending` case is the semantic invariant for the
+PENDING sentinel: a caller cannot pass `CMDR_EXIT_PENDING`
+(0xFFFFFFFF) as a legitimate exit code, so a CLOSED record never
+displays the "still running" marker in the exit field.
+
+Umbrella driver `taf_run_all` returns 0 or a `TAF_FAIL_*`
+(0xFFFFED1x band).
+
+### 7.3 `tests/test_smoke_matrix.pdx` — shell.M4-003 (#14)
+
+`TestSmokeMatrix` module produces + validates the encoder-half wire
+bytes for the `ls | cat` QEMU smoke scenario. Four cases:
+
+- `tsm_case_pipeline`: pipeline_plan for 2 stages → 2 wire entries
+  paired on pipe id 0.
+- `tsm_case_ls_cmdrec`: begin/close for `ls` (audit_id=0x1001,
+  argv="ls\0", exit=0).
+- `tsm_case_cat_cmdrec`: begin/close for `cat` (audit_id=0x1002,
+  argv="cat\0", exit=0).
+- `tsm_case_hist`: history_encode_record for "ls | cat" (8 bytes,
+  record_len 32).
+
+Every golden value is derived by hand from the wire-format specs
+(§3b, §4c, §4d, §4e above) and pinned in-source as
+`mov r11, imm64; cmp rax, r11`. A drift in any encoder fires
+immediately.
+
+The SUBSTRATE half of the smoke — booting QEMU, scripting an
+interactive `login → prompt → ls | cat → reboot → history` session
+against a serial console — lives on the paideia-os side (M4+
+harness in `tools/verify-user-shell.sh` per `.plans/m4-003-notes.md`).
+The shell repo's `tsm_run_all` is the pre-QEMU gate: if the encoder
+golden bytes don't match, there's no point booting the guest.
+
+### 7.4 Fail-code bands
+
+- `0xFFFFED0x` — TestCapsNarrow (M4-001).
+- `0xFFFFED1x` — TestAuditFirst (M4-002).
+- `0xFFFFED2x` — TestSmokeMatrix (M4-003).
+
+These are disjoint from the shell's own `0xFFFFECxx` band so an
+operator reading a test-run log can tell "SUT rejected input" from
+"test framework detected the SUT did the wrong thing" by the high
+two bytes of the return alone.
+
+### 7.5 What M4 deferred to M5 substrate
+
+M4 test-code is pure-function driven; the substrate wiring that
+turns encoder halves into live runs stays deferred to a paideia-os
+round adjacent to R49:
+
+- Userspace `sys_execve`/`sys_wait4` wrappers.
+- Userspace `sys_ipc_recv`/endpoint-mint (turns
+  `pipeline_plan` placeholder pipe ids into real endpoint ids).
+- Userspace PdxFS-write path (persists history via
+  `svc.pdxfs-journal`).
+- Userspace `sys_ipc_send` to `svc.audit-journal` (persists
+  ShellCommandRecord).
+- Cross-repo linkage of libpdx-cap / libpdx-audit /
+  libpdx-semantic-pipe / libpdx-argv symbols into one build.
+
+See `STATUS.md` §"Upstream substrate" for the substrate gaps M4
+identifies and M5 (or a paideia-os round adjacent to R49)
+closes.

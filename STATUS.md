@@ -1,7 +1,7 @@
 # shell — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M3 (semantic-pipe + audit) — complete
+**Current milestone:** M4 (tests + smoke matrix) — complete (encoder half)
 
 See `design/tooling/r49-r50-plan.md` §5.2 in paideia-os for the full
 breakdown.
@@ -60,6 +60,66 @@ breakdown.
   substrate; caps.decl gains `KIND_PDXFS_FILE(write)`.
 - `src/shell.pdx`: stats table extended with `SH_ST_SESSIONS = 5`,
   `SH_ST_PIPELINES = 6`, `SH_ST_HISTORY = 7`.
+
+## M4 — tests + smoke matrix (complete, encoder half)
+
+- `tests/test_caps_narrow.pdx` (issue #12, M4-001): `TestCapsNarrow`
+  module — 8 test cases against `Exec.exec_narrow_child_caps`
+  (HAPPY, NARROWING, MISSING, WIDENING, SIDECAR_FULL, ZERO_DECL,
+  BAD_ARGV_PARENT, BAD_ARGV_DECL). Fixture buffers in .bss with
+  poison sentinel 0xDEADBEEF at dst[0] for "reject leaves dst
+  untouched" verification. Umbrella driver `tcn_run_all` returns 0
+  on all-pass or a 0xFFFFED0x fail code.
+- `tests/test_audit_first.pdx` (issue #13, M4-002): `TestAuditFirst`
+  module — 8 test cases against `CommandRecord.command_record_begin`
+  and `command_record_close` (BEGIN_OK, CLOSE_EXIT0, CLOSE_EXIT1,
+  CLOSE_NO_BEGIN, CLOSE_EXIT_OOR, BEGIN_ID_ZERO, CLOSE_PENDING,
+  ORDERING). Argv fixture "ls\0-l\0" (6 bytes). Umbrella driver
+  `taf_run_all` returns 0 or 0xFFFFED1x.
+- `tests/test_smoke_matrix.pdx` (issue #14, M4-003):
+  `TestSmokeMatrix` module — 4 encoder-half fixtures for the
+  `ls | cat` QEMU smoke. Pipeline (2 stages), ls CommandRecord
+  (audit_id 0x1001), cat CommandRecord (audit_id 0x1002), history
+  ("ls | cat" 8 bytes). Golden bytes derived by hand from the wire
+  specs; every expected value pinned in-source as
+  `mov r11, imm64; cmp rax, r11`. Umbrella driver `tsm_run_all`
+  returns 0 or 0xFFFFED2x. Substrate half (booted QEMU +
+  interactive `login → prompt → run → reboot → history` scripted
+  run) lives on the paideia-os side, gated on this module's
+  `tsm_run_all` return.
+
+**M4 test-code additions to the return-code band 0xFFFFEDxx**
+(disjoint from the shell's own 0xFFFFECxx band so an operator
+reading a test-run log distinguishes "SUT rejected input" from
+"test framework detected the SUT did the wrong thing"):
+
+| Code       | Name                | Meaning                                            |
+|------------|---------------------|----------------------------------------------------|
+| 0xFFFFED01 | TCN_FAIL_HAPPY      | M4-001: happy case failed                          |
+| 0xFFFFED02 | TCN_FAIL_NARROWING  | M4-001: narrowing case failed                      |
+| 0xFFFFED03 | TCN_FAIL_MISSING    | M4-001: missing-cap case failed                    |
+| 0xFFFFED04 | TCN_FAIL_WIDENING   | M4-001: widening case failed                       |
+| 0xFFFFED05 | TCN_FAIL_SIDECAR    | M4-001: sidecar-overflow case failed               |
+| 0xFFFFED06 | TCN_FAIL_ZERO_DECL  | M4-001: zero-decl case failed                      |
+| 0xFFFFED07 | TCN_FAIL_BAD_ARGV_P | M4-001: null-parent case failed                    |
+| 0xFFFFED08 | TCN_FAIL_BAD_ARGV_D | M4-001: null-child_decl case failed                |
+| 0xFFFFED09 | TCN_FAIL_DST_MUTATED| M4-001: any reject left dst poison sentinel gone   |
+| 0xFFFFED11 | TAF_FAIL_BEGIN_OK   | M4-002: begin happy case failed                    |
+| 0xFFFFED12 | TAF_FAIL_CLOSE_E0   | M4-002: close(exit=0) case failed                  |
+| 0xFFFFED13 | TAF_FAIL_CLOSE_E1   | M4-002: close(exit=1) case failed                  |
+| 0xFFFFED14 | TAF_FAIL_NO_BEGIN   | M4-002: close-without-begin case failed            |
+| 0xFFFFED15 | TAF_FAIL_EXIT_OOR   | M4-002: close(exit=256) case failed                |
+| 0xFFFFED16 | TAF_FAIL_ID_ZERO    | M4-002: begin(audit_id=0) case failed              |
+| 0xFFFFED17 | TAF_FAIL_EXIT_PEND  | M4-002: close(exit=PENDING sentinel) case failed   |
+| 0xFFFFED18 | TAF_FAIL_ORDER      | M4-002: begin+close round-trip case failed         |
+| 0xFFFFED21 | TSM_FAIL_PIPELINE   | M4-003: pipeline_plan returned non-zero            |
+| 0xFFFFED22 | TSM_FAIL_LS_BEGIN   | M4-003: ls begin/close returned non-zero           |
+| 0xFFFFED23 | TSM_FAIL_CAT_BEGIN  | M4-003: cat begin/close returned non-zero          |
+| 0xFFFFED24 | TSM_FAIL_HIST       | M4-003: history_encode_record returned non-zero    |
+| 0xFFFFED25 | TSM_FAIL_PIPELINE_GLD | M4-003: pipeline bytes != golden                 |
+| 0xFFFFED26 | TSM_FAIL_LS_GOLDEN  | M4-003: ls record bytes != golden                  |
+| 0xFFFFED27 | TSM_FAIL_CAT_GOLDEN | M4-003: cat record bytes != golden                 |
+| 0xFFFFED28 | TSM_FAIL_HIST_GOLDEN| M4-003: history bytes != golden                    |
 
 ## M3 — semantic-pipe + audit integration (complete)
 
@@ -146,6 +206,9 @@ breakdown.
 | M3-001 (#9)     | semantic-pipe passthrough: child schema forwarded unchanged (D2 literal) | LANDED |
 | M3-002 (#10)    | CommandCompletion[] schema for tab-completion (SH-D7)            | LANDED |
 | M3-003 (#11)    | ShellCommandRecord via libpdx-audit before sys_execve; close on wait | LANDED |
+| M4-001 (#12)    | caps-narrowing violation matrix (child receives cap not in caps.decl → reject) | LANDED |
+| M4-002 (#13)    | audit-first invariant test (child cannot emit before audit is durable) | LANDED |
+| M4-003 (#14)    | QEMU smoke: login → prompt → `ls | cat` → history persists across reboot (encoder half) | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 
@@ -203,8 +266,15 @@ breakdown.
 
 ## Next
 
-M4 — tests + smoke matrix. Caps-narrowing violation matrix
-(shell.M4-001), audit-first invariant test (shell.M4-002), QEMU
-smoke: login → prompt → `ls | cat` → history persists across
-reboot (shell.M4-003). All three depend on the substrate gaps
-above landing in a paideia-os round adjacent to R49.
+M5 — 1.0 signed release. Dual-signed release + `svc.login-shell`
+broker registration (shell.M5-001), `.pdxdoc` for `doc shell` +
+mirror push (shell.M5-002). Depends on doc.M2 (per §5.2 cross-repo
+dependencies) which in turn is unblocked by this M4 close.
+
+The M4 encoder-half tests here (`tcn_run_all`, `taf_run_all`,
+`tsm_run_all`) are what the M5 release-time lint re-runs to
+confirm no regression against the golden fingerprints; the M4
+substrate-half smoke (booted QEMU with scripted interactive
+`login → prompt → ls | cat → reboot → history`) lives on the
+paideia-os side and depends on the substrate gaps above landing
+in a paideia-os round adjacent to R49.
