@@ -1,7 +1,8 @@
 # shell — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M4 (tests + smoke matrix) — complete (encoder half)
+**Current milestone:** M5 (1.0 signed release) — M5-001 landed; M5-002 pending
+**Version:** 1.0.0-rc (bumped in `manifest.pdxproj`; release tag `v1.0.0` at M5-002 close)
 
 See `design/tooling/r49-r50-plan.md` §5.2 in paideia-os for the full
 breakdown.
@@ -190,6 +191,14 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFEC91 | CMDR_ERR_TOO_LONG | CommandRecord.M3: argv_bytes > 8192 (CMDR_ARGV_MAX)        |
 | 0xFFFFEC92 | CMDR_ERR_TRUNCATED| CommandRecord.M3: dst_len < required record size           |
 | 0xFFFFEC93 | CMDR_ERR_BAD_EXIT | CommandRecord.M3: exit_code > 255 (close only)             |
+| 0xFFFFECA0 | RM_ERR_BAD_ARGS   | ReleaseManifest.M5: dst == 0, dst_len == 0, or offset >= dst_len |
+| 0xFFFFECA1 | RM_ERR_TRUNCATED  | ReleaseManifest.M5: dst too small for header / KV / sigblock slot |
+| 0xFFFFECA2 | RM_ERR_KV_TOO_LONG | ReleaseManifest.M5: kv value_len > 65535 (RM_KV_LEN_MAX)  |
+| 0xFFFFECA3 | RM_ERR_SIG_TOO_LONG | ReleaseManifest.M5: sig_len > 8192 (RM_SIG_LEN_MAX)     |
+| 0xFFFFECB0 | BB_STUB           | BrokerBind.M5: encoder validated; sys_ipc_send deferred    |
+| 0xFFFFECB1 | BB_ERR_BAD_ARGS   | BrokerBind.M5: dst/endpoint/name null or name_len == 0     |
+| 0xFFFFECB2 | BB_ERR_NAME_TOO_LONG | BrokerBind.M5: name_len > 256 (BB_NAME_MAX)             |
+| 0xFFFFECB3 | BB_ERR_TRUNCATED  | BrokerBind.M5: dst_len < required record size              |
 
 ## Milestone rollup
 
@@ -209,6 +218,55 @@ reading a test-run log distinguishes "SUT rejected input" from
 | M4-001 (#12)    | caps-narrowing violation matrix (child receives cap not in caps.decl → reject) | LANDED |
 | M4-002 (#13)    | audit-first invariant test (child cannot emit before audit is durable) | LANDED |
 | M4-003 (#14)    | QEMU smoke: login → prompt → `ls | cat` → history persists across reboot (encoder half) | LANDED |
+| M5-001 (#15)    | dual-signed release (manifest.pdxsig encoder + placeholder sigblock) + svc.login-shell broker registration | LANDED |
+
+## M5 — 1.0 signed release (in progress; M5-001 landed)
+
+- `src/release_manifest.pdx` (issue #15, M5-001): `ReleaseManifest`
+  module — encoder for pkg §4 `manifest.pdxsig`. Four entry points
+  (`release_manifest_encode_header_prefix`, `_header_suffix`,
+  `release_manifest_encode_kv`, `release_manifest_encode_sigblock_slot`)
+  assemble the header + eleven-tag body + sigblock in one linear
+  pass. Sigblock zero-fill path pins the two ML-DSA-65 signature
+  slots at their release-form offsets while the crypto substrate
+  (paideia-as v0.33-crypto-kdf) is out of reach.
+- `src/broker_bind.pdx` (issue #15, M5-001): `BrokerBind` module —
+  `broker_bind_login_shell(dst, dst_len, endpoint_cap, name_ptr,
+  name_len, rights_mask)` writes the three-qword BrokerBindRequest
+  header (BB_MAGIC | rec_len fused, endpoint_cap, rights_mask |
+  name_len fused) + UTF-8 name + zero-padding, then returns
+  `BB_STUB` (0xFFFFECB0). The M4+ substrate `sys_ipc_send` wrapper
+  invokes this encoder at shell boot.
+- `manifest.pdxproj`: version 0.4.0-m4 → 1.0.0; adds
+  `release_manifest.pdx` + `broker_bind.pdx` to sources,
+  `test_release_manifest.pdx` to tests, `doc/shell.pdxdoc` to docs
+  (M5-002 delivery); new `release:` block names the two signers +
+  broker name + mirror target.
+- `CHANGELOG.md` (new): v1.0.0 entry + rollup of the four
+  pre-release milestones.
+- `tests/test_release_manifest.pdx` (issue #15, M5-001):
+  `TestReleaseManifest` module — 4-case encoder-golden matrix
+  (`trm_case_hdr_prefix`, `trm_case_hdr_suffix`, `trm_case_kv`,
+  `trm_case_broker_bind`) driven by `trm_run_all`. Fail-code band
+  0xFFFFED3x. Release-lint pre-sign gate.
+- `design/release-manifest.md` (issue #15, M5-001): shell-specific
+  view of the pkg-wide manifest format — which tags shell emits, in
+  what order, with what values; sigblock placeholder scheme;
+  release-lint sequence.
+
+**M5-001 test-code additions to the return-code band 0xFFFFEDxx**
+(disjoint from the shell's own 0xFFFFECxx and the M4 test bands):
+
+| Code       | Name                    | Meaning                                            |
+|------------|-------------------------|----------------------------------------------------|
+| 0xFFFFED30 | TRM_FAIL_HDR_PREFIX     | M5-001: header prefix golden mismatch              |
+| 0xFFFFED31 | TRM_FAIL_HDR_SUFFIX     | M5-001: header suffix golden mismatch              |
+| 0xFFFFED32 | TRM_FAIL_KV             | M5-001: KV record golden mismatch                  |
+| 0xFFFFED33 | TRM_FAIL_BROKER_BIND    | M5-001: broker-bind golden mismatch                |
+| 0xFFFFED34 | TRM_FAIL_HDR_PREFIX_RC  | M5-001: header prefix return code mismatch         |
+| 0xFFFFED35 | TRM_FAIL_HDR_SUFFIX_RC  | M5-001: header suffix return code mismatch         |
+| 0xFFFFED36 | TRM_FAIL_KV_RC          | M5-001: KV record return code mismatch             |
+| 0xFFFFED37 | TRM_FAIL_BROKER_BIND_RC | M5-001: broker-bind return code mismatch           |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 
@@ -266,10 +324,8 @@ reading a test-run log distinguishes "SUT rejected input" from
 
 ## Next
 
-M5 — 1.0 signed release. Dual-signed release + `svc.login-shell`
-broker registration (shell.M5-001), `.pdxdoc` for `doc shell` +
-mirror push (shell.M5-002). Depends on doc.M2 (per §5.2 cross-repo
-dependencies) which in turn is unblocked by this M4 close.
+M5-002 — `.pdxdoc` for `doc shell` + mirror push. Closes the M5
+wave and tags `v1.0.0`.
 
 The M4 encoder-half tests here (`tcn_run_all`, `taf_run_all`,
 `tsm_run_all`) are what the M5 release-time lint re-runs to

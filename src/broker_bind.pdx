@@ -1,0 +1,398 @@
+// src/broker_bind.pdx -- shell.M5-001 (paideia-os/shell#15)
+//
+// BrokerBind module: svc.login-shell registration encoder.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The paideia-os service broker (paideia-os R20b.M1-003 at
+// `src/kernel/core/ipc/svc_broker.pdx`) is the well-known-name
+// registry userspace services use to find each other. A service
+// process binds a name string to one of its `KIND_IPC_ENDPOINT`
+// caps; clients that call the broker with the same name string
+// receive a `Cap<KIND_IPC_ENDPOINT>` connected to that endpoint.
+//
+// Per `design/tooling/r49-r50-plan.md` §5.2 M5 line:
+//   "Shell binds itself to `svc.login-shell` broker name for the
+//    login path to find it."
+//
+// The paideia-os login supervisor (a process spawned by init) walks
+// the broker table on user login, finds the entry keyed by
+// `svc.login-shell`, mints a session cap over `KIND_USER`, and hands
+// the pair (session cap + endpoint cap) to the shell via a
+// broker-mediated IPC. Without the broker registration the shell
+// exists as a binary but the login supervisor has no way to reach
+// it -- so this module is the wire glue between "shell binary
+// installed" and "shell reachable from a user login".
+//
+// M5-001 lands the ENCODER for the broker-bind request wire record.
+// The `sys_ipc_send` call to the broker endpoint is a substrate
+// deferral -- svc_broker.pdx's userspace wrapper wiring lands in
+// paideia-os R20b.M3-002 (`sys_ipc_send` handler) plus the broker-
+// registration IPC schema which is expected in a paideia-os round
+// adjacent to R49. The encoder here produces the exact bytes the
+// M4+ substrate `sys_ipc_send` will forward to the broker; a broker
+// running against these bytes accepts the bind without a schema
+// re-negotiation.
+//
+// The design lives alongside shell's other "encoder + skeleton"
+// entry points (LineReader, Exec, PipePassthrough, CommandRecord):
+// the WIRE FORMAT is the shell's public contract, and the M5 encoder
+// pins it. When the broker substrate reaches, the shell's `_start`
+// frame calls `broker_bind_login_shell` once at boot, the encoder
+// emits the record, `sys_ipc_send` forwards it, and the shell is
+// live to the login path.
+//
+// =============================================================================
+// WIRE FORMAT (BrokerBindRequest)
+// =============================================================================
+//
+// A single fixed-shape record:
+//
+//   +0    u32 magic         = BB_MAGIC = 0x424B4C42 ("BLKB" LE)
+//                             ('B','L','K','B' at bytes 0..3; "L" for
+//                             login, "K" for KIND, "B" for broker;
+//                             chosen so a hex-dump reader can pick
+//                             the record out of a broker log)
+//   +4    u32 rec_len       total record size in bytes (header + name
+//                             + zero-padding to 8-byte alignment)
+//   +8    u64 endpoint_cap  the KIND_IPC_ENDPOINT cap the broker
+//                             will hand to future clients that look
+//                             up this name; caller-supplied wire form
+//                             (16-byte Cap slot | kind | rights |
+//                             target_ptr; broker unpacks server-side)
+//                             -- at M5 the caller passes a single
+//                             u64 that the M4+ substrate will
+//                             replace with the two-qword Cap layout
+//                             once broker's schema lands with a
+//                             concrete field for the endpoint id
+//   +16   u32 rights_mask   BB_RIGHTS_* bitmask the broker will
+//                             narrow to before handing the cap to a
+//                             client (bit 0 = read, bit 1 = write,
+//                             bit 2 = mint-session)
+//   +20   u32 name_len      byte length of the name string
+//                             (0..BB_NAME_MAX; UTF-8, no NUL)
+//   +24   u8[name_len]      name string
+//   +...  u8[pad] zero_pad  0..7 zero bytes to align total to 8 bytes
+//
+// The three qword header (magic|rec_len fused, endpoint_cap, and
+// rights_mask|name_len fused) is single-MOV atomic against a reader
+// observing the same qwords. The name payload follows the History
+// / CommandRecord discipline: byte-copied then zero-padded to an
+// 8-byte multiple.
+//
+// =============================================================================
+// WELL-KNOWN NAME
+// =============================================================================
+//
+// The shell's well-known name is `svc.login-shell`. The 15-byte
+// ASCII string is emitted verbatim by the release-time script that
+// calls `broker_bind_login_shell` with a name_ptr aiming at a
+// literal buffer holding those bytes. The literal lives at
+// release-tooling side (a `.rodata` slot in the `_start` frame at
+// M4+ substrate); this module accepts it as a caller-owned pointer,
+// matching every other encoder in this repo's discipline.
+//
+// The choice of `svc.login-shell` (not `svc.shell` or `svc.pdx-
+// shell`) mirrors the naming pattern the R49-PREP-005/006 tickets
+// established for the other broker names in the wave:
+//   svc.elevate-broker   -- R48-PREP-005
+//   svc.audit-journal    -- R49-PREP-006
+//   svc.pdxfs-journal    -- expected in a follow-up
+//   svc.schema-registry  -- design/tooling/r49-r50-plan.md line 734
+//
+// The `svc.` prefix marks a supervisor-visible service; the `login-`
+// segment names the caller class (the login supervisor is the only
+// process expected to look it up); the `shell` segment names the
+// class of provider. At R56+ when the shell learns multi-session,
+// the same name is re-used -- the shell process handles multiplex
+// server-side; the broker's contract stays one-name-to-one-endpoint.
+//
+// =============================================================================
+// WHAT M5 IS DELIBERATELY NOT
+// =============================================================================
+//
+// M5-001 does NOT ship the `_start` frame's call to this encoder.
+// The `_start` convention lands with the R14b loader entry
+// (already at HEAD in paideia-os); wiring the actual call at shell
+// boot lands with the M4+ substrate that also wires sys_execve /
+// sys_ipc_recv. Same discipline History's PdxFS-write, CommandRecord's
+// audit sys_ipc_send, and Pipeline's endpoint mint observe.
+//
+// M5-001 does NOT ship the broker's response handler. A broker that
+// rejects a bind (name collision, cap kind mismatch, name too long)
+// returns an error via a second IPC message; the shell's response
+// handling reads that message once sys_ipc_recv wraps land. The
+// error codes below (BB_ERR_*) are the encoder-side rejections that
+// happen BEFORE the send; broker-side errors ride a separate return
+// path.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`BrokerBind`).
+//   - No `test` mnemonic; `cmp reg, 0` for zero-checks.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (BB_NAME_MAX = 256
+//     fits trivially).
+//   - Large immediates (BB_MAGIC = 0x424B4C42, error codes
+//     0xFFFFECB0..0xFFFFECB3) emitted via `mov r10, imm32/64`.
+//   - r11 unused (no .bss reach; stateless).
+//   - Byte reads / writes in the name-copy loop and the zero-pad
+//     loop use `xor rax, rax; mov_b rax, [ptr]` and
+//     `mov_b [ptr], rax` per the #1248 pattern.
+//   - Prologue: 5 pushes + `sub rsp, 8` = 48 bytes; rsp % 16 == 0
+//     for shell_note.
+
+module BrokerBind = structure {
+
+  // ==========================================================================
+  // Format constants
+  // ==========================================================================
+
+  // Header size in bytes (fixed 24-byte header: magic|rec_len fused,
+  // endpoint_cap, rights_mask|name_len fused = three qwords).
+  pub let BB_HEADER_SIZE : u64 = 24
+
+  // Magic constant. Little-endian bytes 'B'(0x42), 'L'(0x4C), 'K'(0x4B),
+  // 'B'(0x42) read back as u32 0x424B4C42.
+  pub let BB_MAGIC : u64 = 0x424B4C42
+
+  // Maximum name length. 256 = a generous ceiling for svc.* names
+  // (the longest current wave name svc.schema-registry is 19 bytes;
+  // svc.login-shell is 15 bytes). Fits imm <= 0x7FFFFFFF.
+  pub let BB_NAME_MAX : u64 = 256
+
+  // Rights mask bits.
+  pub let BB_RIGHTS_READ         : u64 = 0x1
+  pub let BB_RIGHTS_WRITE        : u64 = 0x2
+  pub let BB_RIGHTS_MINT_SESSION : u64 = 0x4
+
+  // The rights mask the shell requests for its svc.login-shell binding.
+  // A login supervisor that receives this endpoint cap can read requests
+  // from the shell, write responses (session cap + user identity), and
+  // mint the session cap on the shell's behalf -- all three are needed
+  // to complete a login handshake.
+  pub let BB_RIGHTS_LOGIN_SHELL : u64 = 0x7    // READ | WRITE | MINT_SESSION
+
+  // ==========================================================================
+  // Return-code band 0xFFFFECBx (BrokerBind module)
+  //
+  // BB_STUB is the placeholder success sentinel returned by
+  // broker_bind_login_shell until the substrate `sys_ipc_send` to
+  // the broker wraps land -- same idiom LR_STUB / EX_STUB /
+  // ELVC_STUB observe elsewhere. A caller getting BB_STUB knows the
+  // encoder pass validated but the send has not happened yet.
+  //
+  // BB_ERR_* are hard rejects the encoder returns before touching
+  // dst -- the caller can enlarge the buffer, shorten the name, or
+  // supply a non-null endpoint_cap and retry.
+  // ==========================================================================
+
+  // Encoder-only success (the M5 skeleton path: everything but the send).
+  pub let BB_STUB              : u64 = 0xFFFFECB0
+
+  // dst == 0, dst_len == 0, name_ptr == 0 when name_len > 0,
+  // endpoint_cap == 0.
+  pub let BB_ERR_BAD_ARGS      : u64 = 0xFFFFECB1
+
+  // name_len > BB_NAME_MAX.
+  pub let BB_ERR_NAME_TOO_LONG : u64 = 0xFFFFECB2
+
+  // dst_len < required record size (24 + name_len + padding).
+  pub let BB_ERR_TRUNCATED     : u64 = 0xFFFFECB3
+
+  // ==========================================================================
+  // broker_bind_login_shell(dst, dst_len, endpoint_cap,
+  //                         name_ptr, name_len, rights_mask) -> u64
+  //
+  // Signature: broker_bind_login_shell : (u64, u64, u64, u64, u64, u64)
+  //                                      -> u64 !{mem} @{}
+  // RDI (input): dst           -- VA of the destination IPC buffer
+  // RSI (input): dst_len       -- bytes available in dst
+  // RDX (input): endpoint_cap  -- opaque cap handle the shell hands to
+  //                                the broker (server-side unpacks into
+  //                                the two-qword Cap layout at M4+
+  //                                substrate; must be non-zero)
+  // RCX (input): name_ptr      -- VA of the name string (UTF-8, no NUL)
+  //                                Must be non-null iff name_len > 0.
+  // R8  (input): name_len      -- name byte count (0..BB_NAME_MAX;
+  //                                empty name is refused because a
+  //                                nameless bind cannot be looked up)
+  // R9  (input): rights_mask   -- BB_RIGHTS_* bitmask; caller typically
+  //                                passes BB_RIGHTS_LOGIN_SHELL (0x7)
+  // RAX (output): BB_STUB on success (encoder validated + record
+  //               written; send deferred to M4+), else BB_ERR_BAD_ARGS
+  //               | BB_ERR_NAME_TOO_LONG | BB_ERR_TRUNCATED.
+  //
+  // Writes the fixed 24-byte header + name bytes + 0..7 zero-padding
+  // bytes to dst. Header fields:
+  //   qword0: BB_MAGIC | (rec_len << 32)
+  //   qword1: endpoint_cap
+  //   qword2: rights_mask | (name_len << 32)
+  //
+  // Fail-fast on all gates; dst is NOT touched on any reject path.
+  //
+  // Bumps SH_ST_SESSIONS (slot 5) on every entry -- a broker-bind is
+  // a session-lifecycle event and belongs in the same counter as
+  // session_mint / session_derive_subcap. Bumps SH_ST_ERRORS on
+  // every reject.
+  //
+  // Register plan:
+  //   r12 = dst              (callee-save)
+  //   r13 = name_ptr         (callee-save)
+  //   r14 = rec_len cache    (callee-save; needed after byte-copy)
+  //   r15 = endpoint_cap     (callee-save; single-MOV write later)
+  //   rbx = i for copy loop  (callee-save)
+  //   rax = temp / return
+  //   r10 = magic / large-imm scratch
+  //   -- inputs stay in rsi (dst_len), r8 (name_len), r9 (rights_mask)
+  //
+  // Prologue: 5 pushes + `sub rsp, 8` = 48 bytes; rsp % 16 == 0 for
+  // shell_note. Labels prefixed bb_.
+  // ==========================================================================
+  pub let broker_bind_login_shell : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (endpoint_cap: u64) (name_ptr: u64) (name_len: u64) (rights_mask: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): serialise one BrokerBindRequest per the wire format above. Three qword-atomic header stores (magic|rec_len, endpoint_cap, rights_mask|name_len) then name_len bytes of UTF-8 name (byte-copied via the #1248 pattern) then 0..7 zero bytes to align total to 8 bytes. Fail-fast gates: dst != 0, dst_len > 0, endpoint_cap != 0 (a nameless bind is refused via name_len == 0 case too since a zero-length name cannot be looked up), name_ptr non-null iff name_len > 0 (also refuses name_len == 0 to make 'nameless bind' a hard error rather than a silent no-op), name_len <= BB_NAME_MAX (256). rec_len = (24 + name_len + 7) / 8 * 8 via shr/shl (no large-imm mask). Bumps SH_ST_SESSIONS on entry (broker-bind is a session-lifecycle event -- same class as session_mint). Returns BB_STUB on encoder success; the M4+ substrate calls sys_ipc_send after this returns BB_STUB. 5 pushes (rbx, r12 dst, r13 name_ptr, r14 rec_len, r15 endpoint_cap) + sub rsp, 8 = 48 bytes prologue; rsp % 16 == 0. All large immediates via mov r10, imm32/64. r11 unused. Labels prefixed bb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rcx;                        // name_ptr
+        mov r15, rdx;                        // endpoint_cap
+        // dst_len stays in rsi; name_len in r8; rights_mask in r9
+
+        // Bump SH_ST_SESSIONS (slot 5) unconditionally.
+        mov rdi, 5;                          // SH_ST_SESSIONS
+        call shell_note;
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  bb_bad_args;
+        // Gate: dst_len non-zero.
+        cmp rsi, 0;
+        je  bb_bad_args;
+        // Gate: endpoint_cap non-zero.
+        cmp r15, 0;
+        je  bb_bad_args;
+        // Gate: name_len > 0 (a nameless bind is refused; the broker
+        // has no way to look up an empty name).
+        cmp r8, 0;
+        je  bb_bad_args;
+        // Gate: name_ptr non-null (already know name_len > 0).
+        cmp r13, 0;
+        je  bb_bad_args;
+        // Gate: name_len <= BB_NAME_MAX.
+        cmp r8, 256;                         // BB_NAME_MAX
+        ja  bb_name_too_long;
+
+        // Compute rec_len = (24 + name_len + 7) & ~7 via shr/shl.
+        // BB_HEADER_SIZE (24) is already 8-multiple.
+        mov rax, r8;                         // name_len
+        add rax, 24;                         // + header size
+        add rax, 7;                          // + rounding constant
+        shr rax, 3;                          // drop low 3 bits
+        shl rax, 3;                          // padded to next 8-mul
+        mov r14, rax;                        // r14 = rec_len
+
+        // Gate: dst_len >= rec_len.
+        cmp rsi, r14;
+        jb  bb_truncated;
+
+        // --- Write qword0 = BB_MAGIC | (rec_len << 32) ----------
+        mov rax, r14;
+        shl rax, 32;                         // rec_len << 32
+        mov r10, 0x424B4C42;                 // BB_MAGIC
+        or  rax, r10;
+        mov [r12 + 0], rax;
+
+        // --- Write qword1 = endpoint_cap ------------------------
+        mov [r12 + 8], r15;
+
+        // --- Write qword2 = rights_mask | (name_len << 32) ------
+        // rights_mask is a small bitmask (bits 0..2 at M5); name_len
+        // fits u32 (<= 256).
+        mov rax, r8;                         // name_len (high 32)
+        shl rax, 32;
+        or  rax, r9;                         // rights_mask (low 32)
+        mov [r12 + 16], rax;
+
+        // --- Byte-copy name text --------------------------------
+        xor rbx, rbx;                        // i = 0
+      bb_copy_head:
+        cmp rbx, r8;
+        jae bb_copy_done;
+        xor rax, rax;
+        mov_b rax, [r13 + rbx];              // #1248 byte load
+        mov_b [r12 + rbx + 24], rax;         // byte store at hdr + i
+        add rbx, 1;
+        jmp bb_copy_head;
+      bb_copy_done:
+
+        // --- Zero-pad from dst[24 + name_len] to dst[rec_len - 1] --
+        mov rbx, r8;                         // rbx = name_len
+        add rbx, 24;                         // rbx = cursor at name end
+      bb_pad_head:
+        cmp rbx, r14;
+        jae bb_pad_done;
+        xor rax, rax;
+        mov_b [r12 + rbx], rax;
+        add rbx, 1;
+        jmp bb_pad_head;
+      bb_pad_done:
+
+        // Return BB_STUB (encoder validated; substrate send deferred).
+        mov rax, 0xFFFFECB0;                 // BB_STUB
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bb_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECB1;                 // BB_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bb_name_too_long:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECB2;                 // BB_ERR_NAME_TOO_LONG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bb_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECB3;                 // BB_ERR_TRUNCATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

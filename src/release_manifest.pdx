@@ -1,0 +1,786 @@
+// src/release_manifest.pdx -- shell.M5-001 (paideia-os/shell#15)
+//
+// ReleaseManifest module: shell v1.0 `manifest.pdxsig` encoder.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The paideia-os package model (`design/tooling/plan.md` D4 + §6.3)
+// mandates that every shipping tool -- shell included -- carries a
+// dual-signed `manifest.pdxsig` at the root of its package. The signed
+// envelope covers package identity, per-file inventory, `caps.decl`
+// hash, `deps.list` hash, and the two ML-DSA-65 signatures the pkg
+// installer verifies before dropping any bytes under `/pkgs/`.
+//
+// The authoritative wire spec for `manifest.pdxsig` lives in the pkg
+// repo at `design/manifest-format.md` §4 (pkg.M1-003). shell.M5-001
+// ships the ENCODER half so shell's release script can produce a
+// byte-conformant manifest.pdxsig for shell v1.0. The DECODER half
+// lives on the pkg side (`pkg/src/manifest_codec.pdx`, which parses
+// exactly these bytes at install time).
+//
+// M5-001 lands three entry points -- the minimum a release tool needs
+// to assemble a manifest.pdxsig from the outside:
+//
+//   1. release_manifest_encode_header_prefix (offsets 0..48)
+//        writes magic / format_version / header_flags / body_len /
+//        body_sha3_256_lo / body_sha3_256_hi / sigblock_len
+//   2. release_manifest_encode_header_suffix (offsets 48..64)
+//        writes pubkey_len_author / pubkey_len_root / created_unix_secs
+//   3. release_manifest_encode_kv
+//        writes one KV record (u16 kv_tag + u16 kv_len + kv_value)
+//   4. release_manifest_encode_sigblock_slot
+//        writes one ML-DSA-65 signature slot (u32 sig_len + sig bytes)
+//
+// The four together are enough to build the pkg §3 layout in one
+// linear pass, which is how a release tool that reads a package tree,
+// hashes each file, and emits the manifest actually operates.
+//
+// =============================================================================
+// WHAT M5 IS DELIBERATELY NOT
+// =============================================================================
+//
+// M5-001 does NOT ship an ML-DSA-65 signer. The paideia-as crypto
+// substrate floor (`design/tooling/plan.md` D4) is v0.33-crypto-kdf,
+// which lands ML-DSA-65 sign/verify (`src/kernel/core/crypto/mldsa/*`
+// per `design/security/pe-secure-boot-signing.md`). Until that
+// toolchain floor is reached, the sigblock is written with zero-byte
+// signature payloads and the two length prefixes carry the ML-DSA-65
+// level-2 signature size (3293 bytes) so the byte offsets stay
+// exactly where a signed release will put them. The release lint
+// verifies the offset math; the signer bolt-on replaces the zero
+// payloads without touching the enclosing envelope.
+//
+// M5-001 does NOT compute sha3-256 in-line. The caller passes the
+// already-computed hash halves in as u64s -- the sha3-256 code lives
+// in paideia-as at `src/kernel/core/crypto/sha3/` (R32 substrate) and
+// the release tool is expected to call it before this encoder. Same
+// discipline History and CommandRecord observe with wall-clock
+// timestamps: the wire encoder never mints a clock read or a hash of
+// its own; the dispatch layer does.
+//
+// M5-001 does NOT ship a manifest ASSEMBLER for shell specifically.
+// The choice of which KV records shell v1.0 emits (tag registry from
+// pkg §4.2), in what order, over which files, is release-time policy
+// living in the paideia-as release lint plus `design/release-
+// manifest.md` in this repo. The encoders are the WIRE PRIMITIVES;
+// the assembler is a driver over them.
+//
+// =============================================================================
+// WIRE FORMAT (pkg §4.1 header layout, 64 bytes)
+// =============================================================================
+//
+// All integer fields little-endian. Offsets and widths from pkg.M1-003
+// `design/manifest-format.md` §4.1. Duplicated here so a shell reader
+// does not need to open the pkg repo to understand what these bytes
+// mean.
+//
+//   +0    u64 magic              = 0x0000676973786470 ("pdxsig\0\0")
+//   +8    u32 format_version     = 1 at M1 (bumped by additive change)
+//   +12   u32 header_flags       = 0 at M1 (reserved)
+//   +16   u64 body_len           length in bytes of the body section
+//   +24   u64 body_sha3_256_lo   low  8 bytes of sha3-256(body)
+//   +32   u64 body_sha3_256_hi   high 8 bytes of sha3-256(body)
+//   +40   u64 sigblock_len       length in bytes of the sigblock
+//   +48   u32 pubkey_len_author  length of author pubkey (0 at M5 stub)
+//   +52   u32 pubkey_len_root    length of root pubkey (0 at M5 stub)
+//   +56   u64 created_unix_secs  manifest creation time
+//
+// The pkg §4.1 spec labels the two 8-byte hash fields as "16 bytes of
+// sha3-256 each"; the pkg decoder at `pkg/src/manifest_codec.pdx`
+// §4.2 (lines 122-123) treats them as two 8-byte halves of the
+// 32-byte sha3 digest -- i.e. the first 16 bytes of the digest ride
+// in the header for fast-fail, and a downstream verifier that wants
+// the full 32-byte compare recomputes sha3 over the body payload.
+// This encoder mirrors that decoder: 8 bytes per half, 16 bytes of
+// hash coverage in the header.
+//
+// =============================================================================
+// WIRE FORMAT (pkg §4.2 KV record layout)
+// =============================================================================
+//
+//   +0    u16 kv_tag       one of RM_TAG_* below
+//   +2    u16 kv_len       value byte count (0..65535)
+//   +4    u8[kv_len]       value (tag-specific)
+//
+// The pkg §4.2 tag registry is mirrored here (RM_TAG_*) so a reader
+// of this repo does not have to consult the pkg repo to see what
+// bytes shell's manifest packs. Unknown tags are IGNORED by the pkg
+// decoder (forward-compat per pkg §6); shell v1.0 emits the eleven
+// tags below.
+//
+// =============================================================================
+// WIRE FORMAT (pkg §4.4 sigblock layout)
+// =============================================================================
+//
+// Two ML-DSA-65 signatures back-to-back, each preceded by a 4-byte
+// little-endian length prefix:
+//
+//   +0    u32 sig_len_author
+//   +4    u8[sig_len_author]  author_sig bytes
+//   +...  u32 sig_len_root
+//   +...  u8[sig_len_root]    root_sig bytes
+//
+// ML-DSA-65 at NIST security level 2 emits 3293-byte signatures. The
+// length prefix accommodates rotation to level 3 (4595 bytes) or
+// level 5 (4627 bytes) without a layout change. At M5-001 the
+// signature bytes are ZERO-FILLED and the length prefix is set to
+// RM_SIG_LEN_MLDSA65_L2 (3293); the release-time signer replaces the
+// zero bytes with real signatures once paideia-as v0.33-crypto-kdf
+// is reachable.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ReleaseManifest`).
+//   - No `test` mnemonic; `cmp reg, 0` for zero-checks.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (header offsets,
+//     KV length bound 65535, sigblock slot bound RM_SIG_LEN_MAX =
+//     8192 all fit).
+//   - Large immediates (RM_MAGIC_QWORD = 0x0000676973786470, error
+//     codes 0xFFFFECA0..0xFFFFECA3) emitted via `mov r10, imm64`.
+//   - r11 unused in the encode bodies (no .bss reach; the module is
+//     stateless).
+//   - Byte reads / writes in the KV value copy loop and the sigblock
+//     zero-fill loop use `xor rax, rax; mov_b rax, [ptr]` and
+//     `mov_b [ptr], rax` per the #1248 pattern; same idiom as
+//     history.pdx / completion.pdx / command_record.pdx.
+//   - Each entry point: pushes + `sub rsp, 8` prologue sized so
+//     `rsp % 16 == 0` for the shell_note call.
+
+module ReleaseManifest = structure {
+
+  // ==========================================================================
+  // Format constants (pkg §4 mirror)
+  // ==========================================================================
+
+  // Fixed header size in bytes.
+  pub let RM_HEADER_SIZE : u64 = 64
+
+  // Magic qword "pdxsig\0\0" little-endian: bytes 'p'(0x70) 'd'(0x64)
+  // 'x'(0x78) 's'(0x73) 'i'(0x69) 'g'(0x67) 0x00 0x00 read back as
+  // 0x0000676973786470.
+  pub let RM_MAGIC_QWORD : u64 = 0x0000676973786470
+
+  // Format version. Bumped by additive change per pkg §6.
+  pub let RM_FORMAT_VERSION : u64 = 1
+
+  // KV record header size (u16 tag + u16 len = 4 bytes).
+  pub let RM_KV_HEADER_SIZE : u64 = 4
+
+  // Maximum KV value length. u16 kv_len maxes at 65535.
+  pub let RM_KV_LEN_MAX : u64 = 65535
+
+  // Sigblock length prefix size (u32).
+  pub let RM_SIG_LEN_PREFIX_SIZE : u64 = 4
+
+  // ML-DSA-65 level-2 signature size in bytes. Locked here so the
+  // sigblock offset math at M5-001 stays consistent when the real
+  // signer bolts on at paideia-as v0.33-crypto-kdf.
+  pub let RM_SIG_LEN_MLDSA65_L2 : u64 = 3293
+
+  // Upper bound on the sig slot to bound the zero-fill loop. Level-5
+  // ML-DSA is 4627 bytes; RM_SIG_LEN_MAX picks 8192 (a page) as the
+  // generous ceiling. Fits imm <= 0x7FFFFFFF.
+  pub let RM_SIG_LEN_MAX : u64 = 8192
+
+  // ==========================================================================
+  // KV tag registry (pkg §4.2 mirror)
+  //
+  // shell v1.0's manifest.pdxsig emits eleven tags in order:
+  //   PKG_NAME, PKG_VERSION, PKG_REPO_URL, PAIDEIA_AS_VER,
+  //   AUTHOR_PUBKEY, AUTHOR_FPR, AUTHOR_EXPIRY,
+  //   ROOT_PUBKEY,   ROOT_FPR,   ROOT_EXPIRY,
+  //   CAPS_DECL_HASH, DEPS_LIST_HASH, FILE_INVENTORY (repeated),
+  //   BUILD_REPRODUCER.
+  //
+  // See design/release-manifest.md §2 for the shell-specific values.
+  // ==========================================================================
+  pub let RM_TAG_PKG_NAME         : u64 = 0x0001
+  pub let RM_TAG_PKG_VERSION      : u64 = 0x0002
+  pub let RM_TAG_PKG_REPO_URL     : u64 = 0x0003
+  pub let RM_TAG_PAIDEIA_AS_VER   : u64 = 0x0004
+  pub let RM_TAG_AUTHOR_PUBKEY    : u64 = 0x0010
+  pub let RM_TAG_AUTHOR_FPR       : u64 = 0x0011
+  pub let RM_TAG_AUTHOR_EXPIRY    : u64 = 0x0012
+  pub let RM_TAG_ROOT_PUBKEY      : u64 = 0x0020
+  pub let RM_TAG_ROOT_FPR         : u64 = 0x0021
+  pub let RM_TAG_ROOT_EXPIRY      : u64 = 0x0022
+  pub let RM_TAG_CAPS_DECL_HASH   : u64 = 0x0030
+  pub let RM_TAG_DEPS_LIST_HASH   : u64 = 0x0031
+  pub let RM_TAG_FILE_INVENTORY   : u64 = 0x0040
+  pub let RM_TAG_BUILD_REPRODUCER : u64 = 0x00F0
+
+  // Reserved high-bit marker. Tags with the high bit set signal a
+  // version-incompatible marker (pkg §4.2 last paragraph).
+  pub let RM_TAG_HIGH_BIT : u64 = 0x8000
+
+  // ==========================================================================
+  // Return-code band 0xFFFFECAx (ReleaseManifest module)
+  // ==========================================================================
+
+  // Success sentinel = 0.
+  pub let RM_OK             : u64 = 0
+
+  // dst == 0, dst_len == 0, offset out of range.
+  pub let RM_ERR_BAD_ARGS   : u64 = 0xFFFFECA0
+
+  // dst_len < offset + required-record-size. Refused before touching
+  // dst so the caller can enlarge and retry.
+  pub let RM_ERR_TRUNCATED  : u64 = 0xFFFFECA1
+
+  // KV value length exceeds RM_KV_LEN_MAX (65535). Callers that need
+  // larger values split across a repeated tag (pkg §4.2).
+  pub let RM_ERR_KV_TOO_LONG : u64 = 0xFFFFECA2
+
+  // Sigblock sig_len exceeds RM_SIG_LEN_MAX (8192). A guard against
+  // a runaway length prefix corrupting the offset math.
+  pub let RM_ERR_SIG_TOO_LONG : u64 = 0xFFFFECA3
+
+  // ==========================================================================
+  // release_manifest_encode_header_prefix(dst, dst_len, body_len,
+  //                                      sigblock_len,
+  //                                      body_sha3_lo, body_sha3_hi) -> u64
+  //
+  // Signature: release_manifest_encode_header_prefix : (u64, u64, u64,
+  //                                                    u64, u64, u64)
+  //                                                    -> u64 !{mem} @{}
+  // RDI (input): dst           -- VA of the destination manifest buffer
+  // RSI (input): dst_len       -- bytes available in dst
+  // RDX (input): body_len      -- length of the KV body section
+  // RCX (input): sigblock_len  -- length of the sigblock section
+  // R8  (input): body_sha3_lo  -- low  8 bytes of sha3-256(body)
+  // R9  (input): body_sha3_hi  -- high 8 bytes of sha3-256(body)
+  // RAX (output): RM_OK on success, else RM_ERR_BAD_ARGS |
+  //               RM_ERR_TRUNCATED.
+  //
+  // Writes offsets 0..48 of the header per pkg §4.1:
+  //   qword0 = magic
+  //   qword1 = format_version (low 32) | header_flags=0 (high 32)
+  //   qword2 = body_len
+  //   qword3 = body_sha3_lo
+  //   qword4 = body_sha3_hi
+  //   qword5 = sigblock_len
+  // The caller invokes _suffix next to write offsets 48..64.
+  //
+  // Fail-fast on all gates; dst is NOT touched on any reject path.
+  //
+  // Bumps SH_ST_ERRORS on every reject; the release path does not
+  // have its own stat slot at M5 (release is a once-per-shell-build
+  // event, not a hot-path counter).
+  //
+  // Register plan:
+  //   r12 = dst              (callee-save)
+  //   r13 = body_len         (callee-save; needed after magic write)
+  //   r14 = sigblock_len     (callee-save; needed after body_len write)
+  //   r15 = body_sha3_lo     (callee-save; r8 clobbered by shell_note)
+  //   rbx = body_sha3_hi     (callee-save; r9 clobbered by shell_note)
+  //   rax = temp / return
+  //   r10 = magic / large-imm scratch
+  //
+  // Prologue: 5 pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` = 48
+  // bytes; rsp % 16 == 0 for shell_note.
+  // ==========================================================================
+  pub let release_manifest_encode_header_prefix : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (body_len: u64) (sigblock_len: u64) (body_sha3_lo: u64) (body_sha3_hi: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): serialise offsets 0..48 of the manifest.pdxsig header per pkg §4.1. Six qword-atomic stores: magic (0x0000676973786470), packed version|flags (1|0), body_len, body_sha3_lo, body_sha3_hi, sigblock_len. Fail-fast gates: dst != 0, dst_len >= 48. Header mirror of the pkg decoder at pkg/src/manifest_codec.pdx (parsed_body_len at line 121, parsed_body_sha3_lo at 122, parsed_body_sha3_hi at 123, parsed_sigblock_len at 124). 5 pushes (rbx, r12 dst, r13 body_len, r14 sigblock_len, r15 body_sha3_lo) + rbx caches body_sha3_hi + sub rsp, 8 = 48 bytes prologue; rsp % 16 == 0 for shell_note. All large immediates via mov r10, imm64. r11 unused (no .bss reach). Labels prefixed rm_hp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rdx;                        // body_len
+        mov r14, rcx;                        // sigblock_len
+        mov r15, r8;                         // body_sha3_lo
+        mov rbx, r9;                         // body_sha3_hi
+        // dst_len stays in rsi
+
+        // Bump SH_ST_ERRORS only on reject; no positive slot at M5.
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  rm_hp_bad_args;
+        // Gate: dst_len >= 48 (offsets 0..48).
+        cmp rsi, 48;
+        jb  rm_hp_truncated;
+
+        // --- qword0 = magic --------------------------------------
+        mov r10, 0x0000676973786470;         // RM_MAGIC_QWORD
+        mov [r12 + 0], r10;
+
+        // --- qword1 = format_version | (header_flags << 32) -----
+        // format_version = 1, header_flags = 0.
+        mov rax, 1;                          // RM_FORMAT_VERSION
+        mov [r12 + 8], rax;
+
+        // --- qword2 = body_len ----------------------------------
+        mov [r12 + 16], r13;
+
+        // --- qword3 = body_sha3_lo ------------------------------
+        mov [r12 + 24], r15;
+
+        // --- qword4 = body_sha3_hi ------------------------------
+        mov [r12 + 32], rbx;
+
+        // --- qword5 = sigblock_len ------------------------------
+        mov [r12 + 40], r14;
+
+        xor rax, rax;                        // RM_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_hp_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECA0;                 // RM_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_hp_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA1;                 // RM_ERR_TRUNCATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // release_manifest_encode_header_suffix(dst, dst_len,
+  //                                      pubkey_lens_packed,
+  //                                      created_unix_secs) -> u64
+  //
+  // Signature: (u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst                 -- VA of the destination buffer
+  // RSI (input): dst_len             -- bytes available in dst
+  // RDX (input): pubkey_lens_packed  -- (root_len << 32) | author_len
+  //                                     both are u32; caller packs
+  // RCX (input): created_unix_secs   -- manifest creation time
+  // RAX (output): RM_OK on success, else RM_ERR_BAD_ARGS |
+  //               RM_ERR_TRUNCATED.
+  //
+  // Writes offsets 48..64 of the header per pkg §4.1:
+  //   [dst+48] u32 pubkey_len_author  (low 32 of packed)
+  //   [dst+52] u32 pubkey_len_root    (high 32 of packed)
+  //   [dst+56] u64 created_unix_secs
+  //
+  // Packing pubkey_lens into one u64 keeps the SysV six-arg budget
+  // for a single-function two-arg suffix; the layout matches how the
+  // pkg decoder loads offsets 48..56 as a single qword and picks off
+  // the two halves.
+  //
+  // Register plan (3 pushes + sub rsp, 8 = 32 bytes; rsp % 16 == 0):
+  //   r12 = dst              (callee-save)
+  //   r13 = pubkey_lens_packed (callee-save; rdx clobbered by shell_note)
+  //   r14 = created_unix_secs  (callee-save; rcx clobbered by shell_note)
+  // ==========================================================================
+  pub let release_manifest_encode_header_suffix : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (pubkey_lens_packed: u64) (created_unix_secs: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): serialise offsets 48..64 of manifest.pdxsig header per pkg §4.1. Two qword-atomic stores: packed pubkey_lens (author low 32, root high 32; matches how pkg §4.1 lays out these two u32 fields consecutively at [+48] and [+52] -- a decoder loading [+48] as one u64 recovers both halves via mask+shift), then created_unix_secs at [+56]. Fail-fast gates: dst != 0, dst_len >= 64. Same 3 pushes + sub rsp, 8 prologue as command_record_close. All large immediates via mov r10, imm64. Labels prefixed rm_hs_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rdx;                        // pubkey_lens_packed
+        mov r14, rcx;                        // created_unix_secs
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  rm_hs_bad_args;
+        // Gate: dst_len >= 64.
+        cmp rsi, 64;
+        jb  rm_hs_truncated;
+
+        // --- Write packed pubkey_lens at [+48] -----------------
+        mov [r12 + 48], r13;
+
+        // --- Write created_unix_secs at [+56] ------------------
+        mov [r12 + 56], r14;
+
+        xor rax, rax;                        // RM_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      rm_hs_bad_args:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA0;                 // RM_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      rm_hs_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA1;                 // RM_ERR_TRUNCATED
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // release_manifest_encode_kv(dst, dst_len, offset, kv_tag,
+  //                            value_ptr, value_len) -> u64
+  //
+  // Signature: (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst        -- destination manifest buffer
+  // RSI (input): dst_len    -- bytes available in dst
+  // RDX (input): offset     -- byte offset in dst where the KV record starts
+  // RCX (input): kv_tag     -- one of RM_TAG_* (u16)
+  // R8  (input): value_ptr  -- VA of the value bytes (may be 0 iff value_len == 0)
+  // R9  (input): value_len  -- value byte count (0..RM_KV_LEN_MAX)
+  // RAX (output): RM_OK on success, else RM_ERR_BAD_ARGS |
+  //               RM_ERR_TRUNCATED | RM_ERR_KV_TOO_LONG.
+  //
+  // Writes:
+  //   [dst + offset + 0] u16 kv_tag
+  //   [dst + offset + 2] u16 kv_len
+  //   [dst + offset + 4] u8[value_len]
+  //
+  // The u16 stores are emitted via mov_b pairs (two byte writes) so
+  // no wide-store aliasing constraints apply; the release lint reads
+  // the same two bytes back to fingerprint the record. The KV value
+  // is byte-copied through the #1248 pattern (xor rax, rax; mov_b
+  // rax, [ptr]).
+  //
+  // Fail-fast: dst != 0, dst_len - offset >= 4 + value_len,
+  // value_len <= 65535, value_ptr non-null iff value_len > 0.
+  //
+  // Register plan (5 pushes + sub rsp, 8 = 48 bytes; rsp % 16 == 0):
+  //   r12 = dst
+  //   r13 = value_ptr
+  //   r14 = record start = dst + offset
+  //   r15 = value_len
+  //   rbx = i for byte-copy loop
+  //   rax = temp / return
+  //   r10 = large-imm scratch (unused here)
+  // ==========================================================================
+  pub let release_manifest_encode_kv : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (offset: u64) (kv_tag: u64) (value_ptr: u64) (value_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): serialise one KV record per pkg §4.2 into dst at offset. u16 kv_tag then u16 kv_len then value_len bytes; two-byte stores via mov_b pairs (low, then high) so the encoder does not depend on wide-store alignment; byte-copy uses the #1248 pattern (xor rax, rax; mov_b rax, [r13 + rbx]). Fail-fast gates: dst != 0, dst_len >= offset + 4 + value_len (checked as dst_len >= offset first, then remaining >= 4 + value_len via subtraction to avoid overflow on offset + value_len; using 64-bit ranges the caller cannot reach a wrap), value_len <= 65535, value_ptr non-null iff value_len > 0. 5 pushes (rbx, r12 dst, r13 value_ptr, r14 record start, r15 value_len) + sub rsp, 8 = 48 bytes prologue; rsp % 16 == 0 for shell_note. r11 unused. Labels prefixed rm_kv_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, r8;                         // value_ptr
+        mov r15, r9;                         // value_len
+        // dst_len stays in rsi; offset in rdx; kv_tag in rcx
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  rm_kv_bad_args;
+
+        // Gate: offset < dst_len.
+        cmp rdx, rsi;
+        jae rm_kv_truncated;
+
+        // Compute record start r14 = dst + offset.
+        mov r14, r12;
+        add r14, rdx;
+
+        // Gate: value_len <= RM_KV_LEN_MAX (65535).
+        cmp r15, 65535;
+        ja  rm_kv_too_long;
+
+        // Gate: value_ptr non-null iff value_len > 0.
+        cmp r15, 0;
+        je  rm_kv_space_check;
+        cmp r13, 0;
+        je  rm_kv_bad_args;
+
+      rm_kv_space_check:
+        // Gate: dst_len - offset >= 4 + value_len.
+        // rax = dst_len - offset (safe: offset < dst_len).
+        mov rax, rsi;
+        sub rax, rdx;
+        // required = 4 + value_len; keep in r10.
+        mov r10, r15;
+        add r10, 4;
+        cmp rax, r10;
+        jb  rm_kv_truncated;
+
+        // --- Write u16 kv_tag at [r14 + 0] ---------------------
+        // Low byte then high byte.
+        mov rax, rcx;
+        mov_b [r14 + 0], rax;
+        mov rax, rcx;
+        shr rax, 8;
+        mov_b [r14 + 1], rax;
+
+        // --- Write u16 kv_len at [r14 + 2] ---------------------
+        mov rax, r15;
+        mov_b [r14 + 2], rax;
+        mov rax, r15;
+        shr rax, 8;
+        mov_b [r14 + 3], rax;
+
+        // --- Copy value bytes (skip if value_len == 0) ---------
+        cmp r15, 0;
+        je  rm_kv_done;
+
+        xor rbx, rbx;                        // i = 0
+      rm_kv_copy_head:
+        cmp rbx, r15;
+        jae rm_kv_done;
+        xor rax, rax;
+        mov_b rax, [r13 + rbx];              // #1248 byte load
+        mov_b [r14 + rbx + 4], rax;
+        add rbx, 1;
+        jmp rm_kv_copy_head;
+
+      rm_kv_done:
+        xor rax, rax;                        // RM_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_kv_bad_args:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA0;                 // RM_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_kv_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA1;                 // RM_ERR_TRUNCATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_kv_too_long:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA2;                 // RM_ERR_KV_TOO_LONG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // release_manifest_encode_sigblock_slot(dst, dst_len, offset,
+  //                                       sig_len, sig_ptr) -> u64
+  //
+  // Signature: (u64, u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst      -- destination manifest buffer
+  // RSI (input): dst_len  -- bytes available in dst
+  // RDX (input): offset   -- byte offset in dst where the slot starts
+  // RCX (input): sig_len  -- ML-DSA signature length in bytes
+  // R8  (input): sig_ptr  -- VA of the signature bytes; if 0, the sig
+  //                          payload is zero-filled (M5 placeholder)
+  // RAX (output): RM_OK on success, else RM_ERR_BAD_ARGS |
+  //               RM_ERR_TRUNCATED | RM_ERR_SIG_TOO_LONG.
+  //
+  // Writes:
+  //   [dst + offset + 0] u32 sig_len   (little-endian)
+  //   [dst + offset + 4] u8[sig_len]   sig bytes (or zeros if sig_ptr == 0)
+  //
+  // The sig_ptr == 0 branch is the M5-001 placeholder path: the
+  // release-time signer at paideia-as v0.33-crypto-kdf later replaces
+  // the zeros in place without disturbing the enclosing envelope
+  // offsets. The length prefix stays at RM_SIG_LEN_MLDSA65_L2 (3293)
+  // in the placeholder, so the byte offsets a release lint measures
+  // match the shipped release exactly.
+  //
+  // Fail-fast: dst != 0, offset < dst_len, dst_len - offset >= 4 +
+  // sig_len, sig_len <= RM_SIG_LEN_MAX (8192).
+  //
+  // Register plan (5 pushes + sub rsp, 8 = 48 bytes; rsp % 16 == 0):
+  //   r12 = dst
+  //   r13 = sig_ptr (0 signals zero-fill)
+  //   r14 = slot start = dst + offset
+  //   r15 = sig_len
+  //   rbx = i for byte-copy / zero-fill loop
+  //   rax = temp / return
+  // ==========================================================================
+  pub let release_manifest_encode_sigblock_slot : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (offset: u64) (sig_len: u64) (sig_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): serialise one sigblock slot per pkg §4.4 into dst at offset. u32 sig_len little-endian prefix (four mov_b writes, low byte first) then sig_len bytes: either copied from sig_ptr via the #1248 pattern, or zero-filled if sig_ptr == 0. The zero-fill branch is the M5 placeholder: the release-time ML-DSA-65 signer (paideia-as v0.33-crypto-kdf) replaces the zeros in place while keeping the length prefix -- the enclosing envelope offsets stay measurable at release lint time before the crypto substrate reaches. Fail-fast gates: dst != 0, offset < dst_len, dst_len - offset >= 4 + sig_len, sig_len <= RM_SIG_LEN_MAX (8192). 5 pushes + sub rsp, 8 = 48 bytes prologue. r11 unused. Labels prefixed rm_sb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, r8;                         // sig_ptr
+        mov r15, rcx;                        // sig_len
+        // dst_len stays in rsi; offset in rdx
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  rm_sb_bad_args;
+
+        // Gate: offset < dst_len.
+        cmp rdx, rsi;
+        jae rm_sb_truncated;
+
+        // Compute slot start r14 = dst + offset.
+        mov r14, r12;
+        add r14, rdx;
+
+        // Gate: sig_len <= RM_SIG_LEN_MAX (8192).
+        cmp r15, 8192;
+        ja  rm_sb_sig_too_long;
+
+        // Gate: dst_len - offset >= 4 + sig_len.
+        mov rax, rsi;
+        sub rax, rdx;
+        mov r10, r15;
+        add r10, 4;
+        cmp rax, r10;
+        jb  rm_sb_truncated;
+
+        // --- Write u32 sig_len at [r14 + 0] --------------------
+        // Four byte stores, little-endian: b0 = sig_len & 0xFF, ...
+        mov rax, r15;
+        mov_b [r14 + 0], rax;
+        mov rax, r15;
+        shr rax, 8;
+        mov_b [r14 + 1], rax;
+        mov rax, r15;
+        shr rax, 16;
+        mov_b [r14 + 2], rax;
+        mov rax, r15;
+        shr rax, 24;
+        mov_b [r14 + 3], rax;
+
+        // --- Copy or zero-fill sig payload ---------------------
+        cmp r15, 0;
+        je  rm_sb_done;
+
+        // Branch on sig_ptr: 0 -> zero-fill, else -> copy.
+        cmp r13, 0;
+        je  rm_sb_zero_fill;
+
+        // Copy path.
+        xor rbx, rbx;
+      rm_sb_copy_head:
+        cmp rbx, r15;
+        jae rm_sb_done;
+        xor rax, rax;
+        mov_b rax, [r13 + rbx];
+        mov_b [r14 + rbx + 4], rax;
+        add rbx, 1;
+        jmp rm_sb_copy_head;
+
+      rm_sb_zero_fill:
+        xor rbx, rbx;
+      rm_sb_zero_head:
+        cmp rbx, r15;
+        jae rm_sb_done;
+        xor rax, rax;
+        mov_b [r14 + rbx + 4], rax;
+        add rbx, 1;
+        jmp rm_sb_zero_head;
+
+      rm_sb_done:
+        xor rax, rax;                        // RM_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_sb_bad_args:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA0;                 // RM_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_sb_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA1;                 // RM_ERR_TRUNCATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_sb_sig_too_long:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECA3;                 // RM_ERR_SIG_TOO_LONG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

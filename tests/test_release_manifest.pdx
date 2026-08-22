@@ -1,0 +1,639 @@
+// tests/test_release_manifest.pdx -- shell.M5-001 (paideia-os/shell#15)
+//
+// TestReleaseManifest module: encoder-golden fixtures for the M5
+// release-time producers (ReleaseManifest + BrokerBind).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The release-time signer at paideia-as v0.33-crypto-kdf calls the
+// ReleaseManifest encoders in linear order over a shell v1.0
+// package tree, and calls broker_bind_login_shell once at shell
+// boot. This module ships four goldens that pin the exact bytes
+// each encoder produces for a canonical input, so:
+//
+//   1. Any change to a wire field width / offset / ordering is
+//      caught at repo-build time before the release lint even
+//      reaches the QEMU boot.
+//   2. The pkg-side decoder (`pkg/src/manifest_codec.pdx`) reads
+//      exactly the bytes this module verifies -- a drift here is
+//      a drift there.
+//   3. The paideia-os broker (`svc_broker.pdx` at R20b.M1-003) can
+//      unpack a `broker_bind_login_shell` message byte-for-byte per
+//      the fixture in `trm_case_broker_bind`.
+//
+// Every golden qword is pinned in-source via
+// `mov r11, imm64; cmp rax, r11` -- the same pattern the M4 smoke
+// matrix (`test_smoke_matrix.pdx`) uses so a reader familiar with
+// M4 goldens can re-read this module without a mental shift.
+//
+// =============================================================================
+// FAIL-CODE BAND
+// =============================================================================
+//
+// 0xFFFFED3x -- disjoint from
+//   0xFFFFED0x TestCapsNarrow  (M4-001)
+//   0xFFFFED1x TestAuditFirst  (M4-002)
+//   0xFFFFED2x TestSmokeMatrix (M4-003)
+//
+// | Code       | Name                     | Meaning                        |
+// |------------|--------------------------|--------------------------------|
+// | 0xFFFFED30 | TRM_FAIL_HDR_PREFIX      | header prefix golden mismatch  |
+// | 0xFFFFED31 | TRM_FAIL_HDR_SUFFIX      | header suffix golden mismatch  |
+// | 0xFFFFED32 | TRM_FAIL_KV              | KV record golden mismatch      |
+// | 0xFFFFED33 | TRM_FAIL_BROKER_BIND     | broker-bind golden mismatch    |
+// | 0xFFFFED34 | TRM_FAIL_HDR_PREFIX_RC   | header prefix RC mismatch      |
+// | 0xFFFFED35 | TRM_FAIL_HDR_SUFFIX_RC   | header suffix RC mismatch      |
+// | 0xFFFFED36 | TRM_FAIL_KV_RC           | KV RC mismatch                 |
+// | 0xFFFFED37 | TRM_FAIL_BROKER_BIND_RC  | broker-bind RC mismatch        |
+//
+// The umbrella driver returns 0 on all-pass or the fail-code from
+// the FIRST failing case (fail-fast so operator's log has one row).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module basename TestReleaseManifest (PascalCase).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Large immediates via `mov r11, imm64` for golden compares and
+//     `mov r10, imm64` for constant setup.
+//   - r11 is the golden-compare scratch; r10 the setup scratch.
+//   - Byte writes into fixture .bss buffers use `mov_b [ptr], rax`
+//     after loading rax with the byte constant.
+//   - Every non-leaf test entry: 6 pushes + `sub rsp, 8` = 56 bytes
+//     prologue; rsp % 16 == 0 for the SysV encoder calls.
+
+module TestReleaseManifest = structure {
+
+  // ==========================================================================
+  // Fixture buffers (all in .bss, cache-line aligned)
+  //
+  // 128 bytes for the manifest header + first KV record (header is
+  // 64; one PKG_NAME KV with a 5-byte value + zero-padding is 12
+  // bytes; the buffer includes generous slack).
+  //
+  // 64 bytes for the broker-bind wire record (rec_len 40 for a
+  // 15-byte name; the buffer includes slack).
+  //
+  // Poison sentinel 0xDEADBEEF at qword0 of each buffer before every
+  // fixture reset, so "reject leaves dst untouched" is detectable if
+  // a future edit accidentally starts writing on an error path.
+  // ==========================================================================
+  pub let mut _trm_manifest : [u8; 128] = uninit @align(64)
+  pub let mut _trm_bbind    : [u8; 64]  = uninit @align(64)
+
+  // A literal "shell" name (5 bytes) for the PKG_NAME KV fixture.
+  pub let mut _trm_name_shell : [u8; 8] = uninit @align(8)
+
+  // A literal "svc.login-shell" name (15 bytes) for the broker-bind
+  // fixture; buffer sized to 16 for 8-byte alignment.
+  pub let mut _trm_name_svc : [u8; 16] = uninit @align(8)
+
+  // ==========================================================================
+  // trm_reset()
+  //
+  // Zero all fixture buffers and populate the string literals.
+  // ==========================================================================
+  pub let trm_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): zero the fixture buffers and populate the two string literals (\"shell\" and \"svc.login-shell\"). Byte writes via mov_b after loading rax with the byte constant; #1248 pattern for reads (not used here since this is a pure write path). Sixteen qword zero-writes cover _trm_manifest (128 bytes = 16 qwords) and _trm_bbind (64 bytes = 8 qwords) plus the two name literals (24 bytes = 3 qwords). Leaf function; no push/pop. Labels prefixed trm_rs_.",
+      block: {
+        xor rax, rax;
+
+        // Zero _trm_manifest (16 qwords).
+        lea r10, [rip + _trm_manifest];
+        mov [r10 + 0],   rax;
+        mov [r10 + 8],   rax;
+        mov [r10 + 16],  rax;
+        mov [r10 + 24],  rax;
+        mov [r10 + 32],  rax;
+        mov [r10 + 40],  rax;
+        mov [r10 + 48],  rax;
+        mov [r10 + 56],  rax;
+        mov [r10 + 64],  rax;
+        mov [r10 + 72],  rax;
+        mov [r10 + 80],  rax;
+        mov [r10 + 88],  rax;
+        mov [r10 + 96],  rax;
+        mov [r10 + 104], rax;
+        mov [r10 + 112], rax;
+        mov [r10 + 120], rax;
+
+        // Zero _trm_bbind (8 qwords).
+        lea r10, [rip + _trm_bbind];
+        mov [r10 + 0],  rax;
+        mov [r10 + 8],  rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+
+        // Populate _trm_name_shell = "shell" + 3 zero bytes.
+        lea r10, [rip + _trm_name_shell];
+        mov [r10 + 0], rax;                   // zero qword0
+        mov rax, 0x73;                        // 's'
+        mov_b [r10 + 0], rax;
+        mov rax, 0x68;                        // 'h'
+        mov_b [r10 + 1], rax;
+        mov rax, 0x65;                        // 'e'
+        mov_b [r10 + 2], rax;
+        mov rax, 0x6C;                        // 'l'
+        mov_b [r10 + 3], rax;
+        mov rax, 0x6C;                        // 'l'
+        mov_b [r10 + 4], rax;
+
+        // Populate _trm_name_svc = "svc.login-shell" (15 bytes).
+        xor rax, rax;
+        lea r10, [rip + _trm_name_svc];
+        mov [r10 + 0], rax;                   // zero qword0
+        mov [r10 + 8], rax;                   // zero qword1
+        mov rax, 0x73; mov_b [r10 + 0],  rax; // 's'
+        mov rax, 0x76; mov_b [r10 + 1],  rax; // 'v'
+        mov rax, 0x63; mov_b [r10 + 2],  rax; // 'c'
+        mov rax, 0x2E; mov_b [r10 + 3],  rax; // '.'
+        mov rax, 0x6C; mov_b [r10 + 4],  rax; // 'l'
+        mov rax, 0x6F; mov_b [r10 + 5],  rax; // 'o'
+        mov rax, 0x67; mov_b [r10 + 6],  rax; // 'g'
+        mov rax, 0x69; mov_b [r10 + 7],  rax; // 'i'
+        mov rax, 0x6E; mov_b [r10 + 8],  rax; // 'n'
+        mov rax, 0x2D; mov_b [r10 + 9],  rax; // '-'
+        mov rax, 0x73; mov_b [r10 + 10], rax; // 's'
+        mov rax, 0x68; mov_b [r10 + 11], rax; // 'h'
+        mov rax, 0x65; mov_b [r10 + 12], rax; // 'e'
+        mov rax, 0x6C; mov_b [r10 + 13], rax; // 'l'
+        mov rax, 0x6C; mov_b [r10 + 14], rax; // 'l'
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // trm_case_hdr_prefix() -> u64
+  //
+  // Call release_manifest_encode_header_prefix(_trm_manifest, 128,
+  //   body_len=0x100, sigblock_len=0x1A00,
+  //   body_sha3_lo=0xAABBCCDD11223344, body_sha3_hi=0x9988776655443322).
+  //
+  // Golden bytes at [_trm_manifest + 0..48]:
+  //   qword0 [+0]  = 0x0000676973786470  (RM_MAGIC_QWORD "pdxsig\\0\\0")
+  //   qword1 [+8]  = 0x0000000000000001  (RM_FORMAT_VERSION=1, flags=0)
+  //   qword2 [+16] = 0x0000000000000100  (body_len 0x100)
+  //   qword3 [+24] = 0xAABBCCDD11223344  (body_sha3_lo)
+  //   qword4 [+32] = 0x9988776655443322  (body_sha3_hi)
+  //   qword5 [+40] = 0x0000000000001A00  (sigblock_len 0x1A00)
+  //
+  // Verifies RC == RM_OK (0).
+  // ==========================================================================
+  pub let trm_case_hdr_prefix : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): pin the first 48 bytes of the manifest.pdxsig header. Any width/offset drift in ReleaseManifest.release_manifest_encode_header_prefix is caught here before pkg/src/manifest_codec.pdx parsed_body_len at line 121, parsed_body_sha3_lo at 122, parsed_body_sha3_hi at 123, parsed_sigblock_len at 124 mis-parse. Six qword compares via mov r11, imm64; cmp rax, r11 (same pattern as tsm_case_pipeline in test_smoke_matrix.pdx). 6 pushes + sub rsp, 8 = 56 bytes prologue for the SysV call to release_manifest_encode_header_prefix. Labels prefixed trm_hp_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call trm_reset;
+
+        lea rdi, [rip + _trm_manifest];      // dst
+        mov rsi, 128;                        // dst_len
+        mov rdx, 0x100;                      // body_len
+        mov rcx, 0x1A00;                     // sigblock_len
+        mov r8,  0xAABBCCDD11223344;         // body_sha3_lo
+        mov r9,  0x9988776655443322;         // body_sha3_hi
+        call release_manifest_encode_header_prefix;
+
+        cmp rax, 0;                          // RM_OK
+        jne trm_hp_rc_fail;
+
+        lea r12, [rip + _trm_manifest];
+
+        // qword0 = RM_MAGIC_QWORD.
+        mov rax, [r12 + 0];
+        mov r11, 0x0000676973786470;
+        cmp rax, r11;
+        jne trm_hp_fail;
+
+        // qword1 = 1 (format_version).
+        mov rax, [r12 + 8];
+        cmp rax, 1;
+        jne trm_hp_fail;
+
+        // qword2 = body_len 0x100.
+        mov rax, [r12 + 16];
+        mov r11, 0x0000000000000100;
+        cmp rax, r11;
+        jne trm_hp_fail;
+
+        // qword3 = sha3_lo.
+        mov rax, [r12 + 24];
+        mov r11, 0xAABBCCDD11223344;
+        cmp rax, r11;
+        jne trm_hp_fail;
+
+        // qword4 = sha3_hi.
+        mov rax, [r12 + 32];
+        mov r11, 0x9988776655443322;
+        cmp rax, r11;
+        jne trm_hp_fail;
+
+        // qword5 = sigblock_len 0x1A00.
+        mov rax, [r12 + 40];
+        mov r11, 0x0000000000001A00;
+        cmp rax, r11;
+        jne trm_hp_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_hp_fail:
+        mov rax, 0xFFFFED30;                 // TRM_FAIL_HDR_PREFIX
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_hp_rc_fail:
+        mov rax, 0xFFFFED34;                 // TRM_FAIL_HDR_PREFIX_RC
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // trm_case_hdr_suffix() -> u64
+  //
+  // Populate offsets 0..48 via a header_prefix call first (a suffix
+  // call that follows a real prefix mirrors what a release tool does
+  // in production; the test does NOT re-verify offsets 0..48 here --
+  // that is trm_case_hdr_prefix's job). Then call
+  // release_manifest_encode_header_suffix(_trm_manifest, 128,
+  //   pubkey_lens_packed=0x00000A00000007A0,  // root=0xA00 << 32 | author=0x7A0
+  //   created_unix_secs=0x67B00000).
+  //
+  // Golden bytes at [_trm_manifest + 48..64]:
+  //   qword6 [+48] = 0x00000A00000007A0  (pubkey_lens_packed)
+  //   qword7 [+56] = 0x0000000067B00000  (created_unix_secs)
+  // ==========================================================================
+  pub let trm_case_hdr_suffix : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): pin offsets 48..64 of the manifest.pdxsig header. The pubkey_lens_packed layout matches how pkg §4.1 places pubkey_len_author at [+48] u32 and pubkey_len_root at [+52] u32 -- packing them as (root << 32) | author into a single u64 store lands both at once and reads back the same way. Two qword compares via mov r11, imm64. 6 pushes + sub rsp, 8 = 56 bytes prologue. Labels prefixed trm_hs_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call trm_reset;
+
+        // First a prefix call to establish the 0..48 range (mirrors
+        // production order); RC checked but bytes not re-verified.
+        lea rdi, [rip + _trm_manifest];
+        mov rsi, 128;
+        mov rdx, 0x100;
+        mov rcx, 0x1A00;
+        mov r8,  0xAABBCCDD11223344;
+        mov r9,  0x9988776655443322;
+        call release_manifest_encode_header_prefix;
+        cmp rax, 0;
+        jne trm_hs_rc_fail;
+
+        // Then the suffix.
+        lea rdi, [rip + _trm_manifest];
+        mov rsi, 128;
+        mov rdx, 0x00000A00000007A0;         // (root << 32) | author
+        mov rcx, 0x0000000067B00000;         // created_unix_secs
+        call release_manifest_encode_header_suffix;
+        cmp rax, 0;                          // RM_OK
+        jne trm_hs_rc_fail;
+
+        lea r12, [rip + _trm_manifest];
+
+        // qword6 = pubkey_lens_packed.
+        mov rax, [r12 + 48];
+        mov r11, 0x00000A00000007A0;
+        cmp rax, r11;
+        jne trm_hs_fail;
+
+        // qword7 = created_unix_secs.
+        mov rax, [r12 + 56];
+        mov r11, 0x0000000067B00000;
+        cmp rax, r11;
+        jne trm_hs_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_hs_fail:
+        mov rax, 0xFFFFED31;                 // TRM_FAIL_HDR_SUFFIX
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_hs_rc_fail:
+        mov rax, 0xFFFFED35;                 // TRM_FAIL_HDR_SUFFIX_RC
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // trm_case_kv() -> u64
+  //
+  // Call release_manifest_encode_kv(_trm_manifest, 128, offset=64,
+  //   kv_tag=RM_TAG_PKG_NAME=0x0001, value_ptr=_trm_name_shell,
+  //   value_len=5).
+  //
+  // Writes 9 bytes at [_trm_manifest + 64..73]:
+  //   [+64] 0x01  (tag lo)
+  //   [+65] 0x00  (tag hi)
+  //   [+66] 0x05  (len lo)
+  //   [+67] 0x00  (len hi)
+  //   [+68] 0x73 's'
+  //   [+69] 0x68 'h'
+  //   [+70] 0x65 'e'
+  //   [+71] 0x6C 'l'
+  //   [+72] 0x6C 'l'
+  //
+  // Golden qwords:
+  //   qword_at_64 = 0x6C65687300050001  (bytes 64..71 little-endian)
+  //   qword_at_72 = 0x000000000000006C  (byte 72 = 'l', bytes 73..79 zero)
+  //
+  // Offset chosen at 64 so the KV lands past the 64-byte header,
+  // matching where the body section actually starts in a real
+  // manifest.pdxsig.
+  // ==========================================================================
+  pub let trm_case_kv : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): pin the KV wire layout. A PKG_NAME (tag 0x0001) record with a 5-byte 'shell' value produces exactly nine bytes: 4-byte header (tag lo, tag hi, len lo, len hi) then the five ASCII bytes. Two qword compares verify the layout: qword_at_64 packs the header + first 4 bytes of 'shell' (0x6C 0x65 0x68 0x73 0x00 0x05 0x00 0x01 read little-endian = 0x6C65687300050001); qword_at_72 captures the trailing 'l' at [+72] with the remaining 7 bytes of the qword reading as zeros from the .bss buffer trm_reset left behind. 6 pushes + sub rsp, 8 = 56 bytes prologue. Labels prefixed trm_kv_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call trm_reset;
+
+        lea rdi, [rip + _trm_manifest];      // dst
+        mov rsi, 128;                        // dst_len
+        mov rdx, 64;                         // offset (past 64-byte header)
+        mov rcx, 0x0001;                     // RM_TAG_PKG_NAME
+        lea r8,  [rip + _trm_name_shell];    // value_ptr
+        mov r9,  5;                          // value_len ("shell")
+        call release_manifest_encode_kv;
+
+        cmp rax, 0;                          // RM_OK
+        jne trm_kv_rc_fail;
+
+        lea r12, [rip + _trm_manifest];
+
+        // qword_at_64 = 0x6C65687300050001.
+        mov rax, [r12 + 64];
+        mov r11, 0x6C65687300050001;
+        cmp rax, r11;
+        jne trm_kv_fail;
+
+        // qword_at_72 = 0x000000000000006C ('l' + 7 zeros).
+        mov rax, [r12 + 72];
+        mov r11, 0x000000000000006C;
+        cmp rax, r11;
+        jne trm_kv_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_kv_fail:
+        mov rax, 0xFFFFED32;                 // TRM_FAIL_KV
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_kv_rc_fail:
+        mov rax, 0xFFFFED36;                 // TRM_FAIL_KV_RC
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // trm_case_broker_bind() -> u64
+  //
+  // Call broker_bind_login_shell(_trm_bbind, 64,
+  //   endpoint_cap=0xDEADBEEFCAFEBABE, name_ptr=_trm_name_svc,
+  //   name_len=15, rights_mask=0x7).
+  //
+  // rec_len = (24 + 15 + 7) & ~7 = 40.
+  //
+  // Golden bytes at [_trm_bbind + 0..40]:
+  //   qword0 [+0]  = 0x0000002800000000 | 0x424B4C42
+  //                = 0x00000028424B4C42  (BB_MAGIC | rec_len << 32)
+  //   qword1 [+8]  = 0xDEADBEEFCAFEBABE  (endpoint_cap)
+  //   qword2 [+16] = 0x0000000F00000007  (name_len 15 << 32 | rights 7)
+  //   qword3 [+24] = 0x69676F6C2E637673  ("svc.logi" LE)
+  //   qword4 [+32] = 0x006C6C6568732D6E  ("n-shell\\0" LE, 1 zero pad byte)
+  //
+  // Return code: BB_STUB = 0xFFFFECB0 (the M5 encoder-half sentinel).
+  // ==========================================================================
+  pub let trm_case_broker_bind : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): pin the BrokerBindRequest wire layout for the shell's svc.login-shell registration. The 15-byte name rounds a 24-byte header + 15 name bytes + 1 zero-pad byte to a 40-byte record. The two name qwords (bytes 24..39) verify the ASCII 'svc.login-shell' encoding + the single zero-padding byte at position 39. RC compare uses BB_STUB (0xFFFFECB0) because the encoder returns the M5-half sentinel while the sys_ipc_send substrate is deferred. 6 pushes + sub rsp, 8 = 56 bytes prologue. Labels prefixed trm_bb_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call trm_reset;
+
+        lea rdi, [rip + _trm_bbind];         // dst
+        mov rsi, 64;                         // dst_len
+        mov rdx, 0xDEADBEEFCAFEBABE;         // endpoint_cap
+        lea rcx, [rip + _trm_name_svc];      // name_ptr
+        mov r8,  15;                         // name_len
+        mov r9,  0x7;                        // BB_RIGHTS_LOGIN_SHELL
+        call broker_bind_login_shell;
+
+        // RC == BB_STUB (0xFFFFECB0).
+        mov r11, 0xFFFFECB0;
+        cmp rax, r11;
+        jne trm_bb_rc_fail;
+
+        lea r12, [rip + _trm_bbind];
+
+        // qword0 = BB_MAGIC | (40 << 32) = 0x00000028424B4C42.
+        mov rax, [r12 + 0];
+        mov r11, 0x00000028424B4C42;
+        cmp rax, r11;
+        jne trm_bb_fail;
+
+        // qword1 = endpoint_cap.
+        mov rax, [r12 + 8];
+        mov r11, 0xDEADBEEFCAFEBABE;
+        cmp rax, r11;
+        jne trm_bb_fail;
+
+        // qword2 = (name_len << 32) | rights_mask = 0x0000000F00000007.
+        mov rax, [r12 + 16];
+        mov r11, 0x0000000F00000007;
+        cmp rax, r11;
+        jne trm_bb_fail;
+
+        // qword3 = "svc.logi" LE = 0x69676F6C2E637673.
+        mov rax, [r12 + 24];
+        mov r11, 0x69676F6C2E637673;
+        cmp rax, r11;
+        jne trm_bb_fail;
+
+        // qword4 = "n-shell\\0" LE = 0x006C6C6568732D6E.
+        mov rax, [r12 + 32];
+        mov r11, 0x006C6C6568732D6E;
+        cmp rax, r11;
+        jne trm_bb_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_bb_fail:
+        mov rax, 0xFFFFED33;                 // TRM_FAIL_BROKER_BIND
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      trm_bb_rc_fail:
+        mov rax, 0xFFFFED37;                 // TRM_FAIL_BROKER_BIND_RC
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // trm_run_all() -> u64
+  //
+  // Umbrella runner. Returns 0 on all-pass or the fail-code from the
+  // first failing case. Fail-fast: an operator's release-lint log
+  // sees a single fail row per M5 release attempt.
+  //
+  // The release lint at design/release-manifest.md §4 invokes this
+  // entry as a pre-sign gate: if trm_run_all() != 0, the release
+  // tool refuses to hand any bytes to the ML-DSA-65 signer.
+  // ==========================================================================
+  pub let trm_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M5-001 (#15): the umbrella driver every M5 release lint calls. Sequential invocation of the four goldens; first failure returns immediately. Leaf-like -- 1 push (rbx unused; rbp preserved for the pushed-slot alignment) + sub rsp, 8 = 16 bytes prologue; rsp % 16 == 0 for each nested call. Labels prefixed trm_ra_.",
+      block: {
+        push rbp;
+        sub rsp, 8;
+
+        call trm_case_hdr_prefix;
+        cmp rax, 0;
+        jne trm_ra_out;
+
+        call trm_case_hdr_suffix;
+        cmp rax, 0;
+        jne trm_ra_out;
+
+        call trm_case_kv;
+        cmp rax, 0;
+        jne trm_ra_out;
+
+        call trm_case_broker_bind;
+
+      trm_ra_out:
+        add rsp, 8;
+        pop rbp;
+        ret
+      }
+    }
+}

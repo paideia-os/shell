@@ -1,0 +1,101 @@
+# shell — paideia-as build manifest
+#
+# Wave: R49  Milestone: M5 (1.0 signed release)
+# Doc:   design/tooling/r49-r50-plan.md §5.2 in the paideia-os repo.
+#
+# Consumed by `paideia-as build`. Each line is a directive; blank lines
+# and lines starting with `#` are ignored. paideia-as v0.33+ is the
+# required toolchain floor (mov_b narrow-load mnemonic + @align
+# attribute on .bss slots per the #1248 mitigation); the release-time
+# ML-DSA-65 signer additionally requires paideia-as v0.33-crypto-kdf
+# per design/tooling/plan.md D4 (see design/release-manifest.md §3).
+#
+# The build produces one output file at build-out/shell (the elaborated
+# .pdx → ELF-like Paideia binary), a caps-manifest copy at
+# build-out/shell.caps for the InitCap sidecar packaging step, and (at
+# release time) a signed build-out/shell.manifest.pdxsig for the
+# pkgs.paideia-os mirror push (see design/mirror-push.md).
+
+name        = shell
+version     = 1.0.0
+kind        = tool
+entry       = Shell::shell_main
+output      = build-out/shell
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). -----------------
+sources:
+  - src/shell.pdx                 # M1-001: top-level scaffold + stats
+  - src/line_reader.pdx           # M1-002: LineReader skeleton
+  - src/exec.pdx                  # M1-003 + M2-003: Exec skeleton + narrow-caps
+  - src/session.pdx               # M2-001: KIND_SHELL_SESSION mint + derive
+  - src/pipeline.pdx              # M2-002: pipeline_plan wire builder
+  - src/pds.pdx                   # M2-004: .pds header parser
+  - src/history.pdx               # M2-005: HistoryEntry encoder
+  - src/pipe_passthrough.pdx      # M3-001: semantic-pipe passthrough
+  - src/completion.pdx            # M3-002: CommandCompletion encoder
+  - src/command_record.pdx        # M3-003: ShellCommandRecord audit encoder
+  - src/release_manifest.pdx      # M5-001: manifest.pdxsig encoder
+  - src/broker_bind.pdx           # M5-001: svc.login-shell registration
+
+# --- Library dependencies -----------------------------------------------
+# libpdx-cap provides cap_pack_narrowed / cap_manifest_verify at exec time
+# (M2-003). libpdx-semantic-pipe provides the schema envelope helpers the
+# passthrough / completion modules rely on at M3. libpdx-audit provides the
+# audit_begin / audit_commit pair that CommandRecord wraps at M3-003.
+# libpdx-argv is used by pds.pdx to parse the .pds shebang line. libpdx-
+# elevate is reserved -- shell does not currently request elevated caps at
+# session start; if a future .pds asks for one via `requires: elevate`,
+# the dependency is already in the manifest so no re-signing round is
+# needed to add it.
+deps:
+  - libpdx-argv @ ^0.2
+  - libpdx-cap @ ^0.3            # M2-003: cap-narrowing check at exec
+  - libpdx-semantic-pipe @ ^0.2  # M3-001 + M3-002: passthrough + completion
+  - libpdx-audit @ ^0.2          # M3-003: command_record_begin/close pair
+  - libpdx-elevate @ ^0.2        # M5 reserved: .pds `requires: elevate` future
+
+# --- Test targets ------------------------------------------------------
+# Test binaries built with `paideia-as build --tests`. The release lint
+# (design/release-manifest.md §4) re-runs every test target below and
+# refuses to sign if any test binary returns non-zero at M4+ substrate
+# execution time. At encoder-half M4 they are already golden-fingerprint
+# tests -- see tests/README.md.
+tests:
+  - tests/test_caps_narrow.pdx     # M4-001: caps-narrowing violation matrix
+  - tests/test_audit_first.pdx     # M4-002: audit-first invariant matrix
+  - tests/test_smoke_matrix.pdx    # M4-003: encoder-half QEMU smoke fixtures
+  - tests/test_release_manifest.pdx # M5-001: release-manifest encoder goldens
+
+# --- Documentation targets ---------------------------------------------
+# `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.
+# The doc.M2 renderer consumes these for `doc shell`.
+docs:
+  - doc/shell.pdxdoc              # M5-002: primary doc source for `doc shell`
+
+# --- Paideia-as compliance flags ---------------------------------------
+# These mirror the invariants every R49 tool observes and every source
+# file in this repo is written against. Documented here so a build under
+# a non-conforming paideia-as revision refuses fast.
+compliance:
+  - module-basename-pascal        # Module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm ≤ 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+
+# --- Release policy ----------------------------------------------------
+# Dual-signed release per design/tooling/plan.md D4: author signature
+# (paideia-os-team key) plus paideia-root re-sign. Both signatures live
+# in build-out/shell.manifest.pdxsig; the release-time signer at paideia-
+# as v0.33-crypto-kdf populates the sigblock the release_manifest encoder
+# reserves. See design/release-manifest.md for the wire spec and
+# design/mirror-push.md for the pkgs.paideia-os hand-off.
+release:
+  signer_author  = paideia-os-team
+  signer_root    = paideia_root_pk           # R32 root key fingerprint
+  mldsa_level    = 2                         # NIST security level 2 (3293-byte sigs)
+  broker_name    = svc.login-shell           # M5-001 broker-bind name
+  mirror_target  = pkgs.paideia-os/main/shell/1.0.0/
