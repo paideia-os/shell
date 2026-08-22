@@ -1,0 +1,1025 @@
+// tests/test_caps_narrow.pdx -- shell.M4-001 (paideia-os/shell#12)
+//
+// TestCapsNarrow module: exhaustive caps-narrowing violation matrix
+// against Exec.exec_narrow_child_caps (M2-003).
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Per design/tooling/r49-r50-plan.md §5.2 M4 line, invariant I6 in
+// design/tooling/plan.md §4.2, and D3 audit-first upgrade in the
+// same wave-plan §1: "the child receives no cap not declared in
+// its caps.decl". This module exercises the six equivalence classes
+// exec_narrow_child_caps must distinguish -- five of them REJECTS
+// (four documented error codes plus argv-null / count-zero
+// BAD_ARGV) and one HAPPY path -- and stamps the actual result
+// against the expected result from a small in-repo golden table.
+//
+// The tests are pure-function drivers: no substrate calls, no
+// syscalls, no live filesystem. Every fixture is a caller-owned
+// wire-form buffer populated at test entry via MOV instructions
+// (fixture bytes are not materialised as a static const because
+// paideia-as at this wave-level exposes only .bss uninit + MOV;
+// the setup helper cost per test is 4-8 MOVs). The dst buffer is
+// re-checked after each call so a "reject leaves dst untouched"
+// discipline can be verified by the test itself, not just asserted
+// in prose.
+//
+// M4+ substrate wiring: a top-level test harness (livedom in
+// paideia-os/tools/verify-user-shell.sh at the paideia-os side)
+// will call TestCapsNarrow.tcn_run_all() and check the return
+// against 0 (all pass). Any non-zero return names the first
+// failing case number in bits 0..7, with the expected/actual
+// return codes in bits 8..39/40..71 for a diagnostic dump.
+//
+// =============================================================================
+// TEST MATRIX
+// =============================================================================
+//
+// Six cases; each has its own fixture setup + entry point:
+//
+//   1  tcn_case_happy       parent(TTY write, USER read, IPC mint)
+//                            child_decl(TTY write) -> EX_OK (rights = write)
+//   2  tcn_case_narrowing   parent(TTY write|read = 0x3)
+//                            child_decl(TTY read) -> EX_OK (rights = read only)
+//   3  tcn_case_missing     parent(TTY write)
+//                            child_decl(PDXFS write) -> EX_ERR_MISSING_CAP
+//   4  tcn_case_widening    parent(TTY write = 0x2)
+//                            child_decl(TTY write|read = 0x3)
+//                            -> EX_ERR_WIDENING
+//   5  tcn_case_sidecar     child_decl_count = 3, dst_max_entries = 2
+//                            -> EX_ERR_SIDECAR_FULL
+//   6  tcn_case_zero_decl   child_decl_count = 0 -> EX_OK (session-only child)
+//
+// Two additional bad-arg cases live under tcn_case_bad_argv (7, 8):
+//   7  parent == 0                       -> EX_ERR_BAD_ARGV
+//   8  child_decl == 0                   -> EX_ERR_BAD_ARGV
+//
+// The MISSING and WIDENING cases carry the load-bearing invariant:
+// a child that either names a KIND the parent does not hold or that
+// asks for RIGHTS the parent does not hold receives NOTHING (dst is
+// not extended with a permissive fallback entry). This is the
+// invariant I6 the plan doc calls out; the test is what makes it
+// falsifiable.
+//
+// =============================================================================
+// WIRE FORMAT (mirror of libpdx-cap Cap; 16 bytes per entry)
+// =============================================================================
+//
+//   +0    u16 slot         target slot in the child's cap_table
+//   +2    u16 kind         KIND_* ordinal (0x190..0x196 in R49)
+//   +4    u32 rights       RIGHTS_* mask (bits 0..31; upper bits reserved)
+//   +8    u64 target_ptr   kind-specific tail (opaque to the narrower)
+//
+// exec_narrow_child_caps loads qword0 with a single MOV and extracts
+// kind (bits 16..31) and rights (bits 32..63) via SHR/AND. The test
+// fixture builds qword0 the same way so a fixture typo cannot mask a
+// real narrower bug.
+//
+// KIND ordinals used in the matrix (mirror of shell.pdx SH_KIND_*):
+//
+//   TCN_KIND_USER          = 0x190
+//   TCN_KIND_ELEVATE       = 0x191
+//   TCN_KIND_SHELL_SESSION = 0x194
+//   TCN_KIND_PDXFS_FILE    = 0x195
+//   TCN_KIND_TTY           = 0x196  (provisional; see caps.decl note)
+//   TCN_KIND_IPC_ENDPOINT  = 5
+//
+// The matrix does not touch KIND_ELEVATE_CHANNEL because the shell
+// never delegates that cap to a child (elevate is client-to-broker
+// only; children go through libpdx-elevate to re-request).
+//
+// =============================================================================
+// RETURN CODES
+// =============================================================================
+//
+// All test entries return 0 on pass, or a fail code from the
+// 0xFFFFEDxx band (dedicated to test-only diagnostics; disjoint from
+// the shell's own 0xFFFFECxx band so a caller can tell a "test
+// framework failed" from a "SUT rejected the input"):
+//
+//   0xFFFFED00  TCN_PASS               all cases passed
+//   0xFFFFED01  TCN_FAIL_HAPPY         case 1 result != EX_OK
+//   0xFFFFED02  TCN_FAIL_NARROWING     case 2 result != EX_OK OR rights != 0x1
+//   0xFFFFED03  TCN_FAIL_MISSING       case 3 result != EX_ERR_MISSING_CAP
+//   0xFFFFED04  TCN_FAIL_WIDENING      case 4 result != EX_ERR_WIDENING
+//   0xFFFFED05  TCN_FAIL_SIDECAR       case 5 result != EX_ERR_SIDECAR_FULL
+//   0xFFFFED06  TCN_FAIL_ZERO_DECL     case 6 result != EX_OK
+//   0xFFFFED07  TCN_FAIL_BAD_ARGV_P    case 7 result != EX_ERR_BAD_ARGV
+//   0xFFFFED08  TCN_FAIL_BAD_ARGV_D    case 8 result != EX_ERR_BAD_ARGV
+//   0xFFFFED09  TCN_FAIL_DST_MUTATED   any reject left dst[0] != 0xDEADBEEF
+//                                       (poison sentinel written pre-call)
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestCapsNarrow`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Wire fields are
+//     compared via `cmp reg, reg` after the expected value lands in
+//     a scratch register.
+//   - Large immediates (KIND ordinals, rights << 32 masks, poison
+//     sentinel 0xDEADBEEF, error codes 0xFFFFEC2x, fail codes
+//     0xFFFFED0x) emitted via mov r10, imm32 / imm64.
+//   - r11 scratch for .bss reach (lea r11, [rip + _tcn_*]).
+//   - No byte reads at the fixture-setup layer (all fixture writes
+//     are qword MOVs); the SUT's own byte reads are not the test's
+//     concern.
+//   - Every test entry function is non-leaf (calls exec_narrow_
+//     child_caps + shell_note-via-SUT); prologue is 6 pushes +
+//     `sub rsp, 8` = 56 bytes; rsp % 16 == 0 for the SysV call.
+//   - Fixture buffers are .bss (uninit @align(16)), 64 bytes each
+//     (room for 4 wire entries) except the dst buffer which is 128
+//     bytes (room for 8 wire entries, exercised by case 5).
+
+module TestCapsNarrow = structure {
+
+  // ==========================================================================
+  // KIND ordinal mirrors (local for fixture-build; match shell.pdx SH_KIND_*)
+  // ==========================================================================
+  pub let TCN_KIND_IPC_ENDPOINT  : u64 = 5
+  pub let TCN_KIND_USER          : u64 = 0x190
+  pub let TCN_KIND_SHELL_SESSION : u64 = 0x194
+  pub let TCN_KIND_PDXFS_FILE    : u64 = 0x195
+  pub let TCN_KIND_TTY           : u64 = 0x196
+
+  // ==========================================================================
+  // Rights masks (mirror libpdx-cap RIGHTS_*; also match SS_RIGHTS_*)
+  // ==========================================================================
+  pub let TCN_RIGHTS_READ  : u64 = 0x1
+  pub let TCN_RIGHTS_WRITE : u64 = 0x2
+  pub let TCN_RIGHTS_MINT  : u64 = 0x4
+  pub let TCN_RIGHTS_RW    : u64 = 0x3    // read | write
+
+  // ==========================================================================
+  // Expected return codes from exec_narrow_child_caps (mirror shell.pdx)
+  // ==========================================================================
+  pub let TCN_EX_OK               : u64 = 0
+  pub let TCN_EX_ERR_BAD_ARGV     : u64 = 0xFFFFEC21
+  pub let TCN_EX_ERR_MISSING_CAP  : u64 = 0xFFFFEC24
+  pub let TCN_EX_ERR_WIDENING     : u64 = 0xFFFFEC25
+  pub let TCN_EX_ERR_SIDECAR_FULL : u64 = 0xFFFFEC26
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED0x band; disjoint from shell's 0xFFFFECxx band)
+  // ==========================================================================
+  pub let TCN_PASS               : u64 = 0
+  pub let TCN_FAIL_HAPPY         : u64 = 0xFFFFED01
+  pub let TCN_FAIL_NARROWING     : u64 = 0xFFFFED02
+  pub let TCN_FAIL_MISSING       : u64 = 0xFFFFED03
+  pub let TCN_FAIL_WIDENING      : u64 = 0xFFFFED04
+  pub let TCN_FAIL_SIDECAR       : u64 = 0xFFFFED05
+  pub let TCN_FAIL_ZERO_DECL     : u64 = 0xFFFFED06
+  pub let TCN_FAIL_BAD_ARGV_P    : u64 = 0xFFFFED07
+  pub let TCN_FAIL_BAD_ARGV_D    : u64 = 0xFFFFED08
+  pub let TCN_FAIL_DST_MUTATED   : u64 = 0xFFFFED09
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  // Each buffer is 128 bytes = 8 wire entries. exec_narrow_child_caps
+  // has EX_NARROW_MAX_ENTRIES = 16; the largest case here uses 3
+  // entries, and the sidecar-overflow case builds 3 entries with a
+  // dst_max_entries = 2 gate so 128 bytes of dst is more than the
+  // narrower will touch on any reject.
+  //
+  // The dst poison sentinel 0xDEADBEEF at dst[0] lets every reject
+  // path prove "dst untouched" without a full-buffer memcmp: on
+  // reject the narrower must leave the sentinel intact; on OK the
+  // narrower overwrites it with a real wire entry.
+  // ==========================================================================
+  pub let mut _tcn_parent : [u64; 16] = uninit @align(16)
+  pub let mut _tcn_child  : [u64; 16] = uninit @align(16)
+  pub let mut _tcn_dst    : [u64; 16] = uninit @align(16)
+
+  // ==========================================================================
+  // tcn_reset()
+  //
+  // Zero all three fixture buffers and paint the dst poison sentinel
+  // (0xDEADBEEF at dst[0]) so a subsequent reject leaves a
+  // detectable "untouched" mark. Called by every test entry before
+  // its own fixture-setup MOVs.
+  //
+  // Register plan (leaf):
+  //   r10 = base pointer
+  //   rcx = loop index (0..16)
+  //   rax = zero constant
+  // ==========================================================================
+  pub let tcn_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): zero the three fixture buffers and paint the dst poison sentinel 0xDEADBEEF at dst[0] so every reject test can prove dst-untouched by a single-qword compare instead of a full-buffer memcmp. Loop bound 16 fits imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed tcn_rs_.",
+      block: {
+        // Zero parent.
+        lea r10, [rip + _tcn_parent];
+        xor rax, rax;
+        xor rcx, rcx;
+      tcn_rs_p_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tcn_rs_p_loop;
+        // Zero child.
+        lea r10, [rip + _tcn_child];
+        xor rax, rax;
+        xor rcx, rcx;
+      tcn_rs_c_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tcn_rs_c_loop;
+        // Zero dst.
+        lea r10, [rip + _tcn_dst];
+        xor rax, rax;
+        xor rcx, rcx;
+      tcn_rs_d_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tcn_rs_d_loop;
+        // Paint dst[0] with poison sentinel.
+        lea r10, [rip + _tcn_dst];
+        mov rax, 0xDEADBEEF;
+        mov [r10 + 0], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_happy() -> u64
+  //
+  // Signature: tcn_case_happy : () -> u64 !{mem} @{}
+  //
+  // Parent set: one entry TTY(write), slot=1, target_ptr=0x1000.
+  // Child decl: one entry TTY(write), slot=1.
+  // Expect:   EX_OK; dst[0] = slot=1 | (kind=0x196 << 16) |
+  //           (rights=0x2 << 32); dst[1] = 0x1000.
+  //
+  // Register plan (non-leaf):
+  //   r12 = parent base cache (for the fixture MOVs)
+  //   r13 = child base cache
+  //   Rest scratch.
+  //
+  // Prologue: 6 pushes (rbx, rbp, r12, r13, r14, r15) + `sub rsp, 8`
+  // = 56 bytes prologue; rsp % 16 == 0 for the SUT call.
+  // ==========================================================================
+  pub let tcn_case_happy : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the HAPPY-PATH case in the caps-narrowing violation matrix. Verifies that exec_narrow_child_caps produces EX_OK for a well-formed parent + child_decl pair where the narrower has no widening or missing-cap objection. Fixture: parent = [TTY(write) @slot=1 -> 0x1000]; child = [TTY(write) @slot=1]; dst_max = 8. Post-call dst[0] must equal 1 | (0x196 << 16) | (0x2 << 32); dst[1] must equal 0x1000. Widening check `(0x2 & ~0x2) == 0` passes, intersection `0x2 & 0x2 = 0x2` preserves the write bit. This case anchors every other case: if HAPPY fails, no other test's expected value can be trusted. 6 pushes + `sub rsp, 8` = 56 bytes prologue; rsp % 16 == 0 for the SysV exec_narrow_child_caps call. Labels prefixed tcn_ch_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        // Reset + poison dst.
+        call tcn_reset;
+
+        // Build parent[0] = TTY(write) @ slot=1, target_ptr = 0x1000.
+        // qword0 = slot | (kind << 16) | (rights << 32)
+        //        = 1 | (0x196 << 16) | (0x2 << 32)
+        //        = 0x00000002_01960001
+        lea r12, [rip + _tcn_parent];
+        mov r10, 0x0000000201960001;
+        mov [r12 + 0], r10;
+        mov r10, 0x1000;
+        mov [r12 + 8], r10;
+
+        // Build child_decl[0] = TTY(write) @ slot=1, target_ptr = 0.
+        lea r13, [rip + _tcn_child];
+        mov r10, 0x0000000201960001;
+        mov [r13 + 0], r10;
+        xor r10, r10;
+        mov [r13 + 8], r10;
+
+        // Call exec_narrow_child_caps(parent, 1, child, 1, dst, 8).
+        lea rdi, [rip + _tcn_parent];
+        mov rsi, 1;
+        lea rdx, [rip + _tcn_child];
+        mov rcx, 1;
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  8;
+        call exec_narrow_child_caps;
+
+        // Expect EX_OK (0). Any other result is a fail.
+        cmp rax, 0;
+        jne tcn_ch_fail;
+
+        // Verify dst[0] qword0 = 0x00000002_01960001.
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0x0000000201960001;
+        cmp rax, r11;
+        jne tcn_ch_fail;
+
+        // Verify dst[0] qword1 = 0x1000.
+        mov rax, [r10 + 8];
+        cmp rax, 0x1000;
+        jne tcn_ch_fail;
+
+        // PASS
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_ch_fail:
+        mov rax, 0xFFFFED01;                 // TCN_FAIL_HAPPY
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_narrowing() -> u64
+  //
+  // Parent has TTY(read|write = 0x3); child asks for TTY(read = 0x1).
+  // Expect EX_OK; dst[0] narrowed rights = 0x1 (child & parent).
+  // ==========================================================================
+  pub let tcn_case_narrowing : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the NARROWING case. Verifies that when a child asks for STRICTLY LESS than the parent holds (READ when parent has READ|WRITE), the narrower stores rights = child & parent, not rights = parent (would overprivilege) and not rights = child (would preserve the child's declaration verbatim without checking parent-held rights). Fixture: parent = [TTY(read|write=0x3) @slot=1 -> 0x2000]; child = [TTY(read=0x1) @slot=1]; dst_max = 8. Post-call dst[0] rights lane (bits 32..63) must equal 0x1; dst[0] target_ptr (qword1) must equal 0x2000 (parent's ptr, not child's decl-implied 0). This is the load-bearing narrowing rule -- if the SUT stores 0x3 or 0x2 instead, undo/audit reasoning breaks (a child that receives more than it declared can bypass its own audit records at exec time). 6 pushes + `sub rsp, 8` = 56 bytes prologue. Labels prefixed tcn_nw_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tcn_reset;
+
+        // parent[0] = TTY(read|write = 0x3) @ slot=1, target_ptr=0x2000.
+        // qword0 = 1 | (0x196 << 16) | (0x3 << 32) = 0x00000003_01960001
+        lea r12, [rip + _tcn_parent];
+        mov r10, 0x0000000301960001;
+        mov [r12 + 0], r10;
+        mov r10, 0x2000;
+        mov [r12 + 8], r10;
+
+        // child[0] = TTY(read = 0x1) @ slot=1.
+        // qword0 = 1 | (0x196 << 16) | (0x1 << 32) = 0x00000001_01960001
+        lea r13, [rip + _tcn_child];
+        mov r10, 0x0000000101960001;
+        mov [r13 + 0], r10;
+        xor r10, r10;
+        mov [r13 + 8], r10;
+
+        // Call.
+        lea rdi, [rip + _tcn_parent];
+        mov rsi, 1;
+        lea rdx, [rip + _tcn_child];
+        mov rcx, 1;
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  8;
+        call exec_narrow_child_caps;
+
+        cmp rax, 0;
+        jne tcn_nw_fail;
+
+        // Verify dst[0] qword0 = 1 | (0x196 << 16) | ((0x1 & 0x3) << 32)
+        //                      = 0x0000000101960001 (rights narrowed to 0x1).
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0x0000000101960001;
+        cmp rax, r11;
+        jne tcn_nw_fail;
+
+        // Verify dst[0] target_ptr = parent's 0x2000 (not child's 0).
+        mov rax, [r10 + 8];
+        cmp rax, 0x2000;
+        jne tcn_nw_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_nw_fail:
+        mov rax, 0xFFFFED02;                 // TCN_FAIL_NARROWING
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_missing() -> u64
+  //
+  // Parent holds TTY(write) only; child asks for PDXFS_FILE(write).
+  // Expect EX_ERR_MISSING_CAP; dst untouched (poison sentinel intact).
+  // ==========================================================================
+  pub let tcn_case_missing : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the MISSING-CAP case. Verifies that a child asking for a KIND the parent does not hold is refused with EX_ERR_MISSING_CAP (0xFFFFEC24) and that dst is NOT extended with a permissive-fallback entry (poison sentinel 0xDEADBEEF must remain at dst[0]). Fixture: parent = [TTY(write) @slot=1 -> 0x1000]; child = [PDXFS_FILE(write) @slot=2 -> 0]; dst_max = 8. The inner-scan loop in exec_narrow_child_caps walks all parent entries, fails to find a KIND=0x195 match against parent's KIND=0x196, and takes the en_nc_missing tail. This is the load-bearing capability-confinement rule: a child cannot escalate to a KIND its caps.decl-ish request slipped in for. 6 pushes prologue; labels prefixed tcn_ms_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tcn_reset;
+
+        // parent[0] = TTY(write) @ slot=1, target_ptr=0x1000.
+        lea r12, [rip + _tcn_parent];
+        mov r10, 0x0000000201960001;
+        mov [r12 + 0], r10;
+        mov r10, 0x1000;
+        mov [r12 + 8], r10;
+
+        // child[0] = PDXFS_FILE(write) @ slot=2, target_ptr=0.
+        // qword0 = 2 | (0x195 << 16) | (0x2 << 32) = 0x00000002_01950002
+        lea r13, [rip + _tcn_child];
+        mov r10, 0x0000000201950002;
+        mov [r13 + 0], r10;
+        xor r10, r10;
+        mov [r13 + 8], r10;
+
+        lea rdi, [rip + _tcn_parent];
+        mov rsi, 1;
+        lea rdx, [rip + _tcn_child];
+        mov rcx, 1;
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  8;
+        call exec_narrow_child_caps;
+
+        // Expect EX_ERR_MISSING_CAP (0xFFFFEC24).
+        mov r11, 0xFFFFEC24;
+        cmp rax, r11;
+        jne tcn_ms_fail;
+
+        // Verify dst[0] poison sentinel intact (0xDEADBEEF).
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEF;
+        cmp rax, r11;
+        jne tcn_ms_dst_mutated;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_ms_fail:
+        mov rax, 0xFFFFED03;                 // TCN_FAIL_MISSING
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_ms_dst_mutated:
+        mov rax, 0xFFFFED09;                 // TCN_FAIL_DST_MUTATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_widening() -> u64
+  //
+  // Parent has TTY(write = 0x2); child asks for TTY(read|write = 0x3).
+  // The extra READ bit is a widen; expect EX_ERR_WIDENING; dst intact.
+  // ==========================================================================
+  pub let tcn_case_widening : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the WIDENING case -- the classic capability-attack surface. A child that manages to declare more rights than the parent holds must be refused with EX_ERR_WIDENING (0xFFFFEC25); no clamping-with-warning, no partial narrowing. Fixture: parent = [TTY(write=0x2) @slot=1 -> 0x1000]; child = [TTY(read|write=0x3) @slot=1]; dst_max = 8. The widen check `(child & ~parent) = (0x3 & ~0x2) = 0x1` is non-zero, en_nc_widening taken, EX_ERR_WIDENING returned, poison sentinel 0xDEADBEEF still at dst[0]. If this case fails, cap_manifest_verify's discipline (libpdx-cap) is silently bypassable at exec-time; catching that here at M4 blocks a class of privilege-escalation bugs at wave close instead of at 1.0 release. 6 pushes prologue; labels prefixed tcn_wd_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tcn_reset;
+
+        // parent[0] = TTY(write only = 0x2) @ slot=1.
+        lea r12, [rip + _tcn_parent];
+        mov r10, 0x0000000201960001;
+        mov [r12 + 0], r10;
+        mov r10, 0x1000;
+        mov [r12 + 8], r10;
+
+        // child[0] = TTY(read|write = 0x3) @ slot=1.
+        lea r13, [rip + _tcn_child];
+        mov r10, 0x0000000301960001;
+        mov [r13 + 0], r10;
+        xor r10, r10;
+        mov [r13 + 8], r10;
+
+        lea rdi, [rip + _tcn_parent];
+        mov rsi, 1;
+        lea rdx, [rip + _tcn_child];
+        mov rcx, 1;
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  8;
+        call exec_narrow_child_caps;
+
+        mov r11, 0xFFFFEC25;                 // EX_ERR_WIDENING
+        cmp rax, r11;
+        jne tcn_wd_fail;
+
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEF;
+        cmp rax, r11;
+        jne tcn_wd_dst_mutated;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_wd_fail:
+        mov rax, 0xFFFFED04;                 // TCN_FAIL_WIDENING
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_wd_dst_mutated:
+        mov rax, 0xFFFFED09;                 // TCN_FAIL_DST_MUTATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_sidecar() -> u64
+  //
+  // Parent has 3 caps; child asks for 3; dst_max_entries = 2.
+  // Expect EX_ERR_SIDECAR_FULL; dst intact.
+  // ==========================================================================
+  pub let tcn_case_sidecar : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the SIDECAR-OVERFLOW case. Verifies the pre-copy gate `dst_max_entries >= child_decl_count` in exec_narrow_child_caps: if the caller's dst buffer holds fewer wire entries than the child's caps.decl asks for, the SUT refuses with EX_ERR_SIDECAR_FULL (0xFFFFEC26) BEFORE writing any entry (poison sentinel 0xDEADBEEF must remain). Fixture: parent = [USER, TTY, IPC]; child = [USER, TTY, IPC]; dst_max = 2. Without this gate, a well-formed but too-small caller buffer would produce a partial write the caller might not detect (the SUT's happy path returns entry_count via a separate implicit contract; a partial write would leave slots 0..1 written and slot 2 poisoned, an ambiguity the caller must never have to reason about). 6 pushes prologue; labels prefixed tcn_sc_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tcn_reset;
+
+        // parent[0..2]:
+        //   [0] USER(read) @slot=1
+        //   [1] TTY(write) @slot=2
+        //   [2] IPC_ENDPOINT(mint) @slot=3
+        lea r12, [rip + _tcn_parent];
+        // parent[0] = USER(read=0x1) @slot=1
+        mov r10, 0x0000000101900001;
+        mov [r12 + 0], r10;
+        mov r10, 0x1000;
+        mov [r12 + 8], r10;
+        // parent[1] = TTY(write=0x2) @slot=2
+        mov r10, 0x0000000201960002;
+        mov [r12 + 16], r10;
+        mov r10, 0x2000;
+        mov [r12 + 24], r10;
+        // parent[2] = IPC_ENDPOINT(mint=0x4) @slot=3
+        mov r10, 0x0000000400050003;
+        mov [r12 + 32], r10;
+        mov r10, 0x3000;
+        mov [r12 + 40], r10;
+
+        // child_decl mirrors parent (child asks for exactly what parent has).
+        lea r13, [rip + _tcn_child];
+        mov r10, 0x0000000101900001;
+        mov [r13 + 0], r10;
+        xor r10, r10;
+        mov [r13 + 8], r10;
+        mov r10, 0x0000000201960002;
+        mov [r13 + 16], r10;
+        xor r10, r10;
+        mov [r13 + 24], r10;
+        mov r10, 0x0000000400050003;
+        mov [r13 + 32], r10;
+        xor r10, r10;
+        mov [r13 + 40], r10;
+
+        // Call with dst_max_entries=2 while child_decl_count=3.
+        lea rdi, [rip + _tcn_parent];
+        mov rsi, 3;
+        lea rdx, [rip + _tcn_child];
+        mov rcx, 3;
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  2;
+        call exec_narrow_child_caps;
+
+        mov r11, 0xFFFFEC26;                 // EX_ERR_SIDECAR_FULL
+        cmp rax, r11;
+        jne tcn_sc_fail;
+
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEF;
+        cmp rax, r11;
+        jne tcn_sc_dst_mutated;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_sc_fail:
+        mov rax, 0xFFFFED05;                 // TCN_FAIL_SIDECAR
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_sc_dst_mutated:
+        mov rax, 0xFFFFED09;                 // TCN_FAIL_DST_MUTATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_zero_decl() -> u64
+  //
+  // child_decl_count = 0 -- child declares no ambient caps beyond the
+  // session cap (which pipeline_plan + session_derive_subcap will hand
+  // it separately). This is a LEGAL invocation; expect EX_OK and dst
+  // untouched (nothing to write when child has no decl entries).
+  // ==========================================================================
+  pub let tcn_case_zero_decl : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the ZERO-DECL case. A child with an empty caps.decl (all it needs is the ambient session cap plus its pipe endpoints) is a legitimate invocation, not an error. exec_narrow_child_caps must return EX_OK with zero output entries; dst poison sentinel intact (nothing to write). Fixture: parent = [TTY(write) @slot=1 -> 0x1000] (any non-empty parent works); child_decl_count = 0; dst_max = 8. The SUT's special case at `cmp r15, 0 / je en_nc_done_ok` covers this branch. If this case fails, tools like `doc` or `pkg list` (which need only stdout + audit + session) cannot be invoked because the shell would refuse them at exec-time. 6 pushes prologue; labels prefixed tcn_zd_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tcn_reset;
+
+        // parent[0] = TTY(write) -- unused by SUT (child has no decls) but
+        // must be non-null to pass the parent-non-null gate.
+        lea r12, [rip + _tcn_parent];
+        mov r10, 0x0000000201960001;
+        mov [r12 + 0], r10;
+        mov r10, 0x1000;
+        mov [r12 + 8], r10;
+
+        // child_decl is non-null (buffer exists) but child_decl_count = 0.
+        lea r13, [rip + _tcn_child];
+
+        lea rdi, [rip + _tcn_parent];
+        mov rsi, 1;
+        mov rdx, r13;
+        mov rcx, 0;                          // child_decl_count = 0
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  8;
+        call exec_narrow_child_caps;
+
+        cmp rax, 0;
+        jne tcn_zd_fail;
+
+        // Verify dst[0] still holds the poison sentinel (SUT wrote nothing).
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEF;
+        cmp rax, r11;
+        jne tcn_zd_dst_mutated;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_zd_fail:
+        mov rax, 0xFFFFED06;                 // TCN_FAIL_ZERO_DECL
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_zd_dst_mutated:
+        mov rax, 0xFFFFED09;                 // TCN_FAIL_DST_MUTATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_bad_argv_parent() -> u64
+  //
+  // parent == 0 (null pointer). Expect EX_ERR_BAD_ARGV; dst untouched.
+  // ==========================================================================
+  pub let tcn_case_bad_argv_parent : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the BAD-ARGV null-parent case. exec_narrow_child_caps must refuse parent == 0 with EX_ERR_BAD_ARGV (0xFFFFEC21) before any load / store to any buffer. Without this gate, a caller that passes an uninitialized parent pointer would cause a #PF at qword load time -- a bug the shell would take as a signal-hit rather than a clean rejection. Fixture: parent = 0; child = valid single-entry TTY(write) @slot=1; dst_max = 8. 6 pushes prologue; labels prefixed tcn_bp_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tcn_reset;
+
+        // Populate a valid child so the null-parent gate is the only refusal.
+        lea r13, [rip + _tcn_child];
+        mov r10, 0x0000000201960001;
+        mov [r13 + 0], r10;
+        xor r10, r10;
+        mov [r13 + 8], r10;
+
+        // parent = 0.
+        xor rdi, rdi;
+        mov rsi, 1;
+        lea rdx, [rip + _tcn_child];
+        mov rcx, 1;
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  8;
+        call exec_narrow_child_caps;
+
+        mov r11, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        cmp rax, r11;
+        jne tcn_bp_fail;
+
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEF;
+        cmp rax, r11;
+        jne tcn_bp_dst_mutated;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_bp_fail:
+        mov rax, 0xFFFFED07;                 // TCN_FAIL_BAD_ARGV_P
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_bp_dst_mutated:
+        mov rax, 0xFFFFED09;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_case_bad_argv_decl() -> u64
+  //
+  // child_decl == 0 (null pointer). Expect EX_ERR_BAD_ARGV; dst intact.
+  // Distinct from bad_argv_parent so failure reports the offending arg.
+  // ==========================================================================
+  pub let tcn_case_bad_argv_decl : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): the BAD-ARGV null-decl case. Symmetric to tcn_case_bad_argv_parent: if child_decl is null, exec_narrow_child_caps must refuse with EX_ERR_BAD_ARGV before touching dst. Kept distinct from the parent-null case so a failure report names the offending argument -- the two cases exercise two independent gates in the SUT. Fixture: parent = valid single-entry; child_decl = 0; dst_max = 8. 6 pushes prologue; labels prefixed tcn_bd_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call tcn_reset;
+
+        // Populate a valid parent so the null-child gate is the only refusal.
+        lea r12, [rip + _tcn_parent];
+        mov r10, 0x0000000201960001;
+        mov [r12 + 0], r10;
+        mov r10, 0x1000;
+        mov [r12 + 8], r10;
+
+        // child_decl = 0.
+        lea rdi, [rip + _tcn_parent];
+        mov rsi, 1;
+        xor rdx, rdx;
+        mov rcx, 1;
+        lea r8,  [rip + _tcn_dst];
+        mov r9,  8;
+        call exec_narrow_child_caps;
+
+        mov r11, 0xFFFFEC21;
+        cmp rax, r11;
+        jne tcn_bd_fail;
+
+        lea r10, [rip + _tcn_dst];
+        mov rax, [r10 + 0];
+        mov r11, 0xDEADBEEF;
+        cmp rax, r11;
+        jne tcn_bd_dst_mutated;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_bd_fail:
+        mov rax, 0xFFFFED08;                 // TCN_FAIL_BAD_ARGV_D
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      tcn_bd_dst_mutated:
+        mov rax, 0xFFFFED09;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tcn_run_all() -> u64
+  //
+  // Drive all 8 cases in order. Return 0 on all-pass, else the first
+  // non-zero case return (a specific TCN_FAIL_* code identifies which
+  // case failed; the M4+ substrate harness pretty-prints the code
+  // against the case table above).
+  //
+  // Non-leaf; 1 push + `sub rsp, 8` = 16 bytes prologue -- rsp % 16 == 0.
+  // No callee-save registers needed (each case is self-contained and
+  // uses rax alone for its return).
+  // ==========================================================================
+  pub let tcn_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-001 (#12): drive all 8 caps-narrowing test cases in a fixed order (happy, narrowing, missing, widening, sidecar, zero_decl, bad_argv_parent, bad_argv_decl). Return the first non-zero case return, or 0 on all-pass. Stop-on-first-fail matches the shell error-handling discipline elsewhere in the repo -- a caller that wants a full-matrix diagnostic runs each tcn_case_* individually. Prologue: 1 push + `sub rsp, 8` = 16 bytes; rsp % 16 == 0 for the SysV calls. Labels prefixed tcn_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call tcn_case_happy;
+        cmp rax, 0;
+        jne tcn_ra_done;
+
+        call tcn_case_narrowing;
+        cmp rax, 0;
+        jne tcn_ra_done;
+
+        call tcn_case_missing;
+        cmp rax, 0;
+        jne tcn_ra_done;
+
+        call tcn_case_widening;
+        cmp rax, 0;
+        jne tcn_ra_done;
+
+        call tcn_case_sidecar;
+        cmp rax, 0;
+        jne tcn_ra_done;
+
+        call tcn_case_zero_decl;
+        cmp rax, 0;
+        jne tcn_ra_done;
+
+        call tcn_case_bad_argv_parent;
+        cmp rax, 0;
+        jne tcn_ra_done;
+
+        call tcn_case_bad_argv_decl;
+
+      tcn_ra_done:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}
