@@ -1,0 +1,943 @@
+// tests/test_audit_first.pdx -- shell.M4-002 (paideia-os/shell#13)
+//
+// TestAuditFirst module: verifies the D3 audit-first invariant --
+// the shell's ShellCommandRecord must be well-formed and DURABLE
+// (encoder returns CMDR_OK, sentinel written, header intact) BEFORE
+// the child can emit any user-visible output.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Per design/tooling/r49-r50-plan.md §1 (D3 audit-first upgrade of
+// invariant I5): "every user-facing operation -- including read
+// operations, not just destructive ones -- emits an audit record
+// to /system/audit/user-events/ BEFORE it emits any user-visible
+// output". For the shell that means:
+//
+//   1. `command_record_begin` runs first -- and returns CMDR_OK.
+//   2. libpdx-audit's `audit_begin` sends the OPEN record to the
+//      journal broker and blocks on its durable-write ack (this is
+//      the M4+ substrate wiring; the encoder half lands at M3-003).
+//   3. Only then does `sys_execve` unblock the child.
+//   4. After `sys_wait4`, `command_record_close` updates the record
+//      with the child's exit code and sets the CLOSED flag.
+//   5. libpdx-audit's `audit_commit` propagates the close.
+//
+// This test verifies THE ENCODER HALF of steps 1 + 4:
+//
+//   * begin produces a well-formed OPEN record: correct magic,
+//     record_len, audit_id, ts_begin_ns, exit_code == CMDR_EXIT_PENDING
+//     (0xFFFFFFFF), flags == 0.
+//   * close updates the OPEN record in place: sets CLOSED (+
+//     HAS_ERROR when exit != 0), replaces the pending sentinel with
+//     the real exit code, preserves argv_bytes in the low 32 of
+//     qword4, writes ts_end_ns at qword2's offset.
+//   * a close called on a record before begin (dst_len < header size)
+//     is refused with CMDR_ERR_BAD_ARGS -- the encoder cannot be used
+//     to fabricate a CLOSED record without the OPEN record existing.
+//   * exit_code > 255 is refused with CMDR_ERR_BAD_EXIT -- the
+//     sentinel value 0xFFFFFFFF cannot be written back into a real
+//     close.
+//   * audit_id == 0 is refused at begin -- audit_id 0 is libpdx-
+//     audit's reserved "no active audit" sentinel and cannot be
+//     used to journal a record.
+//
+// The M4+ substrate wiring (libpdx-audit's send-with-durable-ack path)
+// is where the "durable BEFORE child unblocks" half of the invariant
+// actually gets enforced by the kernel; the encoder can produce a
+// well-formed record without that path being live, and this test's
+// role is to make the encoder half falsifiable at wave close so the
+// substrate wiring only needs to test the ack semantics.
+//
+// =============================================================================
+// TEST MATRIX
+// =============================================================================
+//
+//   1  taf_case_begin_ok        argv="ls\0-l\0" -> CMDR_OK; verify header:
+//                                magic, record_len = 56, audit_id, ts_begin,
+//                                argv_bytes = 6, exit_code = 0xFFFFFFFF (pending),
+//                                flags = 0.
+//   2  taf_case_close_exit0     close(ts_end, 0) -> CMDR_OK; verify updated:
+//                                ts_end_ns at qword2, exit_code = 0, flags = CLOSED,
+//                                argv_bytes still = 6 in qword4 low.
+//   3  taf_case_close_exit1     close(ts_end, 1) -> CMDR_OK; verify updated:
+//                                exit_code = 1, flags = CLOSED | HAS_ERROR.
+//   4  taf_case_close_no_begin  close on a zero buffer (dst_len < 48)
+//                                -> CMDR_ERR_BAD_ARGS (encoder cannot fabricate
+//                                CLOSED without OPEN).
+//   5  taf_case_close_exit_oor  close(ts_end, 256) -> CMDR_ERR_BAD_EXIT
+//                                (exit_code > 255 out of wstatus low-byte range;
+//                                the PENDING sentinel 0xFFFFFFFF is deliberately
+//                                above this ceiling so it cannot round-trip).
+//   6  taf_case_begin_id_zero   begin(..., audit_id=0, ...) -> CMDR_ERR_BAD_ARGS
+//                                (audit_id 0 is libpdx-audit "no active audit").
+//   7  taf_case_close_pending   close(ts_end, 0xFFFFFFFF) -> CMDR_ERR_BAD_EXIT
+//                                (a caller passing the sentinel explicitly must
+//                                be rejected; the wire's PENDING marker cannot
+//                                be a legitimate exit).
+//   8  taf_case_ordering        begin then close then check the record's
+//                                complete final state; the record's CLOSED flag
+//                                is present, exit_code has replaced sentinel,
+//                                argv_bytes preserved -- the load-bearing
+//                                round-trip that proves the D3 invariant holds
+//                                for the encoder pair.
+//
+// =============================================================================
+// WIRE FORMAT (mirror of CommandRecord; 48-byte header + argv + pad)
+// =============================================================================
+//
+//   +0    u32 magic        = 0x52444d43 ("CMDR" LE)
+//   +4    u32 record_len   total bytes; multiple of 8
+//   +8    u64 audit_id     libpdx-audit's non-zero handle
+//   +16   u64 ts_begin_ns
+//   +24   u64 ts_end_ns    0 while OPEN
+//   +32   u32 argv_bytes
+//   +36   u32 exit_code    0xFFFFFFFF (PENDING) while OPEN
+//   +40   u32 flags        bit 0 CLOSED, bit 1 HAS_ERROR
+//   +44   u32 reserved
+//   +48   argv bytes (variable) + 0..7 zero pad
+//
+// Argv for the test is "ls\0-l\0" (6 bytes); record_len = 48 + 6 =
+// 54, padded to 56.
+//
+// =============================================================================
+// RETURN CODES
+// =============================================================================
+//
+//   0            TAF_PASS               all cases passed
+//   0xFFFFED11   TAF_FAIL_BEGIN_OK      case 1 result != CMDR_OK
+//                                        OR any header field mismatched
+//   0xFFFFED12   TAF_FAIL_CLOSE_E0      case 2 result != CMDR_OK OR flags != CLOSED
+//   0xFFFFED13   TAF_FAIL_CLOSE_E1      case 3 result != CMDR_OK
+//                                        OR flags != (CLOSED | HAS_ERROR)
+//   0xFFFFED14   TAF_FAIL_NO_BEGIN      case 4 result != CMDR_ERR_BAD_ARGS
+//   0xFFFFED15   TAF_FAIL_EXIT_OOR      case 5 result != CMDR_ERR_BAD_EXIT
+//   0xFFFFED16   TAF_FAIL_ID_ZERO       case 6 result != CMDR_ERR_BAD_ARGS
+//   0xFFFFED17   TAF_FAIL_EXIT_PEND     case 7 result != CMDR_ERR_BAD_EXIT
+//   0xFFFFED18   TAF_FAIL_ORDER         case 8 final record state incorrect
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestAuditFirst`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Large immediates
+//     (CMDR_MAGIC, CMDR_EXIT_PENDING, error codes, fail codes) via
+//     mov r10, imm64 / imm32.
+//   - r11 scratch for .bss reach.
+//   - Byte-copy of argv text into the .bss fixture uses `xor rax, rax;
+//     mov_b rax, [ptr]` then `mov_b [ptr], rax` (#1248 pattern).
+//   - Every non-leaf test entry has 6 pushes + `sub rsp, 8` = 56 bytes
+//     prologue; rsp % 16 == 0 for the SysV command_record_* calls.
+
+module TestAuditFirst = structure {
+
+  // ==========================================================================
+  // Format constants (mirror CommandRecord.CMDR_*)
+  // ==========================================================================
+  pub let TAF_CMDR_MAGIC        : u64 = 0x52444d43
+  pub let TAF_CMDR_EXIT_PENDING : u64 = 0xFFFFFFFF
+  pub let TAF_CMDR_HEADER_SIZE  : u64 = 48
+
+  pub let TAF_CMDR_OK           : u64 = 0
+  pub let TAF_CMDR_ERR_BAD_ARGS : u64 = 0xFFFFEC90
+  pub let TAF_CMDR_ERR_BAD_EXIT : u64 = 0xFFFFEC93
+
+  pub let TAF_FLAG_CLOSED    : u64 = 0x1
+  pub let TAF_FLAG_HAS_ERROR : u64 = 0x2
+
+  // Argv "ls\0-l\0" is 6 bytes; record_len = (48 + 6 + 7) & ~7 = 56.
+  pub let TAF_ARGV_BYTES : u64 = 6
+  pub let TAF_REC_LEN    : u64 = 56
+
+  // Fixture audit_id + timestamps.
+  pub let TAF_AUDIT_ID     : u64 = 0x1234
+  pub let TAF_TS_BEGIN     : u64 = 0x1000000000000000
+  pub let TAF_TS_END       : u64 = 0x2000000000000000
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED1x band)
+  // ==========================================================================
+  pub let TAF_PASS               : u64 = 0
+  pub let TAF_FAIL_BEGIN_OK      : u64 = 0xFFFFED11
+  pub let TAF_FAIL_CLOSE_E0      : u64 = 0xFFFFED12
+  pub let TAF_FAIL_CLOSE_E1      : u64 = 0xFFFFED13
+  pub let TAF_FAIL_NO_BEGIN      : u64 = 0xFFFFED14
+  pub let TAF_FAIL_EXIT_OOR      : u64 = 0xFFFFED15
+  pub let TAF_FAIL_ID_ZERO       : u64 = 0xFFFFED16
+  pub let TAF_FAIL_EXIT_PEND     : u64 = 0xFFFFED17
+  pub let TAF_FAIL_ORDER         : u64 = 0xFFFFED18
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  // _taf_rec: destination for the encoded record. 128 bytes is
+  //   generous -- the largest test record (case 8) uses 56 bytes.
+  // _taf_argv: 8 bytes for "ls\0-l\0" + 2 unused. Populated at test
+  //   entry via mov_b writes.
+  // ==========================================================================
+  pub let mut _taf_rec  : [u64; 16] = uninit @align(16)
+  pub let mut _taf_argv : [u64; 2]  = uninit @align(8)
+
+  // ==========================================================================
+  // taf_reset()
+  //
+  // Zero the record buffer and (re)paint the argv buffer with the
+  // 6-byte "ls\0-l\0" fixture. Leaf function.
+  //
+  // Register plan (leaf):
+  //   r10 = base pointer
+  //   rcx = loop index
+  //   rax = zero / byte const
+  // ==========================================================================
+  pub let taf_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): zero the 128-byte _taf_rec fixture and re-populate _taf_argv with 'ls\\0-l\\0' (6 bytes). Byte-write of the argv fixture uses the #1248 pattern for consistency with the SUT even though writes do not need the xor-clear guard on the destination. Loop bound 16 fits imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed taf_rs_.",
+      block: {
+        // Zero _taf_rec.
+        lea r10, [rip + _taf_rec];
+        xor rax, rax;
+        xor rcx, rcx;
+      taf_rs_loop:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  taf_rs_loop;
+
+        // Populate _taf_argv with "ls\0-l\0" = 0x6c, 0x73, 0x00, 0x2d, 0x6c, 0x00.
+        // Bytes 0..5; bytes 6..7 zero-filled by the loop above (only
+        // the qword store is atomic; per-byte writes below overwrite
+        // the low 6 bytes explicitly).
+        lea r10, [rip + _taf_argv];
+        mov rax, 0x6c;                       // 'l'
+        mov_b [r10 + 0], rax;
+        mov rax, 0x73;                       // 's'
+        mov_b [r10 + 1], rax;
+        xor rax, rax;
+        mov_b [r10 + 2], rax;                // 0
+        mov rax, 0x2d;                       // '-'
+        mov_b [r10 + 3], rax;
+        mov rax, 0x6c;                       // 'l'
+        mov_b [r10 + 4], rax;
+        xor rax, rax;
+        mov_b [r10 + 5], rax;                // 0
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_begin_ok() -> u64
+  //
+  // Call command_record_begin(dst=_taf_rec, dst_len=128, argv=_taf_argv,
+  // argv_bytes=6, audit_id=0x1234, ts_begin=0x1000...). Expect CMDR_OK
+  // and verify every header field:
+  //   qword0: magic 0x52444d43 in low 32; record_len 56 in high 32.
+  //   qword1: 0x1234.
+  //   qword2: 0x1000000000000000.
+  //   qword3: 0 (ts_end pending).
+  //   qword4: argv_bytes=6 in low 32; exit=0xFFFFFFFF in high 32.
+  //   qword5: 0 (flags | reserved).
+  //
+  // Non-leaf; 6 pushes + `sub rsp, 8` prologue.
+  // ==========================================================================
+  pub let taf_case_begin_ok : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the BEGIN happy-path case. Verifies that command_record_begin produces the expected 48-byte header for the fixture argv 'ls\\0-l\\0' with audit_id 0x1234 and ts_begin 0x1000...0. Every one of the six header qwords is compared against its expected fused value: qword0 must fuse magic 0x52444d43 with record_len 56 (54 rounded up to 8-multiple); qword4 must fuse argv_bytes 6 with the CMDR_EXIT_PENDING sentinel 0xFFFFFFFF in the high 32 (so a reader of an unclosed record sees the sentinel distinctly from any legal exit); qword5 (flags | reserved) must be 0 (CLOSED and HAS_ERROR both unset). If any qword mismatches, the entire test fails as TAF_FAIL_BEGIN_OK -- a per-qword code would balloon the fail table for a diagnostic that is trivially recovered by re-running under a debugger. 6 pushes + `sub rsp, 8` = 56 bytes prologue; rsp%16==0 for command_record_begin. Labels prefixed taf_bg_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        // command_record_begin(dst, dst_len, argv, argv_bytes, audit_id, ts_begin).
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _taf_argv];
+        mov rcx, 6;                          // argv_bytes
+        mov r8,  0x1234;                     // audit_id
+        mov r9,  0x1000000000000000;
+        call command_record_begin;
+
+        cmp rax, 0;
+        jne taf_bg_fail;
+
+        lea r12, [rip + _taf_rec];
+
+        // qword0 = magic | (record_len << 32) = 0x52444d43 | (56 << 32)
+        //        = 0x00000038_52444d43
+        mov rax, [r12 + 0];
+        mov r11, 0x0000003852444d43;
+        cmp rax, r11;
+        jne taf_bg_fail;
+
+        // qword1 = audit_id = 0x1234
+        mov rax, [r12 + 8];
+        cmp rax, 0x1234;
+        jne taf_bg_fail;
+
+        // qword2 = ts_begin = 0x1000000000000000
+        mov rax, [r12 + 16];
+        mov r11, 0x1000000000000000;
+        cmp rax, r11;
+        jne taf_bg_fail;
+
+        // qword3 = 0 (ts_end pending)
+        mov rax, [r12 + 24];
+        cmp rax, 0;
+        jne taf_bg_fail;
+
+        // qword4 = argv_bytes | (CMDR_EXIT_PENDING << 32)
+        //        = 6 | (0xFFFFFFFF << 32) = 0xFFFFFFFF_00000006
+        mov rax, [r12 + 32];
+        mov r11, 0xFFFFFFFF00000006;
+        cmp rax, r11;
+        jne taf_bg_fail;
+
+        // qword5 = 0 (flags | reserved)
+        mov rax, [r12 + 40];
+        cmp rax, 0;
+        jne taf_bg_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_bg_fail:
+        mov rax, 0xFFFFED11;                 // TAF_FAIL_BEGIN_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_close_exit0() -> u64
+  //
+  // begin, then close(ts_end=0x2000...0, exit=0). Verify:
+  //   qword2 = ts_end   (0x2000000000000000)
+  //   qword4 = 6 | (0 << 32) = 0x00000000_00000006 (argv_bytes preserved,
+  //                                                 exit sentinel replaced)
+  //   qword5 = CLOSED (0x1); HAS_ERROR unset because exit == 0.
+  // ==========================================================================
+  pub let taf_case_close_exit0 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the CLOSE (exit=0) case. Verifies command_record_close on a record just produced by begin: ts_end lands at offset 24 (qword2), exit_code replaces the CMDR_EXIT_PENDING sentinel in qword4 high 32 while preserving argv_bytes in qword4 low 32, flags at qword5 gains only the CLOSED bit (HAS_ERROR unset because exit == 0). This is the pair-round-trip that proves the close's in-place update preserves the OPEN record's non-mutable fields (magic, record_len, audit_id, ts_begin, argv_bytes) while flipping exactly the three mutable fields. 6 pushes prologue; labels prefixed taf_c0_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        // begin.
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _taf_argv];
+        mov rcx, 6;
+        mov r8,  0x1234;
+        mov r9,  0x1000000000000000;
+        call command_record_begin;
+        cmp rax, 0;
+        jne taf_c0_fail;
+
+        // close(dst, dst_len=128, ts_end=0x2000...0, exit=0).
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        mov rdx, 0x2000000000000000;
+        mov rcx, 0;                          // exit_code = 0
+        call command_record_close;
+        cmp rax, 0;
+        jne taf_c0_fail;
+
+        lea r12, [rip + _taf_rec];
+
+        // qword2 = ts_end.
+        mov rax, [r12 + 24];
+        mov r11, 0x2000000000000000;
+        cmp rax, r11;
+        jne taf_c0_fail;
+
+        // qword4 = 6 (argv_bytes) | (0 << 32) = 6.
+        mov rax, [r12 + 32];
+        cmp rax, 6;
+        jne taf_c0_fail;
+
+        // qword5 = 1 (CLOSED only).
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne taf_c0_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_c0_fail:
+        mov rax, 0xFFFFED12;                 // TAF_FAIL_CLOSE_E0
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_close_exit1() -> u64
+  //
+  // begin, then close(ts_end, exit=1). Verify:
+  //   qword4 = 6 | (1 << 32) = 0x00000001_00000006
+  //   qword5 = CLOSED | HAS_ERROR = 0x3
+  // ==========================================================================
+  pub let taf_case_close_exit1 : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the CLOSE (exit=1) case. Symmetric to case 2 but verifies the HAS_ERROR flag is set when exit_code != 0. If HAS_ERROR failed to set on non-zero exits, the audit log's post-hoc query 'which commands failed?' would silently mis-count -- the undo layer at R51+ depends on HAS_ERROR to skip failed commands during replay (a failed command has nothing to undo). 6 pushes prologue; labels prefixed taf_c1_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _taf_argv];
+        mov rcx, 6;
+        mov r8,  0x1234;
+        mov r9,  0x1000000000000000;
+        call command_record_begin;
+        cmp rax, 0;
+        jne taf_c1_fail;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        mov rdx, 0x2000000000000000;
+        mov rcx, 1;                          // exit_code = 1
+        call command_record_close;
+        cmp rax, 0;
+        jne taf_c1_fail;
+
+        lea r12, [rip + _taf_rec];
+
+        // qword4 = 6 | (1 << 32) = 0x00000001_00000006.
+        mov rax, [r12 + 32];
+        mov r11, 0x0000000100000006;
+        cmp rax, r11;
+        jne taf_c1_fail;
+
+        // qword5 = CLOSED | HAS_ERROR = 3.
+        mov rax, [r12 + 40];
+        cmp rax, 3;
+        jne taf_c1_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_c1_fail:
+        mov rax, 0xFFFFED13;                 // TAF_FAIL_CLOSE_E1
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_close_no_begin() -> u64
+  //
+  // Attempt close on a fresh buffer WITHOUT calling begin first, with
+  // dst_len = 8 (< CMDR_HEADER_SIZE = 48). Expect CMDR_ERR_BAD_ARGS.
+  //
+  // This proves the encoder cannot be used to fabricate a CLOSED
+  // record without an OPEN record existing at the same buffer: even
+  // if the caller passes zero bytes, dst_len < 48 gates the call.
+  // Combined with begin's own audit_id gate, an attacker with a
+  // scratch buffer cannot produce a well-formed CLOSED record.
+  // ==========================================================================
+  pub let taf_case_close_no_begin : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the CLOSE-WITHOUT-BEGIN case. Verifies command_record_close rejects a call where dst_len is smaller than the header (48 bytes) with CMDR_ERR_BAD_ARGS. This is a load-bearing gate: without it, a caller passing a partial buffer might succeed at writing the CLOSED flag while the record's header (magic, record_len, audit_id) is still zero -- a downstream reader would see a malformed record with the CLOSED flag set and either crash or accept the record as valid. Fixture: dst = _taf_rec (unpopulated, all zeros); dst_len = 8 (deliberately below header size). 6 pushes prologue; labels prefixed taf_nb_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        // close on a fresh (zero) buffer with dst_len < CMDR_HEADER_SIZE.
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 8;                          // dst_len < 48
+        mov rdx, 0x2000000000000000;
+        mov rcx, 0;
+        call command_record_close;
+
+        mov r11, 0xFFFFEC90;                 // CMDR_ERR_BAD_ARGS
+        cmp rax, r11;
+        jne taf_nb_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_nb_fail:
+        mov rax, 0xFFFFED14;                 // TAF_FAIL_NO_BEGIN
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_close_exit_oor() -> u64
+  //
+  // begin then close(exit=256). Expect CMDR_ERR_BAD_EXIT. exit_code
+  // > 255 is out of the wstatus low-byte range; the sentinel value
+  // 0xFFFFFFFF is deliberately above this ceiling so it cannot round-
+  // trip through close.
+  // ==========================================================================
+  pub let taf_case_close_exit_oor : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the EXIT-OUT-OF-RANGE case. Verifies command_record_close rejects exit_code > 255 with CMDR_ERR_BAD_EXIT. sys_wait4 returns wstatus with the low byte carrying the exit status (POSIX/paideia-os convention); a caller passing a value outside 0..255 is corrupting the audit trail (or attempting to write the CMDR_EXIT_PENDING sentinel 0xFFFFFFFF into a closed record). Fixture: exit_code = 256 (first value above the ceiling). 6 pushes prologue; labels prefixed taf_or_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _taf_argv];
+        mov rcx, 6;
+        mov r8,  0x1234;
+        mov r9,  0x1000000000000000;
+        call command_record_begin;
+        cmp rax, 0;
+        jne taf_or_fail;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        mov rdx, 0x2000000000000000;
+        mov rcx, 256;                        // exit_code > 255
+        call command_record_close;
+
+        mov r11, 0xFFFFEC93;                 // CMDR_ERR_BAD_EXIT
+        cmp rax, r11;
+        jne taf_or_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_or_fail:
+        mov rax, 0xFFFFED15;                 // TAF_FAIL_EXIT_OOR
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_begin_id_zero() -> u64
+  //
+  // begin(audit_id=0) must be refused with CMDR_ERR_BAD_ARGS.
+  // ==========================================================================
+  pub let taf_case_begin_id_zero : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the AUDIT-ID-ZERO case. Verifies command_record_begin rejects audit_id == 0 with CMDR_ERR_BAD_ARGS. libpdx-audit reserves audit_id 0 as 'no active audit' (per libpdx-audit's audit_begin semantics); a caller that tries to journal a record with audit_id 0 is either passing uninitialized memory or attempting to fabricate an audit record without going through audit_begin. 6 pushes prologue; labels prefixed taf_iz_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _taf_argv];
+        mov rcx, 6;
+        xor r8,  r8;                         // audit_id = 0
+        mov r9,  0x1000000000000000;
+        call command_record_begin;
+
+        mov r11, 0xFFFFEC90;                 // CMDR_ERR_BAD_ARGS
+        cmp rax, r11;
+        jne taf_iz_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_iz_fail:
+        mov rax, 0xFFFFED16;                 // TAF_FAIL_ID_ZERO
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_close_pending() -> u64
+  //
+  // close(exit = CMDR_EXIT_PENDING = 0xFFFFFFFF) -> CMDR_ERR_BAD_EXIT.
+  // The sentinel value is deliberately > 255 so this gate covers it
+  // (same code as case 5 taf_case_close_exit_oor), but a distinct
+  // test entry documents the semantic invariant: the wire's PENDING
+  // marker cannot be written back as a legitimate exit.
+  // ==========================================================================
+  pub let taf_case_close_pending : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the SENTINEL-AS-EXIT case. Verifies command_record_close refuses to write CMDR_EXIT_PENDING (0xFFFFFFFF) as a legitimate exit_code. Same underlying gate as case 5 (exit_code > 255 rejected with CMDR_ERR_BAD_EXIT), but a distinct entry point makes the SEMANTIC invariant falsifiable: the wire's PENDING marker is a reader-observable sentinel; a caller cannot produce a CLOSED record that displays 0xFFFFFFFF where the exit code should be, which would confuse a reader into thinking the record was still pending. Kept as a separate case because 'exit exceeds 255' and 'exit is the pending sentinel' are two different bugs a future refactor might separate. 6 pushes prologue; labels prefixed taf_cp_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _taf_argv];
+        mov rcx, 6;
+        mov r8,  0x1234;
+        mov r9,  0x1000000000000000;
+        call command_record_begin;
+        cmp rax, 0;
+        jne taf_cp_fail;
+
+        // close(dst, dst_len, ts_end, exit = 0xFFFFFFFF).
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        mov rdx, 0x2000000000000000;
+        mov rcx, 0xFFFFFFFF;                 // CMDR_EXIT_PENDING
+        call command_record_close;
+
+        mov r11, 0xFFFFEC93;                 // CMDR_ERR_BAD_EXIT
+        cmp rax, r11;
+        jne taf_cp_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_cp_fail:
+        mov rax, 0xFFFFED17;                 // TAF_FAIL_EXIT_PEND
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_case_ordering() -> u64
+  //
+  // The load-bearing round-trip. begin then close(exit=0), then verify
+  // the FULL final state of the record so a single test entry pins
+  // the entire D3 audit-first invariant for the encoder pair:
+  //
+  //   qword0: magic 0x52444d43 | (56 << 32)
+  //   qword1: audit_id 0x1234
+  //   qword2: ts_end 0x2000...0
+  //   qword3: 0 (reserved by design; ts_begin lives at qword2? no --
+  //           wait, ts_begin is at qword2, ts_end is at qword3. Let
+  //           me re-check the layout in the SUT.)
+  //
+  // The wire (per src/command_record.pdx):
+  //   +0    magic | (record_len << 32)         qword0
+  //   +8    audit_id                            qword1
+  //   +16   ts_begin_ns                         qword2
+  //   +24   ts_end_ns                           qword3
+  //   +32   argv_bytes | (exit_code << 32)      qword4
+  //   +40   flags | (reserved << 32)            qword5
+  //
+  // After close(exit=0):
+  //   qword2 (ts_begin): unchanged = 0x1000...0
+  //   qword3 (ts_end):   updated   = 0x2000...0
+  //   qword4:            argv_bytes=6 | (exit=0 << 32) = 6
+  //   qword5:            CLOSED = 1
+  //
+  // Also verifies the argv tail bytes at [dst + 48..53] are preserved
+  // ("ls\0-l\0" round-trip through begin) -- close never touches the
+  // tail, so it must still be there.
+  // ==========================================================================
+  pub let taf_case_ordering : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): the LOAD-BEARING ROUND-TRIP case. Verifies the complete final state of a begin+close pair against the D3 audit-first invariant. Every one of the six header qwords is checked against its expected value AND the argv tail bytes at offset 48..53 are re-loaded to verify begin's byte-copy loop preserved 'ls\\0-l\\0' verbatim (close never touches the tail; a mutation would signal a memory-corruption bug). If this test passes, the shell's encoder pair round-trips correctly: OPEN -> durable-in-buffer -> CLOSED with the right fields updated and the wrong fields untouched. Under the D3 invariant this is what makes the substrate-side journal-durability check meaningful -- a well-formed record is what libpdx-audit's send-with-ack path is being asked to make durable. 6 pushes prologue; labels prefixed taf_od_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        call taf_reset;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        lea rdx, [rip + _taf_argv];
+        mov rcx, 6;
+        mov r8,  0x1234;
+        mov r9,  0x1000000000000000;
+        call command_record_begin;
+        cmp rax, 0;
+        jne taf_od_fail;
+
+        lea rdi, [rip + _taf_rec];
+        mov rsi, 128;
+        mov rdx, 0x2000000000000000;
+        mov rcx, 0;
+        call command_record_close;
+        cmp rax, 0;
+        jne taf_od_fail;
+
+        lea r12, [rip + _taf_rec];
+
+        // qword0 = magic | (56 << 32).
+        mov rax, [r12 + 0];
+        mov r11, 0x0000003852444d43;
+        cmp rax, r11;
+        jne taf_od_fail;
+
+        // qword1 = audit_id.
+        mov rax, [r12 + 8];
+        cmp rax, 0x1234;
+        jne taf_od_fail;
+
+        // qword2 = ts_begin.
+        mov rax, [r12 + 16];
+        mov r11, 0x1000000000000000;
+        cmp rax, r11;
+        jne taf_od_fail;
+
+        // qword3 = ts_end.
+        mov rax, [r12 + 24];
+        mov r11, 0x2000000000000000;
+        cmp rax, r11;
+        jne taf_od_fail;
+
+        // qword4 = argv_bytes | (0 << 32) = 6.
+        mov rax, [r12 + 32];
+        cmp rax, 6;
+        jne taf_od_fail;
+
+        // qword5 = CLOSED.
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne taf_od_fail;
+
+        // Argv tail bytes at offset 48..53 = "ls\0-l\0".
+        xor rax, rax;
+        mov_b rax, [r12 + 48];
+        cmp rax, 0x6c;                       // 'l'
+        jne taf_od_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 49];
+        cmp rax, 0x73;                       // 's'
+        jne taf_od_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 50];
+        cmp rax, 0;
+        jne taf_od_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 51];
+        cmp rax, 0x2d;                       // '-'
+        jne taf_od_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 52];
+        cmp rax, 0x6c;                       // 'l'
+        jne taf_od_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 53];
+        cmp rax, 0;
+        jne taf_od_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      taf_od_fail:
+        mov rax, 0xFFFFED18;                 // TAF_FAIL_ORDER
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // taf_run_all() -> u64
+  //
+  // Drive all 8 cases in order; return the first non-zero result, or
+  // 0 on all-pass. Same shape as tcn_run_all.
+  // ==========================================================================
+  pub let taf_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M4-002 (#13): drive all 8 audit-first test cases in a fixed order (begin_ok, close_exit0, close_exit1, close_no_begin, close_exit_oor, begin_id_zero, close_pending, ordering). Stop-on-first-fail. Prologue: 1 push + `sub rsp, 8` = 16 bytes; rsp % 16 == 0 for SysV calls. Labels prefixed taf_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call taf_case_begin_ok;
+        cmp rax, 0;
+        jne taf_ra_done;
+
+        call taf_case_close_exit0;
+        cmp rax, 0;
+        jne taf_ra_done;
+
+        call taf_case_close_exit1;
+        cmp rax, 0;
+        jne taf_ra_done;
+
+        call taf_case_close_no_begin;
+        cmp rax, 0;
+        jne taf_ra_done;
+
+        call taf_case_close_exit_oor;
+        cmp rax, 0;
+        jne taf_ra_done;
+
+        call taf_case_begin_id_zero;
+        cmp rax, 0;
+        jne taf_ra_done;
+
+        call taf_case_close_pending;
+        cmp rax, 0;
+        jne taf_ra_done;
+
+        call taf_case_ordering;
+
+      taf_ra_done:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}
