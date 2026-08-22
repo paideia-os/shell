@@ -1,8 +1,9 @@
 # shell — status
 
 **Wave:** R49 (Wave 1)
-**Current milestone:** M5 (1.0 signed release) — M5-001 landed; M5-002 pending
-**Version:** 1.0.0-rc (bumped in `manifest.pdxproj`; release tag `v1.0.0` at M5-002 close)
+**Current milestone:** M5 (1.0 signed release) — encoder half + doc source landed; substrate deferred
+**Version:** 1.0.0 (see `CHANGELOG.md`)
+**Release tag:** `v1.0.0`
 
 See `design/tooling/r49-r50-plan.md` §5.2 in paideia-os for the full
 breakdown.
@@ -219,8 +220,9 @@ reading a test-run log distinguishes "SUT rejected input" from
 | M4-002 (#13)    | audit-first invariant test (child cannot emit before audit is durable) | LANDED |
 | M4-003 (#14)    | QEMU smoke: login → prompt → `ls | cat` → history persists across reboot (encoder half) | LANDED |
 | M5-001 (#15)    | dual-signed release (manifest.pdxsig encoder + placeholder sigblock) + svc.login-shell broker registration | LANDED |
+| M5-002 (#16)    | .pdxdoc for doc shell (doc/shell.pdxdoc + design/pdxdoc-source.md) + mirror-push protocol (design/mirror-push.md) | LANDED |
 
-## M5 — 1.0 signed release (in progress; M5-001 landed)
+## M5 — 1.0 signed release (complete, encoder half + doc source + design contracts)
 
 - `src/release_manifest.pdx` (issue #15, M5-001): `ReleaseManifest`
   module — encoder for pkg §4 `manifest.pdxsig`. Four entry points
@@ -239,9 +241,9 @@ reading a test-run log distinguishes "SUT rejected input" from
   invokes this encoder at shell boot.
 - `manifest.pdxproj`: version 0.4.0-m4 → 1.0.0; adds
   `release_manifest.pdx` + `broker_bind.pdx` to sources,
-  `test_release_manifest.pdx` to tests, `doc/shell.pdxdoc` to docs
-  (M5-002 delivery); new `release:` block names the two signers +
-  broker name + mirror target.
+  `test_release_manifest.pdx` to tests, `doc/shell.pdxdoc` to docs;
+  new `release:` block names the two signers + broker name + mirror
+  target.
 - `CHANGELOG.md` (new): v1.0.0 entry + rollup of the four
   pre-release milestones.
 - `tests/test_release_manifest.pdx` (issue #15, M5-001):
@@ -249,12 +251,24 @@ reading a test-run log distinguishes "SUT rejected input" from
   (`trm_case_hdr_prefix`, `trm_case_hdr_suffix`, `trm_case_kv`,
   `trm_case_broker_bind`) driven by `trm_run_all`. Fail-code band
   0xFFFFED3x. Release-lint pre-sign gate.
+- `doc/shell.pdxdoc` (issue #16, M5-002): the doc source for
+  `doc shell`. Front-matter block + 11 body sections (SYNOPSIS,
+  DESCRIPTION, OPTIONS, EXAMPLES, FILES, ENVIRONMENT,
+  EXIT_STATUS, DIFFERENCES_FROM_POSIX, SEE_ALSO,
+  CAPABILITIES_REQUESTED, SIGNING) per
+  `design/pdxdoc-source.md` §3.
 - `design/release-manifest.md` (issue #15, M5-001): shell-specific
   view of the pkg-wide manifest format — which tags shell emits, in
   what order, with what values; sigblock placeholder scheme;
   release-lint sequence.
+- `design/pdxdoc-source.md` (issue #16, M5-002): the `.pdxdoc`
+  source-file conventions the doc.M1-002 parser is expected to
+  consume.
+- `design/mirror-push.md` (issue #16, M5-002): the
+  `pkgs.paideia-os` mirror-push protocol — file tree layout,
+  `index.pdxsig` row shape, atomic-push discipline.
 
-**M5-001 test-code additions to the return-code band 0xFFFFEDxx**
+**M5 test-code additions to the return-code band 0xFFFFEDxx**
 (disjoint from the shell's own 0xFFFFECxx and the M4 test bands):
 
 | Code       | Name                    | Meaning                                            |
@@ -324,13 +338,20 @@ reading a test-run log distinguishes "SUT rejected input" from
 
 ## Next
 
-M5-002 — `.pdxdoc` for `doc shell` + mirror push. Closes the M5
-wave and tags `v1.0.0`.
+The R49 wave of `shell` is complete at v1.0.0. The next
+shell-repo work opens at R56+ (multi-session mux + remote
+shell); that wave will re-open a new M1..M5 sequence against a
+fresh set of issues.
 
-The M4 encoder-half tests here (`tcn_run_all`, `taf_run_all`,
-`tsm_run_all`) are what the M5 release-time lint re-runs to
-confirm no regression against the golden fingerprints; the M4
-substrate-half smoke (booted QEMU with scripted interactive
+The M5-001 encoder half + M5-002 doc source + design contracts
+are what the release-time lint (once paideia-as reaches
+v0.33-crypto-kdf and the broker `sys_ipc_send` wrapper lands)
+signs and pushes to `pkgs.paideia-os/main/shell/1.0.0/`. The
+M4 encoder-half tests (`tcn_run_all`, `taf_run_all`,
+`tsm_run_all`) plus the M5 addition (`trm_run_all`) are what the
+release-time lint re-runs to confirm no regression against the
+golden fingerprints; the M4 substrate-half smoke (booted QEMU
+with scripted interactive
 `login → prompt → ls | cat → reboot → history`) lives on the
 paideia-os side and depends on the substrate gaps above landing
 in a paideia-os round adjacent to R49.

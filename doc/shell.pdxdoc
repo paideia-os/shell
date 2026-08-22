@@ -1,0 +1,160 @@
+---
+name: shell
+version: 1.0.0
+kind: tool
+authors: paideia-os-team
+license: MIT
+---
+
+## SYNOPSIS
+
+  shell
+  shell <script.pds>
+  shell -c '<command>'
+
+The paideia-os interactive shell: reads user commands, spawns tool
+processes with the caller's cap environment narrowed per each
+callee's caps.decl, and threads text-and-schema-and-cap layers
+through semantic pipes.
+
+## DESCRIPTION
+
+`shell` is the process the login supervisor launches after
+authenticating a user. It reads a line from the terminal
+(KIND_TTY), parses it into a pipeline of one or more child
+commands, mints one KIND_IPC_ENDPOINT per pipe operator, narrows
+the parent's capability environment against each callee's
+caps.decl, invokes sys_execve, waits for exit, and appends a
+HistoryEntry to `~/.history/`.
+
+Every command execution is journaled to `/system/audit/user-
+events/` via libpdx-audit BEFORE the child runs, and closed with
+the exit code after wait. This is the D3 audit-first invariant:
+a child cannot emit user-visible output until its
+ShellCommandRecord is durable in the audit journal. A shell that
+loses network to the audit-journal broker (`svc.audit-journal`)
+refuses to spawn children — exit code 3 (system error) is the
+correct response, and correcting the audit reachability is a
+recovery operation the operator undertakes with intent.
+
+The shell is a semantic-pipe conduit (D2 literal): a child's
+schema-pipe output rides through the shell to the pipeline
+consumer unchanged. The shell publishes three schemas of its
+own: ShellPromptRecord (one per interactive prompt),
+CommandCompletion (one array per tab-completion request), and
+ShellCommandRecord (one per command exec + wait). These layer
+alongside the forwarded child schemas over the same
+KIND_IPC_ENDPOINT pair.
+
+At session start, `shell` mints a KIND_SHELL_SESSION cap and
+derives sub-caps per child (rights masked to READ | WRITE, not
+MINT — the child cannot itself derive further sub-caps). The
+session cap is the correlation id every audit-journal reader
+uses to reassemble a pipe of tools as one unit of work.
+
+## OPTIONS
+
+  -c <command>              Execute <command> once and exit
+  <script.pds>              Execute a .pds script and exit; see pds-format(5)
+  --no-history              Suppress ~/.history/ writes for this session
+  --no-cap:<KIND>           Strip the named capability at spawn time
+                              (see plan.md I6; passed through to every child)
+
+## EXAMPLES
+
+  $ shell
+  paideia $ ls
+  ...
+  paideia $ ls | cat > /tmp/files
+  paideia $ exit
+
+  $ shell -c 'grep foo /etc/hosts'
+
+  $ shell ~/bin/build-report.pds
+
+  $ shell --no-cap:KIND_PDXFS_FILE < deploy.pds
+  shell: KIND_PDXFS_FILE stripped for this session
+  ...
+
+## FILES
+
+  ~/.history/<session>-<ts>.pdxhist
+    CoW-journal of the session's HistoryEntry records. Appended
+    after every interactive line commit; format per history.pdx
+    (24-byte header + UTF-8 command + zero pad to 8 bytes).
+
+  /system/audit/user-events/
+    Audit-journal path (owned by svc.audit-journal). One
+    ShellCommandRecord per child command exec + wait.
+
+  <cwd>/*.pds
+    Script files the shell can execute directly. See pds-format(5)
+    for the header conventions (shebang, capability manifest,
+    schema imports, body).
+
+## ENVIRONMENT
+
+  Shell reads no environment variables. All configuration is
+  either capability-driven (declared in caps.decl at build time
+  and honoured at exec via the InitCap sidecar) or command-line
+  driven (--no-history, --no-cap:*). This is deliberate — env
+  vars are an ambient-authority channel this project avoids per
+  plan.md D5.
+
+## EXIT_STATUS
+
+  0    Success — the last child exited 0 (or the shell exited cleanly).
+  1    Caller error — the shell itself detected a bad flag / bad script.
+  2    Usage — the shell was invoked with an unrecognised argument shape.
+  3    System error — audit-journal unreachable, sys_execve failed,
+       broker registration refused. See STATUS.md 0xFFFFECxx band.
+  4    Capability denied — a required cap was stripped or not held.
+
+## DIFFERENCES_FROM_POSIX
+
+- No environment-variable configuration — POSIX shells read ~30 vars including PATH, PS1, IFS — paideia-os shell reads none; PATH is replaced by InitCap-seeded binary lookup and PS1 lives in a per-user config file the shell reads via KIND_PDXFS_FILE(read).
+
+- Audit-first — POSIX shells write nothing to a durable audit trail before exec — paideia-os shell refuses to spawn until ShellCommandRecord is durable in svc.audit-journal.
+
+- Capability handoff visible + refusable — POSIX shells silently propagate all inherited file descriptors and env — paideia-os shell narrows each child's cap set per that child's caps.decl and the user can strip further via --no-cap:<KIND>.
+
+- Cap-declared IPC endpoints — POSIX pipes are anonymous file descriptors — paideia-os pipes are KIND_IPC_ENDPOINT caps with declared read/write rights and a target_ptr the child cannot forge.
+
+- Schema-typed pipes — POSIX pipes carry bytes only — paideia-os pipes carry both bytes and a schema layer (D2); a downstream query tool reads schema-typed records without a re-parse from text.
+
+## SEE_ALSO
+
+  pkg(1)               — package manager; installs and verifies shell itself.
+  doc(1)               — this documentation renderer.
+  cat(1)               — the tool used in the canonical `ls | cat` smoke.
+  ls(1)                — the sibling tool the smoke pairs with cat.
+  pds-format(5)        — the .pds script header format shell executes.
+  history-storage(5)   — ~/.history/ CoW-journal layout.
+  semantic-shell(5)    — the D2 semantic-pipe design at the terminal layer.
+  libpdx-cap(3)        — the cap narrowing library shell links.
+  libpdx-audit(3)      — the audit-journal client library shell links.
+  libpdx-semantic-pipe(3) — the semantic-pipe passthrough library shell links.
+  libpdx-elevate(3)    — the elevate-broker client (reserved for `.pds requires: elevate`).
+  design://architecture.md — shell's internal architecture.
+  design://release-manifest.md — the manifest.pdxsig this release ships.
+
+## CAPABILITIES_REQUESTED
+
+  KIND_USER(read)                — user identity the shell delegates to children.
+  KIND_TTY(write)                — terminal render; children receive sub-caps.
+  KIND_IPC_ENDPOINT(mint)        — pipeline pipe substrate; one mint per `|`.
+  KIND_SHELL_SESSION(mint)       — session cap minted once per login; sub-caps per child.
+  KIND_PDXFS_FILE(write)         — ~/.history/ CoW journal writes.
+
+## SIGNING
+
+  author_pk        paideia-os-team (ML-DSA-65, NIST L2)
+                   fpr: <32-byte sha3-256; populated at release-signer bolt-on>
+  paideia_root_pk  paideia_root_pk (ML-DSA-65, NIST L2; R32 root key)
+                   fpr: <32-byte sha3-256; populated at release-signer bolt-on>
+
+  Both fingerprints match what `pkg keys` reports on any
+  paideia-os machine after `pkg install shell`. A mismatch means
+  the shell binary reached the machine through an unattested
+  path and `pkg install shell` should have refused it — file an
+  incident and re-install from a verified mirror.
