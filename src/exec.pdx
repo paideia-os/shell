@@ -86,6 +86,325 @@
 module Exec = structure {
 
   // ==========================================================================
+  // M2-003 additions: caps environment propagation.
+  //
+  // The shell hands each child process a cap set assembled by
+  // narrowing the shell's own held caps against the child's declared
+  // caps.decl requirements. The narrowing enforces two invariants
+  // simultaneously:
+  //
+  //   * MONOTONE: the child's rights are a strict SUBSET of the
+  //     parent's rights (`(child & ~parent) == 0`). Any bit the child
+  //     requests that the parent does not hold is a widening attempt
+  //     and refused with EX_ERR_WIDENING. This is the same discipline
+  //     libpdx-cap's cap_pack_narrowed enforces at the byte level
+  //     (see libpdx-cap/src/cap.pdx cap_pack_narrowed body).
+  //
+  //   * NARROWED: the child receives the INTERSECTION of what its
+  //     caps.decl asks for and what the parent holds. A child that
+  //     asks for KIND_TTY(read) when the parent holds KIND_TTY(write)
+  //     receives NOTHING for that KIND (intersection is empty) --
+  //     refused with EX_ERR_MISSING_CAP. A child that asks for
+  //     KIND_PDXFS_FILE(read) when the parent holds
+  //     KIND_PDXFS_FILE(read | write) receives read only.
+  //
+  // The parent-cap set is passed as a flat wire-record array (16 bytes
+  // per Cap, same layout as libpdx-cap's Cap). The child-decl set is
+  // ALSO a flat wire-record array -- at M2, the caller (the shell's
+  // exec dispatcher) has already parsed the child's caps.decl file
+  // through libpdx-cap's caps_decl parser and materialised the
+  // requirements as a wire-record array using symbolic rights masks.
+  // exec_narrow_child_caps does the narrowing.
+  //
+  // The output is another flat wire-record array (the child's InitCap
+  // sidecar entries for its ambient caps -- excluding the pipe caps
+  // pipeline_plan produces separately and the session cap M2-001
+  // produces separately). The exec layer concatenates the three
+  // buffers (session + pipeline + narrowed caps.decl) into one
+  // per-child sidecar at sys_execve time.
+  //
+  // As with M1, the ACTUAL sys_execve call is a substrate deferral --
+  // exec_spawn_and_wait still returns EX_STUB on its happy path.
+  // exec_narrow_child_caps is a pure narrowing helper that does not
+  // touch the substrate boundary at all; it operates entirely on
+  // caller-owned buffers.
+  //
+  // Wire record layout (matches Cap wire from libpdx-cap):
+  //   +0    u16 slot
+  //   +2    u16 kind
+  //   +4    u32 rights
+  //   +8    u64 target_ptr
+  //
+  // Rights masks used by exec_narrow_child_caps operate on the u32
+  // rights lane only; all logic is bitmask AND / bitmask AND-NOT.
+  // ==========================================================================
+
+  // Max entries considered in one call. Fits imm <= 0x7FFFFFFF by wide
+  // margin; the largest observed caps.decl in the R49 wave has 6
+  // requires items (pkg install), so 16 gives 2x headroom for future
+  // tools without changing the layout.
+  pub let EX_NARROW_MAX_ENTRIES : u64 = 16
+
+  // ==========================================================================
+  // exec_narrow_child_caps(parent, parent_count, child_decl,
+  //                        child_decl_count, dst, dst_max_entries) -> u64
+  //
+  // Signature: exec_narrow_child_caps : (u64, u64, u64, u64, u64, u64)
+  //                                     -> u64 !{mem} @{}
+  // RDI (input): parent            -- VA of parent-cap wire-record array
+  // RSI (input): parent_count      -- entries in parent (0..EX_NARROW_MAX)
+  // RDX (input): child_decl        -- VA of child-decl wire-record array
+  // RCX (input): child_decl_count  -- entries in child_decl (0..EX_NARROW_MAX)
+  // R8  (input): dst               -- VA of the destination sidecar buffer
+  //                                  (must hold at least child_decl_count
+  //                                   16-byte entries; else EX_ERR_SIDECAR_FULL)
+  // R9  (input): dst_max_entries   -- entries dst can hold
+  // RAX (output): EX_OK (0) on success, else EX_ERR_MISSING_CAP |
+  //               EX_ERR_WIDENING | EX_ERR_SIDECAR_FULL |
+  //               EX_ERR_BAD_ARGV (reused for null-ptr / count-zero
+  //               args in this helper).
+  //
+  // For each entry in child_decl:
+  //   (1) Look up parent-cap entry with matching KIND (linear scan).
+  //   (2) If no match: EX_ERR_MISSING_CAP (fail-fast; dst untouched
+  //       for entries beyond this point).
+  //   (3) Check widen: if (child_rights & ~parent_rights) != 0,
+  //       EX_ERR_WIDENING.
+  //   (4) Write narrowed Cap to dst[i]: qword0 = slot | (kind << 16)
+  //       | ((child_rights & parent_rights) << 32); qword1 =
+  //       parent_target_ptr. child_target_ptr in the decl entry is
+  //       ignored -- the child's cap must point at the PARENT'S
+  //       target, not at a target the decl invented.
+  //
+  // Bumps SH_ST_SPAWNS (slot 2) on every entry (spawn intent).
+  // Bumps SH_ST_ERRORS on any reject path.
+  //
+  // Register plan:
+  //   r12 = parent base            (callee-save)
+  //   r13 = parent_count           (callee-save)
+  //   r14 = child_decl base        (callee-save)
+  //   r15 = child_decl_count       (callee-save)
+  //   rbx = i (outer loop; 0..child_decl_count)
+  //   rbp = dst base + inner scan cache
+  //   rax = compute scratch / return value
+  //   r10 = large-imm scratch / lane mask
+  //   r11 = inner-loop cursor scratch
+  //   rdi = child_kind (cached for inner scan)
+  //   rsi = child_rights (cached for widen)
+  //
+  // Prologue: 6 pushes (rbx, rbp, r12, r13, r14, r15) + `sub rsp, 8`
+  // = 56 bytes; rsp % 16 == 0 for shell_note. Matched epilogue at
+  // every return. Same idiom as libpdx-argv parse_argv.
+  //
+  // Note on the two-return-value convention: the destination buffer's
+  // filled-entry COUNT equals child_decl_count on success (one output
+  // per requirement); on failure the number of GOOD entries written
+  // is unspecified because the caller should treat dst as poisoned
+  // (matches libpdx-cap cap_manifest_verify's discipline).
+  // ==========================================================================
+  pub let exec_narrow_child_caps : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (parent: u64) (parent_count: u64) (child_decl: u64) (child_decl_count: u64) (dst: u64) (dst_max_entries: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-003 (#6): cap narrowing at exec. For each entry in the child's caps.decl (wire-form), find the matching-KIND parent cap by linear scan, check that child rights are a subset of parent rights (widen check `(child & ~parent) == 0`, same as libpdx-cap cap_pack_narrowed), and write a narrowed Cap to dst carrying rights = (child & parent) and target_ptr = parent's target_ptr (the child cap points at parent's target, not at a decl-invented target). MISSING and WIDENING are both fail-fast; dst may hold partial results on reject and callers must treat it as poisoned (matches libpdx-cap cap_manifest_verify discipline). Wire layout matches libpdx-cap's Cap (16 bytes: slot|kind|rights fused into qword0, target_ptr in qword1). 6 pushes (rbx outer index, rbp inner cursor scratch, r12 parent, r13 parent_count, r14 child_decl, r15 child_decl_count) + `sub rsp, 8` = 56 bytes prologue; rsp%16==0 for shell_note. Same idiom as libpdx-argv parse_argv. r11 scratch (paideia-as reserved) for inner-scan cursor; every compare uses imm <= 0x7FFFFFFF (largest is EX_NARROW_MAX_ENTRIES = 16). Byte reads not needed -- all fields are qword-load / qword-store from wire records. Labels prefixed en_nc_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // parent base
+        mov r13, rsi;                        // parent_count
+        mov r14, rdx;                        // child_decl base
+        mov r15, rcx;                        // child_decl_count
+        mov rbp, r8;                         // dst base
+        // r9 = dst_max_entries stays in r9 for the overflow gate below
+
+        // Bump SH_ST_SPAWNS (attempt counter).
+        mov rdi, 2;                          // SH_ST_SPAWNS
+        call shell_note;
+
+        // Gate: parent non-null.
+        cmp r12, 0;
+        je  en_nc_bad_argv;
+        // Gate: parent_count non-zero.
+        cmp r13, 0;
+        je  en_nc_bad_argv;
+        // Gate: child_decl non-null.
+        cmp r14, 0;
+        je  en_nc_bad_argv;
+        // dst non-null (child_decl_count == 0 is allowed -- child
+        // declares no caps beyond the ambient session cap, valid case).
+        cmp rbp, 0;
+        je  en_nc_bad_argv;
+
+        // Gate: dst_max_entries >= child_decl_count.
+        cmp r9, r15;
+        jb  en_nc_sidecar_full;
+
+        // Gate: parent_count <= EX_NARROW_MAX_ENTRIES.
+        cmp r13, 16;                         // EX_NARROW_MAX_ENTRIES
+        ja  en_nc_bad_argv;
+        // Gate: child_decl_count <= EX_NARROW_MAX_ENTRIES.
+        cmp r15, 16;
+        ja  en_nc_bad_argv;
+
+        // Special case: child_decl_count == 0. Success with zero
+        // output; caller may still concat session + pipeline caps.
+        cmp r15, 0;
+        je  en_nc_done_ok;
+
+        // Outer loop: rbx = 0 ; rbx < child_decl_count ; rbx++
+        xor rbx, rbx;
+
+      en_nc_outer_head:
+        // Load child_decl[rbx] into rdi (kind) and rsi (rights).
+        // decl entry: [+0] slot|kind|rights fused; [+8] target_ptr.
+        mov r10, rbx;
+        shl r10, 4;                          // r10 = rbx * 16
+        mov rax, [r14 + r10 + 0];            // qword0 = slot|kind|rights
+        // Extract kind (bits 16..31) and rights (bits 32..63).
+        mov rdi, rax;
+        shr rdi, 16;
+        and rdi, 0xFFFF;                     // rdi = child_kind
+        mov rsi, rax;
+        shr rsi, 32;                         // rsi = child_rights (u32)
+        // Also cache the child's requested slot (bits 0..15) so we
+        // preserve it in the narrowed output. The child's caps.decl
+        // is the authority on which slot the child expects.
+        mov rcx, rax;
+        and rcx, 0xFFFF;                     // rcx = child_slot
+
+        // Inner scan: find the parent entry with matching KIND.
+        // r11 = inner cursor (0..parent_count).
+        xor r11, r11;
+
+      en_nc_inner_head:
+        cmp r11, r13;
+        jae en_nc_missing;                   // scanned all parents; no match
+
+        // Load parent[r11] qword0 and extract kind.
+        mov r10, r11;
+        shl r10, 4;                          // r10 = r11 * 16
+        mov rax, [r12 + r10 + 0];
+        shr rax, 16;
+        and rax, 0xFFFF;                     // rax = parent_kind
+        cmp rax, rdi;                        // parent_kind == child_kind?
+        je  en_nc_found;
+
+        add r11, 1;
+        jmp en_nc_inner_head;
+
+      en_nc_found:
+        // r10 = r11 * 16 (parent entry offset, still cached in r10).
+        // Load parent's rights (qword0 bits 32..63) and target_ptr.
+        mov rax, [r12 + r10 + 0];
+        shr rax, 32;                         // rax = parent_rights (u32)
+
+        // Widen check: (child_rights & ~parent_rights) == 0 ?
+        // Compute: rdx = ~parent; and rdx, rsi (child); cmp rdx, 0.
+        mov rdx, rax;
+        not rdx;                             // rdx = ~parent_rights
+        and rdx, rsi;                        // rdx = child & ~parent
+        cmp rdx, 0;
+        jne en_nc_widening;
+
+        // Narrowed rights = child_rights & parent_rights.
+        and rax, rsi;                        // rax = narrowed rights
+
+        // Load parent's target_ptr into rdx.
+        mov rdx, [r12 + r10 + 8];            // rdx = parent target_ptr
+
+        // Assemble dst[rbx] qword0 = child_slot | (child_kind << 16)
+        //                          | (narrowed_rights << 32).
+        // rcx = child_slot (0..65535 already masked).
+        // rdi = child_kind (0..65535 already masked).
+        // rax = narrowed_rights (u32).
+        mov r10, rdi;
+        shl r10, 16;                         // r10 = kind << 16
+        or  rcx, r10;                        // rcx = slot | (kind << 16)
+        shl rax, 32;                         // rax = rights << 32
+        or  rcx, rax;                        // rcx = full qword0
+
+        // dst offset = rbx * 16.
+        mov r10, rbx;
+        shl r10, 4;                          // r10 = rbx * 16
+        mov [rbp + r10 + 0], rcx;
+        mov [rbp + r10 + 8], rdx;            // parent's target_ptr
+
+        // Advance outer loop.
+        add rbx, 1;
+        cmp rbx, r15;
+        jb  en_nc_outer_head;
+
+      en_nc_done_ok:
+        xor rax, rax;                        // EX_OK (0)
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      en_nc_bad_argv:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      en_nc_missing:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC24;                 // EX_ERR_MISSING_CAP
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      en_nc_widening:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC25;                 // EX_ERR_WIDENING
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret;
+
+      en_nc_sidecar_full:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC26;                 // EX_ERR_SIDECAR_FULL
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // exec_spawn_and_wait(argv, argv_count) -> u64
   //
   // Signature: exec_spawn_and_wait : (u64, u64) -> u64 !{mem} @{}

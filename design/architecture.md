@@ -249,6 +249,43 @@ we don't yet" signal.
 Same skeleton discipline as `LineReader`: `SH_ST_SPAWNS` bumps on
 entry, `SH_ST_ERRORS` bumps on reject.
 
+### 4.2b `exec_narrow_child_caps` — M2-003
+
+```
+exec_narrow_child_caps(parent: u64, parent_count: u64,
+                       child_decl: u64, child_decl_count: u64,
+                       dst: u64, dst_max_entries: u64) -> u64
+```
+
+Pure cap-narrowing helper: no substrate touch, no syscall. For each
+entry in the child's caps.decl (wire-form), the function:
+
+1. Linearly scans `parent` for the matching KIND.
+2. Refuses if no match: `EX_ERR_MISSING_CAP` (0xFFFFEC24).
+3. Refuses if the child requests rights the parent does not hold —
+   the widen check `(child & ~parent) == 0`, same as libpdx-cap
+   `cap_pack_narrowed`: `EX_ERR_WIDENING` (0xFFFFEC25).
+4. Writes a narrowed Cap to `dst[i]` with:
+   - `slot` = child's requested slot (from decl).
+   - `kind` = child's requested kind (== parent's kind by scan).
+   - `rights` = `child & parent` (intersection).
+   - `target_ptr` = parent's `target_ptr` (the child cap points at
+     the parent's target, not at a decl-invented target).
+
+The output is a flat 16-byte-per-entry array the exec layer
+concatenates with the session-cap entry (from `session_derive_subcap`,
+M2-001) and the pipe-endpoint entries (from `pipeline_plan`, M2-002)
+into one per-child InitCap sidecar at `sys_execve` time.
+
+`EX_ERR_SIDECAR_FULL` (0xFFFFEC26) — `dst_max_entries <
+child_decl_count`.
+
+The `EX_STUB` skeleton in `exec_spawn_and_wait` is unchanged at
+M2-003 — the sys_execve call remains a substrate deferral. This
+helper is invoked separately by the shell's exec dispatcher once the
+substrate lands; every path that reaches `sys_execve` in M3+ will
+first pass through `exec_narrow_child_caps`.
+
 ### 4.3 M2 evolution
 
 At M2, `exec_spawn_and_wait`:
