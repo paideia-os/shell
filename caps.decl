@@ -52,14 +52,18 @@ requires:
 - KIND_PDXFS_FILE(write)
 
 # Declared output schemas — the shell emits three schemas over the
-# semantic-pipe substrate. All three are formalised at M3 (schema
-# passthrough + tab completion + audit); M1 pre-declares the names
-# so downstream tooling (query, pipeviz at R59+) can already see
-# them in the manifest.
+# semantic-pipe substrate.
 #
 # - ShellPromptRecord — one record per interactive prompt (M3-001)
 # - CommandCompletion — one array per tab-completion request (M3-002)
 # - ShellCommandRecord — one record per command exec + wait (M3-003)
+#
+# At M3 the shell adds a fourth output PATH: it forwards its
+# children's schema pipes UNCHANGED to the pipeline consumer (D2
+# literal, pipe_passthrough.pdx). The forwarded schema is whatever
+# the child declared; the shell is a transparent conduit, not a
+# schema publisher for those bytes. Hence only the three names
+# above appear here.
 declares_output_schemas:
 - ShellPromptRecord
 - CommandCompletion

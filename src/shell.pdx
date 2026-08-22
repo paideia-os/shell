@@ -114,33 +114,49 @@ module Shell = structure {
   pub let EX_ERR_WAIT_FAIL       : u64 = 0xFFFFEC23   // M2+: sys_wait4 refused
 
   // ==========================================================================
-  // Session-level stats -- eight u64 slots, cache-line aligned.
+  // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
-  // Slot map (M1):
-  //   0 SH_ST_PROMPTS  line_reader_read_line entries
-  //   1 SH_ST_LINES    line_reader_read_line successful returns (M2+)
-  //   2 SH_ST_SPAWNS   exec_spawn_and_wait entries
-  //   3 SH_ST_EXITS    exec_spawn_and_wait successful returns (M2+)
-  //   4 SH_ST_ERRORS   any error / reject path from any shell module
-  //   5 SH_ST_SESSIONS session_mint + session_derive_subcap entries (M2-001)
-  //   6 SH_ST_PIPELINES pipeline_plan entries (M2-002)
-  //   7 SH_ST_HISTORY  history_encode_record entries (M2-005)
+  // Slot map:
+  //   0  SH_ST_PROMPTS       line_reader_read_line entries        (M1)
+  //   1  SH_ST_LINES         line_reader_read_line successes       (M2+)
+  //   2  SH_ST_SPAWNS        exec_spawn_and_wait entries           (M1)
+  //   3  SH_ST_EXITS         exec_spawn_and_wait successes         (M2+)
+  //   4  SH_ST_ERRORS        any error / reject path (shared)      (M1)
+  //   5  SH_ST_SESSIONS      session_mint / _derive_subcap entries (M2-001)
+  //   6  SH_ST_PIPELINES     pipeline_plan entries                 (M2-002)
+  //   7  SH_ST_HISTORY       history_encode_record entries         (M2-005)
+  //   8  SH_ST_PASSTHRU      pipe_passthrough_forward entries      (M3-001)
+  //   9  SH_ST_COMPLETIONS   completion_encode_record entries      (M3-002)
+  //   10 SH_ST_AUDITS        command_record_begin + _close entries (M3-003)
+  //   11..15                 reserved for M4/M5 (audit fingerprints,
+  //                          smoke matrix, dual-signed release counters)
+  //
+  // The table grew from 8 to 16 at M3 to accommodate the three new
+  // event classes M3 introduces without another re-layout. 16 fits
+  // trivially in imm <= 0x7FFFFFFF; cache-line alignment holds
+  // (16 * 8 = 128 bytes = 2 cache lines). Reserved slots read as 0
+  // (uninit @align(64) zero-inits at loader time; shell_reset also
+  // zeroes them). A caller passing SH_ST_MAX or above is a no-op --
+  // same discipline as the M1 shell_note.
   //
   // Cache-line alignment matches _elevate_broker_stats / _elevate_
   // client_stats -- keeps a future SMP counter path a mechanical
   // widening rather than a re-layout.
   // ==========================================================================
-  pub let mut _shell_stats : [u64; 8] = uninit @align(64)
+  pub let mut _shell_stats : [u64; 16] = uninit @align(64)
 
-  pub let SH_ST_PROMPTS  : u64 = 0
-  pub let SH_ST_LINES    : u64 = 1
-  pub let SH_ST_SPAWNS   : u64 = 2
-  pub let SH_ST_EXITS    : u64 = 3
-  pub let SH_ST_ERRORS   : u64 = 4
-  pub let SH_ST_SESSIONS : u64 = 5   // M2-001
-  pub let SH_ST_PIPELINES: u64 = 6   // M2-002
-  pub let SH_ST_HISTORY  : u64 = 7   // M2-005
-  pub let SH_ST_MAX      : u64 = 8
+  pub let SH_ST_PROMPTS     : u64 = 0
+  pub let SH_ST_LINES       : u64 = 1
+  pub let SH_ST_SPAWNS      : u64 = 2
+  pub let SH_ST_EXITS       : u64 = 3
+  pub let SH_ST_ERRORS      : u64 = 4
+  pub let SH_ST_SESSIONS    : u64 = 5   // M2-001
+  pub let SH_ST_PIPELINES   : u64 = 6   // M2-002
+  pub let SH_ST_HISTORY     : u64 = 7   // M2-005
+  pub let SH_ST_PASSTHRU    : u64 = 8   // M3-001
+  pub let SH_ST_COMPLETIONS : u64 = 9   // M3-002
+  pub let SH_ST_AUDITS      : u64 = 10  // M3-003
+  pub let SH_ST_MAX         : u64 = 16
 
   // ==========================================================================
   // shell_reset() -> ()
@@ -159,7 +175,7 @@ module Shell = structure {
   pub let shell_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "shell.M1-001 (#1): clear the eight-word session stats table. Startup + teardown only; a live counter reset would race any concurrent shell_note (same discipline as elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70, and elevate_client_stats_reset libpdx-elevate/src/elevate_client.pdx). Loop: r10 base, rcx index 0..8, rax = 0. `cmp rcx, 8` uses imm <= 0x7FFFFFFF (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed sh_rs_.",
+      justification: "shell.M1-001 (#1) / shell.M3 (#9-#11): clear the sixteen-word session stats table. Startup + teardown only; a live counter reset would race any concurrent shell_note (same discipline as elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70, and elevate_client_stats_reset libpdx-elevate/src/elevate_client.pdx). Loop: r10 base, rcx index 0..16, rax = 0. `cmp rcx, 16` uses imm <= 0x7FFFFFFF (paideia-as conformance). Loop bound widened from 8 to 16 at M3 to cover SH_ST_PASSTHRU / _COMPLETIONS / _AUDITS + 5 reserved slots without another re-layout. Leaf function -- no push/pop parity. Labels prefixed sh_rs_.",
       block: {
         lea r10, [rip + _shell_stats];
         xor rax, rax;
@@ -167,7 +183,7 @@ module Shell = structure {
       sh_rs_loop:
         mov [r10 + rcx * 8], rax;
         add rcx, 1;
-        cmp rcx, 8;
+        cmp rcx, 16;
         jb  sh_rs_loop;
         ret
       }
@@ -190,9 +206,9 @@ module Shell = structure {
   pub let shell_note : (u64) -> () !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "shell.M1-001 (#1): bounded increment; out-of-range which is a no-op (not an error sentinel -- a slot that never got incremented reads as 0, which is also the correct 'never touched' value). Same shape as elevate_client_note libpdx-elevate/src/elevate_client.pdx. `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed sh_nt_.",
+      justification: "shell.M1-001 (#1) / shell.M3 (#9-#11): bounded increment; out-of-range which is a no-op (not an error sentinel -- a slot that never got incremented reads as 0, which is also the correct 'never touched' value). Same shape as elevate_client_note libpdx-elevate/src/elevate_client.pdx. Bound widened from 8 to 16 at M3 to admit slots 8..10 (PASSTHRU, COMPLETIONS, AUDITS) plus 5 reserved. `cmp rdi, 16` uses imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed sh_nt_.",
       block: {
-        cmp rdi, 8;
+        cmp rdi, 16;
         jae sh_nt_out;
         lea r10, [rip + _shell_stats];
         mov rax, [r10 + rdi * 8];
@@ -218,9 +234,9 @@ module Shell = structure {
   pub let shell_stat : (u64) -> u64 !{mem} @{} =
     fn (which: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "shell.M1-001 (#1): bounded read; out-of-range which returns 0 (0 is both the 'never touched' value and the 'out of range' value -- an explicit sentinel would force the caller to two loads for a distinction they never need). Same shape as elevate_client_stat libpdx-elevate/src/elevate_client.pdx. `cmp rdi, 8` uses imm <= 0x7FFFFFFF. Leaf function. Labels prefixed sh_st_.",
+      justification: "shell.M1-001 (#1) / shell.M3 (#9-#11): bounded read; out-of-range which returns 0 (0 is both the 'never touched' value and the 'out of range' value -- an explicit sentinel would force the caller to two loads for a distinction they never need). Same shape as elevate_client_stat libpdx-elevate/src/elevate_client.pdx. Bound widened from 8 to 16 at M3 in lockstep with shell_note. `cmp rdi, 16` uses imm <= 0x7FFFFFFF. Leaf function. Labels prefixed sh_st_.",
       block: {
-        cmp rdi, 8;
+        cmp rdi, 16;
         jae sh_st_zero;
         lea r10, [rip + _shell_stats];
         mov rax, [r10 + rdi * 8];

@@ -1,0 +1,344 @@
+// src/pipe_passthrough.pdx -- shell.M3-001 (paideia-os/shell#9)
+//
+// PipePassthrough module: forward a semantic-pipe frame verbatim.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The shell is a semantic-pipe PASSTHROUGH between two children in a
+// pipeline. Each child stage in `a | b | c` writes typed R20b frames
+// (op:u8, ver:u8, flags:u16 LE, payload_len:u32 LE -- the 8-byte
+// frame header from paideia-os src/kernel/core/ipc/frame.pdx) to its
+// stdout endpoint; the shell copies those bytes UNCHANGED into the
+// next stage's stdin endpoint. The bytes include the semantic-pipe
+// schema_hash prefix (per libpdx-semantic-pipe's M2 envelope --
+// schema_hash: [u8;32] follows the R20b header when the R20b
+// flags-bit for "typed record follows" is set), and the shell MUST
+// NOT touch, decode, re-encode, or re-hash any of them. This is D2
+// literal from design/tooling/plan.md: the shell forwards typed
+// pipes; it does not schema-erase them into byte streams the
+// downstream cannot re-type.
+//
+// The M3 semantics are three-fold:
+//
+//   1. VERIFY -- pipe_passthrough_forward reads the 8-byte R20b
+//      frame header from src, confirms payload_len fits within
+//      (src_len - 8) and within dst_max, and refuses on any
+//      mismatch. This gate stops a truncated read (child crashed
+//      mid-frame) from producing a torn frame downstream.
+//   2. COPY  -- byte-for-byte from src[0..8+payload_len) to
+//      dst[0..8+payload_len). No field is rewritten: the op, ver,
+//      flags, payload_len at src[0..8) go through unchanged. If the
+//      "typed" flag is set at src[+2..+4] and a schema_hash sits
+//      at src[+8..+40) followed by the record body, that data is
+//      part of the payload and copies as-is.
+//   3. RECORD -- pipe_passthrough_forward writes the number of
+//      bytes forwarded (8 + payload_len) into the .bss singleton
+//      passthrough_bytes_forwarded so the caller (the shell's
+//      pipeline driver in M4+) can advance both endpoint cursors
+//      by the same amount.
+//
+// The M3 module deliberately does NOT link libpdx-semantic-pipe.
+// Reason: the passthrough is a byte-level forward that must be
+// correct even against a schema the shell has never seen. Making
+// the passthrough path independent of libpdx-semantic-pipe's schema
+// registry means a child at R56+ that ships a new schema does not
+// need a shell rebuild to be pipeable to. This mirrors the same
+// discipline libpdx-cap M2 followed for the cap wire format --
+// downstream consumers don't need to link the producer's library
+// to interpret its wire.
+//
+// =============================================================================
+// R20b FRAME HEADER LAYOUT (mirror of paideia-os src/kernel/core/ipc/frame.pdx)
+// =============================================================================
+//
+//   +0  u8   op          opcode (SEND=1, RECV=2, etc.; passthrough
+//                        preserves whatever value the sender wrote)
+//   +1  u8   ver         version (currently 1)
+//   +2  u16  flags LE    bit 0 = typed record follows (schema_hash
+//                        prefix + record body); other bits reserved
+//   +4  u32  payload_len LE  bytes of payload that follow the header
+//
+// Total frame on wire = 8 + payload_len bytes. Every field is little-
+// endian (x86-64 native). The passthrough loads payload_len as a u32
+// via `xor rax, rax; mov_d rax, [src + 4]` -- but paideia-as does
+// not expose mov_d in the M2 asm surface, so the read uses byte-wise
+// composition (four `mov_b` loads assembled via shl/or) to stay
+// within the paideia-as instruction subset. This is the same
+// pattern history.pdx's cmd_len read would use if it read from the
+// wire (history reads cmd_len from a register, not from memory, so
+// the pattern first appears here).
+//
+// Actually simpler: load qword0 (all 8 header bytes) with one mov;
+// extract payload_len from the high 32 bits with shr 32. This is
+// legal because x86-64 permits a naturally-aligned 8-byte load and
+// the header is defined as one aligned qword (paideia-os
+// src/kernel/core/ipc/frame.pdx). See M3 comment inside the
+// justification for the rationale.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`PipePassthrough`).
+//   - No `test` mnemonic; `cmp reg, 0` for zero-checks.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The frame-header
+//     bound compares against payload_len; the maximum payload_len a
+//     legal R20b frame carries is 0x7FFFFFFF - 8 (fits inside the
+//     compare). Larger payloads are refused as PP_ERR_OVERSIZED.
+//   - Large immediates (error codes 0xFFFFEC70..0xFFFFEC73,
+//     PP_MAX_PAYLOAD = 0x7FFFFFF7) emitted via mov r10, imm32 or
+//     mov rax, imm32.
+//   - r11 reserved as .bss LEA scratch for
+//     passthrough_bytes_forwarded.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248) --
+//     the byte-copy inner loop uses this pattern for each of the
+//     8 + payload_len bytes copied.
+//   - 4 callee-save pushes (rbx copy index, r12 src, r13 dst, r14
+//     total_len cache) + `sub rsp, 8` = 40 bytes prologue; rsp %
+//     16 == 0 for shell_note.
+
+module PipePassthrough = structure {
+
+  // ==========================================================================
+  // Format constants
+  // ==========================================================================
+
+  // R20b frame header size in bytes (8: op | ver | flags:u16 |
+  // payload_len:u32). Mirrors paideia-os src/kernel/core/ipc/frame.pdx.
+  pub let PP_HEADER_SIZE : u64 = 8
+
+  // Maximum payload size the passthrough accepts on one call. The
+  // R20b frame's payload_len field is u32; the ceiling here is
+  // 0x7FFFFFF7 (2 GiB minus the 8-byte header, still under the
+  // paideia-as `cmp reg, imm <= 0x7FFFFFFF` boundary by 8 bytes).
+  // A payload above this bound is refused as PP_ERR_OVERSIZED --
+  // the frame is malformed on the wire even before the shell touches
+  // it. Fits imm <= 0x7FFFFFFF (equal to the largest legal compare).
+  pub let PP_MAX_PAYLOAD : u64 = 0x7FFFFFF7
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEC7x (PipePassthrough module)
+  // ==========================================================================
+
+  // Success sentinel = 0. On success, the caller reads
+  // passthrough_bytes_forwarded for the number of bytes copied.
+  pub let PP_OK             : u64 = 0
+
+  // src == 0, src_len < 8 (header alone doesn't fit), dst == 0, or
+  // dst_max == 0. All caught before touching dst.
+  pub let PP_ERR_BAD_ARGS   : u64 = 0xFFFFEC70
+
+  // payload_len decoded from the header exceeds src_len - 8, i.e.
+  // the caller's source buffer does not contain the whole frame.
+  // Refused before touching dst -- a torn-frame forward would
+  // corrupt the downstream reader's demux.
+  pub let PP_ERR_TRUNCATED  : u64 = 0xFFFFEC71
+
+  // dst_max < 8 + payload_len -- the destination cannot hold the
+  // whole frame. Refused before touching dst.
+  pub let PP_ERR_DST_OVERFLOW : u64 = 0xFFFFEC72
+
+  // payload_len > PP_MAX_PAYLOAD -- malformed frame on the wire.
+  pub let PP_ERR_OVERSIZED  : u64 = 0xFFFFEC73
+
+  // ==========================================================================
+  // Caller-visible output (singleton .bss)
+  //
+  // pipe_passthrough_forward writes the number of bytes it copied
+  // (always 8 + payload_len on success) into
+  // passthrough_bytes_forwarded so the caller can advance both
+  // endpoint cursors by the same amount without re-decoding the
+  // header.
+  // ==========================================================================
+  pub let mut passthrough_bytes_forwarded : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // pipe_passthrough_reset()
+  //
+  // Signature: pipe_passthrough_reset : () -> () !{mem} @{}
+  //
+  // Zero the passthrough_bytes_forwarded slot. Called by tests
+  // before each fixture and by the shell's pipeline driver before
+  // each forward attempt. Leaf function; r11 scratch; no push/pop
+  // parity.
+  // ==========================================================================
+  pub let pipe_passthrough_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M3-001 (#9): zero the passthrough_bytes_forwarded singleton so a subsequent pipe_passthrough_forward starts from a known-empty baseline. xor rax, rax + one lea + one store. r11 scratch (paideia-as conformance). Leaf function.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + passthrough_bytes_forwarded];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pipe_passthrough_forward(src, src_len, dst, dst_max) -> u64
+  //
+  // Signature: pipe_passthrough_forward : (u64, u64, u64, u64) -> u64
+  //                                       !{mem} @{}
+  // RDI (input): src      -- VA of the source buffer holding one
+  //                          R20b frame (header + payload)
+  // RSI (input): src_len  -- bytes available in src starting at src
+  // RDX (input): dst      -- VA of the destination buffer
+  // RCX (input): dst_max  -- bytes dst can hold
+  // RAX (output): PP_OK on success (byte count in
+  //               passthrough_bytes_forwarded), else
+  //               PP_ERR_BAD_ARGS | PP_ERR_TRUNCATED |
+  //               PP_ERR_DST_OVERFLOW | PP_ERR_OVERSIZED.
+  //
+  // Reads the R20b 8-byte frame header from src, extracts
+  // payload_len (bits 32..63 of qword0), verifies (8 + payload_len)
+  // fits in both src_len and dst_max, then byte-copies 8 +
+  // payload_len bytes verbatim from src to dst.
+  //
+  // Fail-fast on all gates; dst is NOT touched on any reject path.
+  //
+  // Bumps SH_ST_PASSTHRU (slot 8) on every entry. Bumps SH_ST_ERRORS
+  // on every reject path.
+  //
+  // Register plan:
+  //   r12 = src            (callee-save; preserved through shell_note)
+  //   r13 = dst            (callee-save; preserved through shell_note)
+  //   r14 = total_len      (callee-save; cached across the copy loop:
+  //                         total_len = 8 + payload_len)
+  //   rbx = i for copy loop (callee-save so reject paths keep parity)
+  //   rax = temp / return  (payload_len during decode, byte staging
+  //                         during copy)
+  //   r10 = temp (byte staging / large-imm scratch)
+  //   rsi, rcx = still hold src_len / dst_max during the gates
+  //
+  // Prologue: 4 pushes (rbx, r12, r13, r14) + `sub rsp, 8` = 40
+  // bytes; rsp % 16 == 0 for shell_note. Matched epilogue at every
+  // return.
+  // ==========================================================================
+  pub let pipe_passthrough_forward : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (src: u64) (src_len: u64) (dst: u64) (dst_max: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M3-001 (#9): D2-literal semantic-pipe passthrough. Copy one R20b frame (8-byte header + payload_len bytes of payload) from src to dst without decoding, rehashing, or otherwise touching the schema-hash prefix or record body -- the shell is a byte-level forwarder between two children in a pipeline (design/tooling/r49-r50-plan.md §5.2 M3 line 'each child's schema pipe is forwarded unchanged'). The 8-byte R20b header (paideia-os src/kernel/core/ipc/frame.pdx) is loaded as one aligned qword and payload_len extracted from bits 32..63; the four gates (src != 0, src_len >= 8, dst != 0, dst_max > 0) fail fast before the header read, and payload_len <= PP_MAX_PAYLOAD and 8+payload_len <= min(src_len, dst_max) gate before any byte touches dst. Copy loop uses the #1248 byte-load pattern (`xor rax, rax; mov_b rax, [r12 + rbx]`) with a symmetric byte-store; this is the same idiom history.pdx uses in the command-text copy. 4 pushes (rbx copy index, r12 src, r13 dst, r14 total_len cache) + `sub rsp, 8` = 40 bytes prologue; rsp % 16 == 0 for shell_note. r11 used only in the singleton-write LEA on the happy path. All large immediates via mov r10, imm32. Labels prefixed pp_fw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;                          // align rsp % 16 for shell_note
+
+        mov r12, rdi;                        // src
+        mov r13, rdx;                        // dst
+        // src_len stays in rsi; dst_max stays in rcx
+
+        // Bump SH_ST_PASSTHRU (slot 8) unconditionally.
+        mov rdi, 8;                          // SH_ST_PASSTHRU
+        call shell_note;
+
+        // Gate: src non-null.
+        cmp r12, 0;
+        je  pp_fw_bad_args;
+        // Gate: dst non-null.
+        cmp r13, 0;
+        je  pp_fw_bad_args;
+        // Gate: dst_max non-zero.
+        cmp rcx, 0;
+        je  pp_fw_bad_args;
+        // Gate: src_len >= PP_HEADER_SIZE (must have room for header).
+        cmp rsi, 8;                          // PP_HEADER_SIZE
+        jb  pp_fw_bad_args;
+
+        // Read the 8-byte R20b header as one aligned qword. Extract
+        // payload_len from the high 32 bits (bits 32..63) by shifting
+        // right by 32. `shr rax, 32` uses imm8; fits paideia-as.
+        mov rax, [r12 + 0];
+        shr rax, 32;                         // rax = payload_len (u32)
+
+        // Gate: payload_len <= PP_MAX_PAYLOAD.
+        mov r10, 0x7FFFFFF7;                 // PP_MAX_PAYLOAD
+        cmp rax, r10;
+        ja  pp_fw_oversized;
+
+        // total_len = 8 + payload_len. Cache in r14 for the copy loop
+        // and for the singleton write on the happy path.
+        add rax, 8;                          // total_len = 8 + payload_len
+        mov r14, rax;
+
+        // Gate: src_len >= total_len (source buffer holds the whole frame).
+        cmp rsi, r14;
+        jb  pp_fw_truncated;
+        // Gate: dst_max >= total_len (destination can hold the frame).
+        cmp rcx, r14;
+        jb  pp_fw_dst_overflow;
+
+        // Byte-copy: for rbx = 0; rbx < total_len; rbx++
+        //   dst[rbx] = src[rbx]
+        xor rbx, rbx;
+      pp_fw_copy_head:
+        cmp rbx, r14;
+        jae pp_fw_copy_done;
+        xor rax, rax;
+        mov_b rax, [r12 + rbx];              // #1248 byte load
+        mov_b [r13 + rbx], rax;              // byte store
+        add rbx, 1;
+        jmp pp_fw_copy_head;
+      pp_fw_copy_done:
+
+        // Record bytes_forwarded = total_len.
+        lea r11, [rip + passthrough_bytes_forwarded];
+        mov [r11], r14;
+
+        xor rax, rax;                        // PP_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pp_fw_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC70;                 // PP_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pp_fw_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC71;                 // PP_ERR_TRUNCATED
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pp_fw_dst_overflow:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC72;                 // PP_ERR_DST_OVERFLOW
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pp_fw_oversized:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC73;                 // PP_ERR_OVERSIZED
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
