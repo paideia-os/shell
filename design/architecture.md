@@ -350,6 +350,69 @@ consumer at exec time when needed. If M3 requires them, extend the
 singleton with `(offset, length)` pairs — mirrors libpdx-argv's
 flag_names discipline.
 
+## 4b. `History` module (src/history.pdx) — M2-005
+
+### 4b.1 Contract
+
+```
+history_encode_record(dst: u64, dst_len: u64,
+                      cmd_ptr: u64, cmd_len: u64,
+                      ts_ns: u64, flags: u64) -> u64
+history_reset() -> ()
+```
+
+Pure byte-serialiser: writes one `HistoryEntry` record into the
+caller-owned `dst` buffer. Number of bytes written is placed in the
+`.bss` singleton `history_bytes_written` (8-byte aligned) so the
+caller can advance its journal cursor without recomputing padding.
+
+### 4b.2 Wire format
+
+Fixed 24-byte header + variable command bytes + 0..7 zero pad:
+
+```
++0    u32 magic         = 0x54534948 ("HIST" bytes 'H','I','S','T')
++4    u32 record_len    total bytes; always an 8-multiple
++8    u64 ts_ns         wall-clock nanoseconds (caller-supplied)
++16   u32 cmd_len       command length
++20   u32 flags         bit 0 HAS_ERROR, bit 1 SCRIPT, rest reserved
++24   u8[cmd_len]       UTF-8 command text
++...  0..7 zero bytes   padding to align record_len to 8
+```
+
+Each of the three header qwords is a single MOV — a torn write
+between fields inside one record is impossible on x86-64. `record_len`
+is computed as `(24 + cmd_len + 7) / 8 * 8` via shr/shl (no large-imm
+mask).
+
+### 4b.3 Error codes
+
+- `HIST_ERR_BAD_ARGS` (0xFFFFEC60) — `dst == 0`, `dst_len == 0`, or
+  `cmd_ptr == 0 && cmd_len > 0`. `cmd_len == 0` is allowed (records
+  the "empty enter" event).
+- `HIST_ERR_TOO_LONG` (0xFFFFEC61) — `cmd_len > 4096`
+  (`HIST_CMD_MAX`).
+- `HIST_ERR_TRUNCATED` (0xFFFFEC62) — `dst_len` less than required.
+
+All three are fail-fast — `dst` is not touched on reject.
+
+### 4b.4 Substrate deferral (PdxFS write)
+
+The M2 module builds the wire bytes; the M3+ substrate wiring appends
+them to `~/.history/<session>-<ts>.pdxhist` via
+`sys_ipc_send(svc.pdxfs-journal, encoded_bytes)`. PdxFS v1 has landed
+`KIND_PDXFS_FILE` at HEAD (paideia-os R42 scaffold, commits `411ad0e`
+/ `2ff76d4`), but the userspace-write path is not wired in the shell
+repo at HEAD. Same discipline as `LineReader` / `Exec`: build the
+pure logic at M2, defer the substrate boundary to M3+.
+
+### 4b.5 caps.decl amendment
+
+`caps.decl` gains `KIND_PDXFS_FILE(write)` at M2-005. The shell
+narrows this cap per-session to the invoker's own history subtree
+via libpdx-cap's `cap_pack_narrowed` at session start; children
+never receive this cap (history subtree is the shell's own state).
+
 ## 5. Return-code band `0xFFFFECxx`
 
 ```

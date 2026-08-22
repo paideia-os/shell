@@ -1,0 +1,362 @@
+// src/history.pdx -- shell.M2-005 (paideia-os/shell#8)
+//
+// History module: ~/.history/ CoW-journal record encoder.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The shell persists its interactive command history to `~/.history/`
+// as a CoW-journal (copy-on-write, append-only) file backed by
+// KIND_PDXFS_FILE(write). Each entered command produces one
+// HistoryEntry record; the shell appends the record's bytes to the
+// current-session journal file.
+//
+// M2-005 lands the ENCODER -- the pure byte-serialisation of one
+// HistoryEntry record into a caller-owned buffer. The actual
+// PdxFS-write step (`sys_ipc_send` to `svc.pdxfs-journal` broker
+// with the encoded bytes as payload) is a substrate deferral,
+// consistent with the M1 discipline for LineReader / Exec: PdxFS
+// v1 has landed KIND_PDXFS_FILE at HEAD (paideia-os R42 scaffold,
+// commits 411ad0e / 2ff76d4) but the userspace-write path is not
+// wired in the shell repo at HEAD. The encoder is fully specified
+// at M2; the M3+ substrate wiring calls the encoder and appends
+// the bytes.
+//
+// The value of building the encoder at M2 is the same as for
+// Session / Pipeline / Pds -- the WIRE FORMAT is the public
+// contract every reader downstream must agree on (semantic-pipe
+// consumers of the history schema, `undo history clear` restore,
+// cross-shell history browsing at R56+). Fixing the format at M2
+// means M3+ substrate is a byte-append against a stable schema,
+// not a joint format-and-plumbing exercise.
+//
+// =============================================================================
+// WIRE FORMAT (HistoryEntry)
+// =============================================================================
+//
+// One entry is a fixed 24-byte header + variable-length UTF-8 command
+// bytes + zero padding to an 8-byte boundary:
+//
+//   +0    u32 magic         = HIST_MAGIC = 0x54534948 ("HIST" in LE:
+//                             bytes 'H','I','S','T' at addresses 0..3)
+//   +4    u32 record_len    total record size in bytes (header + cmd
+//                             + padding, always a multiple of 8)
+//   +8    u64 ts_ns         wall-clock timestamp in nanoseconds
+//                             (caller-supplied; the wire never mints
+//                             a clock read of its own -- clock reads
+//                             live at the shell's dispatch layer)
+//   +16   u32 cmd_len       command byte count (<= HIST_CMD_MAX)
+//   +20   u32 flags         bit 0 = has_error   (last exit != 0)
+//                             bit 1 = script     (recorded during .pds
+//                                                 exec, not interactive)
+//                             bits 2..31 reserved (must be zero)
+//   +24   u8[cmd_len] cmd_bytes
+//   +...  u8[pad] zero_pad  0..7 zero bytes to align total to 8 bytes
+//
+// The magic and record_len sit in qword0 (endianness-preserving);
+// ts_ns is qword1; cmd_len | flags fill qword2's low half. Each of
+// the first three qwords is a single MOV to the wire so a torn write
+// between fields inside one record is impossible on x86-64.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`History`).
+//   - No `test` mnemonic; `cmp reg, 0` for zero-checks.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. HIST_CMD_MAX is
+//     4096; the required-size compare against dst_len uses
+//     `cmp reg, reg` (not immediate) after the required-size compute.
+//   - Large immediates (HIST_MAGIC = 0x54534948, error codes
+//     0xFFFFEC60..0xFFFFEC62) emitted via mov r10, imm64 or
+//     `mov rax, imm32` respectively.
+//   - r11 unused (no .bss reach; caller-owned buffer only).
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` -- history_
+//     encode_record uses one such pattern in the byte-copy inner loop.
+//   - 4 callee-save pushes (rbx, r12, r13, r14) + `sub rsp, 8` for
+//     the SysV call alignment across shell_note.
+
+module History = structure {
+
+  // ==========================================================================
+  // Format constants
+  // ==========================================================================
+
+  // Header size in bytes (fixed 24-byte header). Every emitted record
+  // has this many bytes of leading metadata.
+  pub let HIST_HEADER_SIZE : u64 = 24
+
+  // Maximum command length in bytes. 4096 = one page; a command
+  // longer than one page is almost certainly a paste that includes
+  // an embedded newline (a real command line ends at Enter, before
+  // the paste's second line). Fits imm <= 0x7FFFFFFF.
+  pub let HIST_CMD_MAX : u64 = 4096
+
+  // Magic constant. Little-endian layout of bytes 'H'(0x48),
+  // 'I'(0x49), 'S'(0x53), 'T'(0x54) reads back as u32 0x54534948.
+  // Downstream readers verify by loading a u32 at offset 0 and
+  // comparing against this value; a corrupted record fails the
+  // check immediately.
+  pub let HIST_MAGIC : u64 = 0x54534948
+
+  // Flag bits.
+  pub let HIST_FLAG_HAS_ERROR : u64 = 0x1
+  pub let HIST_FLAG_SCRIPT    : u64 = 0x2
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEC6x (History module)
+  // ==========================================================================
+
+  // Success sentinel = 0. On success, the caller reads
+  // history_bytes_written for the number of bytes appended to dst.
+  pub let HIST_OK             : u64 = 0
+
+  // dst == 0, dst_len == 0, cmd_ptr == 0 (cmd_len == 0 is allowed --
+  // the empty command records a "user pressed Enter on empty prompt"
+  // event, which is a real event a shell may want to record for
+  // audit-first purposes).
+  pub let HIST_ERR_BAD_ARGS   : u64 = 0xFFFFEC60
+
+  // cmd_len > HIST_CMD_MAX. Refused before touching dst.
+  pub let HIST_ERR_TOO_LONG   : u64 = 0xFFFFEC61
+
+  // dst_len < required-record-size (header + cmd + padding). Refused
+  // before touching dst so the caller can enlarge the buffer and
+  // retry without seeing partial-record garbage.
+  pub let HIST_ERR_TRUNCATED  : u64 = 0xFFFFEC62
+
+  // ==========================================================================
+  // Caller-visible output (singleton .bss)
+  //
+  // history_encode_record writes the number of bytes it appended to
+  // dst here so the caller can advance its journal cursor without
+  // recomputing the padding formula.
+  // ==========================================================================
+  pub let mut history_bytes_written : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // history_reset()
+  //
+  // Signature: history_reset : () -> () !{mem} @{}
+  //
+  // Zero the singleton. Called by tests before each fixture and by
+  // the shell before each history-encode attempt.
+  // ==========================================================================
+  pub let history_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-005 (#8): zero history_bytes_written. Leaf function.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + history_bytes_written];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // history_encode_record(dst, dst_len, cmd_ptr, cmd_len, ts_ns, flags) -> u64
+  //
+  // Signature: history_encode_record : (u64, u64, u64, u64, u64, u64)
+  //                                    -> u64 !{mem} @{}
+  // RDI (input): dst      -- VA of the destination journal buffer
+  // RSI (input): dst_len  -- bytes available in dst starting at dst
+  // RDX (input): cmd_ptr  -- VA of the command text (UTF-8; caller-
+  //                           owned; must be non-null if cmd_len > 0)
+  // RCX (input): cmd_len  -- command length in bytes (0..HIST_CMD_MAX)
+  // R8  (input): ts_ns    -- wall-clock timestamp in nanoseconds
+  //                           (caller-supplied; the encoder does NOT
+  //                           mint a clock read of its own)
+  // R9  (input): flags    -- HIST_FLAG_* bitmask; bits 2..31 must be
+  //                           zero (any other bits set are silently
+  //                           masked -- see below)
+  // RAX (output): HIST_OK on success (byte count in
+  //               history_bytes_written), else HIST_ERR_BAD_ARGS |
+  //               HIST_ERR_TOO_LONG | HIST_ERR_TRUNCATED.
+  //
+  // Writes the fixed 24-byte header + cmd_len command bytes + 0..7
+  // zero-padding bytes to dst. Total record length is
+  // `HIST_HEADER_SIZE + cmd_len` rounded up to the next 8-byte
+  // multiple.
+  //
+  // Fail-fast on all gates; dst is NOT touched on any reject path.
+  //
+  // Bumps SH_ST_HISTORY (slot 7) on every entry. Bumps SH_ST_ERRORS
+  // on every reject.
+  //
+  // Register plan:
+  //   r12 = dst              (callee-save)
+  //   r13 = cmd_ptr          (callee-save)
+  //   r14 = record_len cache (callee-save; needed after byte-copy loop)
+  //   rbx = i for copy loop  (callee-save so it survives shell_note
+  //                           on the reject path)
+  //   rax = temp / return
+  //   r10 = temp (magic, byte staging)
+  //   r15 = flags cache      (callee-save)
+  //   -- inputs still live in rsi (dst_len), rcx (cmd_len), r8 (ts_ns)
+  //      until after the gates, then r14 replaces rsi
+  //
+  // Prologue: 5 pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` = 48
+  // bytes; rsp % 16 == 0 for shell_note. Matched epilogue.
+  // ==========================================================================
+  pub let history_encode_record : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (cmd_ptr: u64) (cmd_len: u64) (ts_ns: u64) (flags: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-005 (#8): serialise one HistoryEntry record. Wire layout per design/architecture.md §4b: 24-byte header (magic u32 | record_len u32 fused into qword0; ts_ns qword1; cmd_len u32 | flags u32 fused into qword2), then cmd_len bytes of command text, then 0..7 zero bytes to align total to 8. Every qword store is a single MOV so a torn write between fields inside one record is impossible on x86-64. Byte-copy loop uses `xor rax, rax; mov_b rax, [r13 + rbx]` per #1248 (byte load), then `mov_b [r12 + <hdr> + rbx], rax` (byte store); this pattern is what libpdx-cap's caps_decl parser and libpdx-argv's parser use for their own byte moves. Flags are silently masked to bits 0..1 (HIST_FLAG_HAS_ERROR | HIST_FLAG_SCRIPT); a caller passing an unknown bit does not get an error but does not corrupt any reader either (unknown bits read as zero after mask). Fail-fast gates: dst != 0, dst_len > 0, cmd_ptr non-null iff cmd_len > 0, cmd_len <= HIST_CMD_MAX (4096, fits imm <= 0x7FFFFFFF), dst_len >= record_len. 5 pushes (rbx copy index, r12 dst, r13 cmd_ptr, r14 record_len cache, r15 flags cache) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 for shell_note. r11 unused (no .bss reach in the encode body; the write to history_bytes_written on the happy path uses one lea r11 slot). Labels prefixed hs_er_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rdx;                        // cmd_ptr
+        mov r15, r9;                         // flags (cache)
+        // dst_len stays in rsi; cmd_len stays in rcx; ts_ns stays in r8
+
+        // Bump SH_ST_HISTORY (slot 7) unconditionally.
+        mov rdi, 7;                          // SH_ST_HISTORY
+        call shell_note;
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  hs_er_bad_args;
+        // Gate: dst_len non-zero.
+        cmp rsi, 0;
+        je  hs_er_bad_args;
+        // Gate: cmd_ptr non-null iff cmd_len > 0.
+        cmp rcx, 0;
+        je  hs_er_check_dst_len;             // cmd_len == 0: skip cmd_ptr check
+        cmp r13, 0;
+        je  hs_er_bad_args;
+
+      hs_er_check_dst_len:
+        // Gate: cmd_len <= HIST_CMD_MAX.
+        cmp rcx, 4096;                       // HIST_CMD_MAX
+        ja  hs_er_too_long;
+
+        // Compute record_len = (HIST_HEADER_SIZE + cmd_len + 7) & ~7
+        // = (24 + cmd_len + 7) rounded up to next multiple of 8.
+        // Computed via shr 3 / shl 3 rather than an AND with a
+        // 64-bit immediate mask so no large-imm hop is needed --
+        // both shifts take imm8. HIST_HEADER_SIZE (24) is already
+        // an 8-multiple, so the round-up only affects cmd_len's
+        // low 3 bits.
+        mov rax, rcx;
+        add rax, 24;                         // + header size (already 8-mul)
+        add rax, 7;                          // + rounding constant
+        shr rax, 3;                          // drop low 3 bits
+        shl rax, 3;                          // padded to next 8-mul
+        mov r14, rax;                        // r14 = record_len cache
+
+        // Gate: dst_len >= record_len.
+        cmp rsi, r14;
+        jb  hs_er_truncated;
+
+        // --- Write qword0 = magic | (record_len << 32) --------------
+        // record_len fits in u32 (< 2^32 easily: 24 + 4096 = 4120).
+        mov rax, r14;
+        shl rax, 32;                         // rax = record_len << 32
+        mov r10, 0x54534948;                 // HIST_MAGIC
+        or  rax, r10;                        // rax = magic | (record_len << 32)
+        mov [r12 + 0], rax;
+
+        // --- Write qword1 = ts_ns ----------------------------------
+        mov [r12 + 8], r8;
+
+        // --- Write qword2 = cmd_len | (masked_flags << 32) ---------
+        // Mask flags to bits 0..1 so unknown bits do not reach the wire.
+        mov rax, r15;
+        and rax, 0x3;                        // HIST_FLAG_HAS_ERROR | HIST_FLAG_SCRIPT
+        shl rax, 32;                         // masked_flags << 32
+        or  rax, rcx;                        // | cmd_len (u32 in low half)
+        mov [r12 + 16], rax;
+
+        // --- Byte-copy command text -------------------------------
+        // If cmd_len == 0, skip the loop entirely.
+        cmp rcx, 0;
+        je  hs_er_pad;
+
+        xor rbx, rbx;                        // i = 0
+      hs_er_copy_head:
+        cmp rbx, rcx;
+        jae hs_er_copy_done;
+        // Read one byte from cmd_ptr[i] via #1248 pattern.
+        xor rax, rax;
+        mov_b rax, [r13 + rbx];
+        // Write it at dst[HIST_HEADER_SIZE + i] = dst[24 + i].
+        mov_b [r12 + rbx + 24], rax;
+        add rbx, 1;
+        jmp hs_er_copy_head;
+      hs_er_copy_done:
+
+      hs_er_pad:
+        // Zero-pad from dst[HIST_HEADER_SIZE + cmd_len] to
+        // dst[record_len - 1]. The gap length is (record_len - 24 -
+        // cmd_len), which is 0..7 bytes.
+        // Cursor = 24 + cmd_len; end = record_len.
+        mov rbx, rcx;
+        add rbx, 24;                         // rbx = cursor
+      hs_er_pad_head:
+        cmp rbx, r14;
+        jae hs_er_pad_done;
+        xor rax, rax;
+        mov_b [r12 + rbx], rax;              // zero byte
+        add rbx, 1;
+        jmp hs_er_pad_head;
+      hs_er_pad_done:
+
+        // Record bytes_written = record_len.
+        lea r11, [rip + history_bytes_written];
+        mov [r11], r14;
+
+        xor rax, rax;                        // HIST_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hs_er_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC60;                 // HIST_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hs_er_too_long:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC61;                 // HIST_ERR_TOO_LONG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hs_er_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC62;                 // HIST_ERR_TRUNCATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

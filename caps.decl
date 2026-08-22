@@ -28,6 +28,14 @@
 #     processes at R56+. M1 pre-declares the requirement so downstream
 #     tooling (audit journal at M3, session lookup at M5) can already
 #     see it in the manifest.
+#   * KIND_PDXFS_FILE(write) (0x195, paideia-os
+#     src/kernel/core/cap/kind_pdxfs_file.pdx, R42 scaffold) — the
+#     shell writes CoW-journal records to `~/.history/` at every
+#     interactive line commit (shell.M2-005). Write cap is narrowed
+#     per-session to the invoker's own history subtree via
+#     libpdx-cap's cap_pack_narrowed at session start; children never
+#     receive this cap (the history subtree is the shell's own state,
+#     not a child's).
 #
 # InitCap sidecar note. The R20b.M4-001 loader-side InitCap sidecar
 # (paideia-os src/kernel/core/loader/init_caps.pdx) is not itself a
@@ -41,6 +49,7 @@ requires:
 - KIND_TTY(write)
 - KIND_IPC_ENDPOINT(mint)
 - KIND_SHELL_SESSION(mint)
+- KIND_PDXFS_FILE(write)
 
 # Declared output schemas — the shell emits three schemas over the
 # semantic-pipe substrate. All three are formalised at M3 (schema
