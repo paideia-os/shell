@@ -1,0 +1,405 @@
+// src/pds.pdx -- shell.M2-004 (paideia-os/shell#7)
+//
+// Pds module: parser for the .pds script HEADER format.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The `.pds` script format is specified at design/terminal/pds-format.md
+// in the paideia-os repo. A script has two parts:
+//
+//   1. HEADER -- a run of lines each starting with either '#!' (shebang)
+//      or '#<pragma>' (pragma directive). The header ends at the first
+//      blank line or the first non-'#' line.
+//   2. BODY -- shell pipeline syntax per semantic-shell.md §2, executed
+//      by the shell's exec dispatch once the header caps and imports
+//      have been validated.
+//
+// M2-004 implements the HEADER parser. The BODY dispatch reuses the
+// same pipeline_plan + exec_narrow_child_caps machinery M2-002 and
+// M2-003 landed, so no BODY-specific code is needed here.
+//
+// Recognised pragmas (per pds-format.md §1):
+//
+//   #!<interpreter>          shebang (recorded; not enforced at M2)
+//   #capability <name>       required capability; script exec refused
+//                            if the shell cannot narrow to this name
+//   #requires-paideia <ver>  minimum paideia-os version; recorded, not
+//                            enforced at M2 (paideia-os itself does not
+//                            expose a runtime-queryable version at HEAD)
+//   #import "<path>" as <n>  imports another .pds as a module; the
+//                            parser records the import; the loader
+//                            resolves the path at exec (M3+)
+//   #schema "<path>"         pre-registers a schema for the semantic-
+//                            pipe substrate; recorded, resolved at M3+
+//   #ascii                   ASCII-only rendering flag (recorded)
+//
+// The parser is a strict predecence:
+//   * The FIRST line may be a shebang; if so, it is consumed.
+//   * The next run of '#'-lines is the pragma block; each line is
+//     dispatched by first-token match.
+//   * The first non-'#' line (including a blank line) ENDS the header.
+//     The parser returns; the caller reads pds_body_offset for where
+//     the body starts.
+//
+// =============================================================================
+// STORAGE
+// =============================================================================
+//
+// One PdsHeader singleton lives in .bss (same singleton pattern as
+// libpdx-cap's caps_decl parser and libpdx-argv's ParsedArgs). One
+// script per shell exec invocation is enough for M2's consumers.
+//
+// Counts (u64 each): pds_capability_count, pds_import_count,
+// pds_schema_count. Flags (u64 each, 0 = unset, 1 = set):
+// pds_has_shebang, pds_ascii_flag. Cursor (u64): pds_body_offset --
+// the byte offset in the input buffer where the body starts.
+//
+// The parser does NOT materialise the pragma STRING VALUES. Reason:
+// the shell exec dispatcher does the string comparison against the
+// caller's own cap-name table at exec time; storing intermediate
+// copies would double the memory footprint of a script's header for
+// no downstream benefit. If M3 needs string values (e.g., for
+// #import path resolution), the parser can be extended to record
+// (offset, length) pairs — mirrors libpdx-argv's flag_names slot
+// discipline.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Pds`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest is
+//     PDS_MAX_CAPS = 16 for overflow gates; ASCII byte compares
+//     (0x23 '#', 0x21 '!', 0x0A '\n', etc.) fit trivially.
+//   - r11 reserved as .bss LEA scratch for pds_* singleton addresses.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - Non-leaf function: nested `call shell_note` on entry + reject
+//     paths. Two callee-save pushes (r12 buf, r13 buf_len) matched
+//     with `sub rsp, 8` for the SysV call alignment.
+
+module Pds = structure {
+
+  // ==========================================================================
+  // Storage caps
+  // ==========================================================================
+
+  // Per-header maxima. All fit imm <= 0x7FFFFFFF by wide margin.
+  pub let PDS_MAX_CAPS    : u64 = 16
+  pub let PDS_MAX_IMPORTS : u64 = 8
+  pub let PDS_MAX_SCHEMAS : u64 = 8
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEC5x (Pds module)
+  // ==========================================================================
+
+  pub let PDS_OK              : u64 = 0
+  pub let PDS_ERR_BAD_ARGS    : u64 = 0xFFFFEC50   // buf == 0 or buf_len == 0
+  pub let PDS_ERR_MALFORMED   : u64 = 0xFFFFEC51   // header line not recognised
+  pub let PDS_ERR_OVERFLOW    : u64 = 0xFFFFEC52   // too many caps / imports /
+                                                   // schemas for one script
+
+  // ==========================================================================
+  // Singleton header record (.bss)
+  //
+  // The parser reads a script buffer and writes the counts + flags
+  // here. Consumers (the shell exec dispatcher, .pds import resolver)
+  // read the fields directly. Mirrors libpdx-argv's ParsedArgs
+  // singleton at src/parsed_args.pdx.
+  // ==========================================================================
+  pub let mut pds_has_shebang       : u64 = uninit @align(8)
+  pub let mut pds_ascii_flag        : u64 = uninit @align(8)
+  pub let mut pds_capability_count  : u64 = uninit @align(8)
+  pub let mut pds_import_count      : u64 = uninit @align(8)
+  pub let mut pds_schema_count      : u64 = uninit @align(8)
+  pub let mut pds_body_offset       : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // pds_reset()
+  //
+  // Signature: pds_reset : () -> () !{mem} @{}
+  //
+  // Zero the six singleton slots. Called by tests before each fixture
+  // and by the .pds executor before each new script. Leaf function.
+  // ==========================================================================
+  pub let pds_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-004 (#7): zero the six PdsHeader singleton slots so a subsequent pds_parse starts from a known-empty baseline. xor rax, rax produces the zero; six lea + mov pairs write it. r11 scratch. Leaf function.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + pds_has_shebang];       mov [r11], rax;
+        lea r11, [rip + pds_ascii_flag];        mov [r11], rax;
+        lea r11, [rip + pds_capability_count];  mov [r11], rax;
+        lea r11, [rip + pds_import_count];      mov [r11], rax;
+        lea r11, [rip + pds_schema_count];      mov [r11], rax;
+        lea r11, [rip + pds_body_offset];       mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pds_parse(buf, buf_len) -> u64
+  //
+  // Signature: pds_parse : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): buf     -- VA of the script buffer (caller-owned)
+  // RSI (input): buf_len -- length in bytes
+  // RAX (output): PDS_OK on success (header parsed; body_offset set),
+  //               else PDS_ERR_BAD_ARGS | PDS_ERR_MALFORMED |
+  //               PDS_ERR_OVERFLOW.
+  //
+  // Parse strategy: line-oriented walk with r8 as cursor, r9 as end.
+  // For each line:
+  //
+  //   1. If line[0] == '#' and line[1] == '!' and this is the FIRST
+  //      line (no shebang yet): set pds_has_shebang = 1, skip to end
+  //      of line, continue.
+  //   2. Else if line[0] == '#': dispatch by prefix:
+  //         "#capability "  -> increment pds_capability_count
+  //         "#import "      -> increment pds_import_count
+  //         "#schema "      -> increment pds_schema_count
+  //         "#requires-paideia " -> no-op (recorded implicitly by
+  //                                 pragma count; version is not
+  //                                 enforced at M2)
+  //         "#ascii"        -> set pds_ascii_flag = 1
+  //         other '#' line  -> PDS_ERR_MALFORMED
+  //   3. Else (line does not start with '#'): the header ENDS here.
+  //      Set pds_body_offset = cursor position and return PDS_OK.
+  //
+  // Blank lines within the header (bare '\n') are treated as header
+  // terminators — pds_format.md §1 does not authorise blank lines
+  // inside the pragma block, so the first blank line ends the header
+  // (same rule as HTTP headers).
+  //
+  // Overflow: if any count would exceed its MAX, return PDS_ERR_OVERFLOW.
+  //
+  // Bumps SH_ST_LINES (slot 1) on entry (script "line reader"
+  // analogue — a script IS a line consumer). Bumps SH_ST_ERRORS on
+  // any reject path.
+  //
+  // Register plan:
+  //   r12 = buf base           (callee-save)
+  //   r13 = buf_len            (callee-save)
+  //   r8  = walk cursor
+  //   r9  = walk end (buf + buf_len)
+  //   rax = byte load / accumulator / return value
+  //   r10 = ephemeral compute (pragma-tag byte compares)
+  //   r11 = .bss LEA scratch
+  //   rbx = "shebang consumed already" flag (0 initially)
+  //
+  // Prologue: 3 pushes (rbx, r12, r13) + `sub rsp, 8` = 32 bytes;
+  // rsp % 16 == 0 for shell_note. Matched epilogue at every return.
+  // ==========================================================================
+  pub let pds_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (buf: u64) (buf_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-004 (#7): parse .pds script HEADER per design/terminal/pds-format.md §1. Line-oriented byte walker; each line dispatched by prefix ('#!' shebang first-line, '#capability ', '#import ', '#schema ', '#requires-paideia ', '#ascii', else header terminator). Every byte read follows the #1248 pattern (xor rax, rax; mov_b rax, [r8]). Counts stored in .bss singleton (pds_capability_count / pds_import_count / pds_schema_count) with overflow guards (PDS_MAX_CAPS/IMPORTS/SCHEMAS = 16/8/8 fit imm <= 0x7FFFFFFF). Non-leaf: nested call shell_note. Three pushes (rbx shebang-consumed flag, r12 buf, r13 buf_len) + `sub rsp, 8` = 32 bytes prologue; rsp % 16 == 0. r11 reserved for .bss LEA scratch. String tag matches use per-byte cmp against ASCII (0x23 '#', 0x21 '!', 0x0A '\\n', 0x20 ' ', 0x63 'c', 0x69 'i', 0x73 's', 0x72 'r', 0x61 'a'). Only the first byte after '#' is dispatched (single-char lookahead is enough to disambiguate the M2 pragma set); a longer prefix compare will be added at M3 when #requires-paideia gains a runtime version check. Labels prefixed pd_pa_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // buf
+        mov r13, rsi;                        // buf_len
+
+        // Bump SH_ST_LINES (script's own line consumption).
+        mov rdi, 1;                          // SH_ST_LINES
+        call shell_note;
+
+        // Gate: buf non-null.
+        cmp r12, 0;
+        je  pd_pa_bad_args;
+        // Gate: buf_len non-zero.
+        cmp r13, 0;
+        je  pd_pa_bad_args;
+
+        // Initialize walk state.
+        mov r8, r12;                         // r8 = cursor
+        mov r9, r12;
+        add r9, r13;                         // r9 = end
+        xor rbx, rbx;                        // rbx = shebang_consumed = 0
+
+      pd_pa_line_head:
+        // If cursor >= end, header ended without an explicit body.
+        // body_offset = buf_len (past the last byte).
+        cmp r8, r9;
+        jae pd_pa_eof;
+
+        // Peek first byte of line.
+        xor rax, rax;
+        mov_b rax, [r8];
+
+        // Blank line (bare '\n') ends header.
+        cmp rax, 0x0A;                       // '\n'
+        je  pd_pa_body_start;
+
+        // '#' -> pragma or shebang. Anything else -> body starts.
+        cmp rax, 0x23;                       // '#'
+        jne pd_pa_body_start;
+
+        // First byte is '#'. Peek the second byte.
+        mov r10, r8;
+        add r10, 1;
+        cmp r10, r9;
+        jae pd_pa_malformed;                 // '#' at EOF is malformed
+
+        xor rax, rax;
+        mov_b rax, [r10];
+
+        // Dispatch by second byte:
+        //   '!'  (0x21) -> shebang (only if not already consumed)
+        //   'c'  (0x63) -> #capability ... (or #compile? — capability
+        //                  is the only M2 pragma starting with 'c')
+        //   'i'  (0x69) -> #import ...
+        //   's'  (0x73) -> #schema ...
+        //   'r'  (0x72) -> #requires-paideia ...
+        //   'a'  (0x61) -> #ascii ...
+        //   else -> PDS_ERR_MALFORMED
+        cmp rax, 0x21;                       // '!'
+        je  pd_pa_shebang;
+        cmp rax, 0x63;                       // 'c'
+        je  pd_pa_capability;
+        cmp rax, 0x69;                       // 'i'
+        je  pd_pa_import;
+        cmp rax, 0x73;                       // 's'
+        je  pd_pa_schema;
+        cmp rax, 0x72;                       // 'r'
+        je  pd_pa_requires;
+        cmp rax, 0x61;                       // 'a'
+        je  pd_pa_ascii;
+        jmp pd_pa_malformed;
+
+      pd_pa_shebang:
+        // Shebang only allowed as the FIRST line.
+        cmp rbx, 0;
+        jne pd_pa_malformed;
+        mov rax, 1;
+        lea r11, [rip + pds_has_shebang];
+        mov [r11], rax;
+        mov rbx, 1;                          // shebang_consumed
+        jmp pd_pa_skip_to_eol;
+
+      pd_pa_capability:
+        // Increment pds_capability_count; check overflow.
+        lea r11, [rip + pds_capability_count];
+        mov rax, [r11];
+        add rax, 1;
+        cmp rax, 16;                         // PDS_MAX_CAPS
+        ja  pd_pa_overflow;
+        mov [r11], rax;
+        // Also record that first line is now used (rbx becomes 1
+        // once ANY pragma has been consumed, so a stray shebang later
+        // is rejected as malformed).
+        mov rbx, 1;
+        jmp pd_pa_skip_to_eol;
+
+      pd_pa_import:
+        lea r11, [rip + pds_import_count];
+        mov rax, [r11];
+        add rax, 1;
+        cmp rax, 8;                          // PDS_MAX_IMPORTS
+        ja  pd_pa_overflow;
+        mov [r11], rax;
+        mov rbx, 1;
+        jmp pd_pa_skip_to_eol;
+
+      pd_pa_schema:
+        lea r11, [rip + pds_schema_count];
+        mov rax, [r11];
+        add rax, 1;
+        cmp rax, 8;                          // PDS_MAX_SCHEMAS
+        ja  pd_pa_overflow;
+        mov [r11], rax;
+        mov rbx, 1;
+        jmp pd_pa_skip_to_eol;
+
+      pd_pa_requires:
+        // No-op at M2 (paideia-os does not expose runtime-queryable
+        // version; recorded implicitly by presence in the pragma
+        // block). Just skip to EOL.
+        mov rbx, 1;
+        jmp pd_pa_skip_to_eol;
+
+      pd_pa_ascii:
+        // Set pds_ascii_flag = 1.
+        mov rax, 1;
+        lea r11, [rip + pds_ascii_flag];
+        mov [r11], rax;
+        mov rbx, 1;
+        jmp pd_pa_skip_to_eol;
+
+      pd_pa_skip_to_eol:
+        // Advance cursor to the byte after the next '\n', or to end
+        // if no '\n' remains.
+      pd_pa_seol_head:
+        cmp r8, r9;
+        jae pd_pa_seol_done;
+        xor rax, rax;
+        mov_b rax, [r8];
+        add r8, 1;
+        cmp rax, 0x0A;
+        jne pd_pa_seol_head;
+      pd_pa_seol_done:
+        jmp pd_pa_line_head;
+
+      pd_pa_body_start:
+        // Body begins at the current cursor offset from buf base.
+        mov rax, r8;
+        sub rax, r12;                        // body_offset = cursor - buf
+        lea r11, [rip + pds_body_offset];
+        mov [r11], rax;
+        xor rax, rax;                        // PDS_OK
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pd_pa_eof:
+        // Header ran to EOF with no body. Valid: pure-header script
+        // (e.g., a manifest-only .pds). body_offset = buf_len.
+        mov rax, r13;
+        lea r11, [rip + pds_body_offset];
+        mov [r11], rax;
+        xor rax, rax;
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pd_pa_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC50;                 // PDS_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pd_pa_malformed:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC51;                 // PDS_ERR_MALFORMED
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pd_pa_overflow:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC52;                 // PDS_ERR_OVERFLOW
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

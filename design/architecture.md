@@ -303,6 +303,53 @@ M2 also lands the pipeline shape (`a | b | c`), minting one
 `KIND_IPC_ENDPOINT` per `|` and splicing it into the paired children's
 stdin/stdout via a second InitCap sidecar entry.
 
+## 4a. `Pds` module (src/pds.pdx) — M2-004
+
+### 4a.1 Contract
+
+```
+pds_parse(buf: u64, buf_len: u64) -> u64
+pds_reset() -> ()
+```
+
+Parses the HEADER of a `.pds` script (per `design/terminal/pds-format.md`).
+The header is a run of lines each starting with `#!` (shebang, first
+line only) or `#<pragma>`. First non-`#` line or blank line ends the
+header.
+
+Populates the `.bss` singleton `PdsHeader` record:
+
+- `pds_has_shebang` — 1 if a shebang was seen, else 0.
+- `pds_ascii_flag` — 1 if `#ascii` was seen, else 0.
+- `pds_capability_count` — number of `#capability` pragmas (≤ 16).
+- `pds_import_count` — number of `#import` pragmas (≤ 8).
+- `pds_schema_count` — number of `#schema` pragmas (≤ 8).
+- `pds_body_offset` — byte offset of the first body byte in `buf`.
+
+### 4a.2 Dispatch
+
+Second-byte lookahead is enough to disambiguate the M2 pragma set:
+`!`→shebang, `c`→capability, `i`→import, `s`→schema,
+`r`→requires-paideia (no-op recorded), `a`→ascii. Any other second
+byte is `PDS_ERR_MALFORMED` (0xFFFFEC51). Overflow of any of the
+three counts returns `PDS_ERR_OVERFLOW` (0xFFFFEC52).
+
+### 4a.3 Body dispatch
+
+The body is shell pipeline syntax; the parser does NOT re-parse it.
+Body execution goes through the same `pipeline_plan` + `exec_narrow_
+child_caps` machinery M2-002 and M2-003 landed. `pds_body_offset`
+tells the caller where the body starts; the caller reads bytes from
+there through the normal shell line-reader path.
+
+### 4a.4 String values not materialised
+
+The parser tracks COUNTS + FLAGS only. Pragma STRING VALUES (the
+capability names, import paths, schema paths) are re-read by the
+consumer at exec time when needed. If M3 requires them, extend the
+singleton with `(offset, length)` pairs — mirrors libpdx-argv's
+flag_names discipline.
+
 ## 5. Return-code band `0xFFFFECxx`
 
 ```
