@@ -1,0 +1,410 @@
+// src/completion.pdx -- shell.M3-002 (paideia-os/shell#10)
+//
+// Completion module: CommandCompletion[] wire encoder for tab-completion.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The shell's tab-completion path emits a `CommandCompletion[]`
+// semantic-pipe schema in response to a TAB keypress at the
+// interactive prompt. Per SH-D7 in design/terminal/semantic-shell.md,
+// completion is SCHEMA-REGISTRY-DRIVEN: the completion candidate is
+// not a raw string but a typed record naming (kind, name, score) so a
+// downstream renderer can style commands, files, options, and schema
+// hits differently -- and so a semantic-pipe consumer downstream of
+// the shell (query, pipeviz at R59+) can filter completions by kind
+// without column-slicing text.
+//
+// M3-002 lands the ENCODER -- the pure byte-serialisation of one
+// CommandCompletion record into a caller-owned buffer. The actual
+// tab-completion PIPELINE (walking the schema registry, scoring
+// candidates against the partial input, ordering by score) is a
+// substrate deferral consistent with the M1-through-M3 skeleton
+// discipline: the schema registry (design/terminal/semantic-shell.md
+// SH-D7 §"registry") does not exist as a userspace-queryable table
+// at HEAD 2026-08-21, so the shell M3 ships the encoder alone. The
+// M4+ tab-completion driver will call this encoder once per
+// candidate.
+//
+// Encoder shape mirrors History M2-005 (same 24-byte-fused-header
+// pattern for atomic writes), with a Completion-specific field
+// vocabulary. Fixing the wire at M3 means the M4+ driver is a
+// registry-walk + score compute + call this encoder loop, not a
+// joint format-and-plumbing exercise.
+//
+// =============================================================================
+// WIRE FORMAT (CommandCompletion)
+// =============================================================================
+//
+// One record is a fixed 16-byte header + variable-length UTF-8
+// candidate name + zero padding to an 8-byte boundary:
+//
+//   +0    u32 magic         = COMP_MAGIC = 0x504d4f43 ("COMP" in LE:
+//                             bytes 'C','O','M','P' at addresses 0..3)
+//   +4    u32 record_len    total record size in bytes (header + name
+//                             + padding, always a multiple of 8)
+//   +8    u16 kind          COMP_KIND_* (command | file | dir |
+//                             option | schema)
+//   +10   u16 score         match score 0..1000 (higher = better;
+//                             callers use 0 when scoring is not yet
+//                             implemented)
+//   +12   u32 name_len      candidate byte length (<= COMP_NAME_MAX)
+//   +16   u8[name_len]      candidate name (UTF-8; NOT null-terminated)
+//   +...  u8[pad] zero_pad  0..7 zero bytes to align total to 8 bytes
+//
+// The magic + record_len sit in qword0; kind | score | name_len fill
+// qword1 (kind low 16, score bits 16..31, name_len bits 32..63). Each
+// header qword is a single MOV to the wire; a torn write between
+// fields inside one header is impossible on x86-64. Cross-qword
+// tearing is possible; a partial-write detector at the reader
+// compares record_len against actual bytes delivered.
+//
+// =============================================================================
+// KIND VOCABULARY
+// =============================================================================
+//
+//   COMP_KIND_COMMAND = 1  installed tool (e.g. `ls`, `cat`, `pkg`)
+//   COMP_KIND_FILE    = 2  file candidate in the current or an
+//                          argument directory
+//   COMP_KIND_DIR     = 3  directory candidate
+//   COMP_KIND_OPTION  = 4  option (e.g. `--long`, `--json`)
+//   COMP_KIND_SCHEMA  = 5  schema-typed field (e.g. `owner`, `size`
+//                          when completing inside a `query` argument)
+//
+// The vocabulary is closed at M3: adding a kind is a schema-version
+// bump. Reserved values 0 and 6..65535 read as "unknown kind" at the
+// downstream renderer -- which falls back to the plain-text
+// candidate name without special styling.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Completion`).
+//   - No `test` mnemonic; `cmp reg, 0` for zero-checks.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. COMP_NAME_MAX is
+//     512; the score bound compare is against 1000; the kind bound
+//     compare is against 5.
+//   - Large immediates (COMP_MAGIC = 0x504d4f43, error codes
+//     0xFFFFEC80..0xFFFFEC83) emitted via mov r10, imm32 or
+//     mov rax, imm32.
+//   - r11 reserved as .bss LEA scratch for
+//     completion_bytes_written.
+//   - Byte reads use `xor rax, rax; mov_b rax, [ptr]` (#1248) in
+//     the name-copy inner loop and the zero-pad loop.
+//   - 5 callee-save pushes (rbx copy index, r12 dst, r13 name_ptr,
+//     r14 record_len cache, r15 kind|score|name_len fused) +
+//     `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 for
+//     shell_note. Matched epilogue at every return.
+
+module Completion = structure {
+
+  // ==========================================================================
+  // Format constants
+  // ==========================================================================
+
+  // Header size in bytes (fixed 16-byte header). Every emitted record
+  // has this many bytes of leading metadata.
+  pub let COMP_HEADER_SIZE : u64 = 16
+
+  // Maximum candidate name length in bytes. 512 is generous for
+  // command names, file basenames, and long option strings; a
+  // candidate above this bound is refused as COMP_ERR_TOO_LONG.
+  // Fits imm <= 0x7FFFFFFF.
+  pub let COMP_NAME_MAX : u64 = 512
+
+  // Maximum score. Higher = better match; 1000 is a full-string exact
+  // match. A caller passing score > COMP_SCORE_MAX is refused as
+  // COMP_ERR_BAD_ARGS (a score above the ceiling would mis-sort the
+  // downstream renderer's ordered list).
+  pub let COMP_SCORE_MAX : u64 = 1000
+
+  // Magic constant. Little-endian layout of bytes 'C'(0x43),
+  // 'O'(0x4F), 'M'(0x4D), 'P'(0x50) reads back as u32 0x504d4f43.
+  pub let COMP_MAGIC : u64 = 0x504d4f43
+
+  // Kind vocabulary (fixed at M3; extending is a schema-version bump).
+  pub let COMP_KIND_COMMAND : u64 = 1
+  pub let COMP_KIND_FILE    : u64 = 2
+  pub let COMP_KIND_DIR     : u64 = 3
+  pub let COMP_KIND_OPTION  : u64 = 4
+  pub let COMP_KIND_SCHEMA  : u64 = 5
+  pub let COMP_KIND_MAX     : u64 = 5
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEC8x (Completion module)
+  // ==========================================================================
+
+  // Success sentinel = 0. On success, the caller reads
+  // completion_bytes_written for the number of bytes appended.
+  pub let COMP_OK             : u64 = 0
+
+  // dst == 0, dst_len == 0, name_ptr == 0 (name_len == 0 is refused
+  // separately -- an empty candidate is a completion bug, not a
+  // legitimate record), kind == 0 or kind > COMP_KIND_MAX, or score
+  // > COMP_SCORE_MAX.
+  pub let COMP_ERR_BAD_ARGS   : u64 = 0xFFFFEC80
+
+  // name_len > COMP_NAME_MAX. Refused before touching dst.
+  pub let COMP_ERR_TOO_LONG   : u64 = 0xFFFFEC81
+
+  // dst_len < required-record-size (header + name + padding).
+  // Refused before touching dst so the caller can enlarge the buffer
+  // and retry without seeing partial-record garbage.
+  pub let COMP_ERR_TRUNCATED  : u64 = 0xFFFFEC82
+
+  // name_len == 0. Empty candidate names are refused; the empty
+  // string is not a legitimate completion candidate. Distinct code
+  // from COMP_ERR_BAD_ARGS so a caller-side bug (produced an empty
+  // candidate in the ranker) is distinguishable from an ordinary
+  // input error.
+  pub let COMP_ERR_EMPTY_NAME : u64 = 0xFFFFEC83
+
+  // ==========================================================================
+  // Caller-visible output (singleton .bss)
+  //
+  // completion_encode_record writes the number of bytes it appended
+  // to dst here so the caller can advance its journal cursor without
+  // recomputing the padding formula. Singleton pattern mirrors
+  // History's history_bytes_written -- one encode per completion is
+  // enough (the caller loops one encode per candidate).
+  // ==========================================================================
+  pub let mut completion_bytes_written : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // completion_reset()
+  //
+  // Signature: completion_reset : () -> () !{mem} @{}
+  //
+  // Zero the singleton. Called by tests before each fixture and by
+  // the shell before each completion-encode attempt.
+  // ==========================================================================
+  pub let completion_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M3-002 (#10): zero completion_bytes_written. Leaf function; r11 scratch (paideia-as conformance).",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + completion_bytes_written];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // completion_encode_record(dst, dst_len, name_ptr, name_len,
+  //                          kind, score) -> u64
+  //
+  // Signature: completion_encode_record : (u64, u64, u64, u64, u64, u64)
+  //                                       -> u64 !{mem} @{}
+  // RDI (input): dst       -- VA of the destination journal buffer
+  // RSI (input): dst_len   -- bytes available in dst starting at dst
+  // RDX (input): name_ptr  -- VA of the candidate name (UTF-8; caller-
+  //                            owned; must be non-null)
+  // RCX (input): name_len  -- candidate byte length (1..COMP_NAME_MAX)
+  // R8  (input): kind      -- COMP_KIND_* (1..COMP_KIND_MAX)
+  // R9  (input): score     -- match score (0..COMP_SCORE_MAX)
+  // RAX (output): COMP_OK on success (byte count in
+  //               completion_bytes_written), else COMP_ERR_BAD_ARGS |
+  //               COMP_ERR_TOO_LONG | COMP_ERR_TRUNCATED |
+  //               COMP_ERR_EMPTY_NAME.
+  //
+  // Writes the fixed 16-byte header + name_len name bytes + 0..7
+  // zero-padding bytes to dst. Total record length is
+  // `COMP_HEADER_SIZE + name_len` rounded up to the next 8-byte
+  // multiple.
+  //
+  // Fail-fast on all gates; dst is NOT touched on any reject path.
+  //
+  // Bumps SH_ST_COMPLETIONS (slot 9) on every entry. Bumps
+  // SH_ST_ERRORS on every reject.
+  //
+  // Register plan:
+  //   r12 = dst              (callee-save)
+  //   r13 = name_ptr         (callee-save)
+  //   r14 = record_len cache (callee-save; needed after byte-copy loop)
+  //   rbx = i for copy loop  (callee-save so it survives shell_note
+  //                            on the reject path)
+  //   r15 = fused qword1     (kind | (score << 16) | (name_len << 32))
+  //   rax = temp / return
+  //   r10 = temp (magic, byte staging, bound scratch)
+  //   -- inputs still live in rsi (dst_len), rcx (name_len), r8 (kind),
+  //      r9 (score) until after the gates
+  //
+  // Prologue: 5 pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` = 48
+  // bytes; rsp % 16 == 0 for shell_note. Matched epilogue.
+  // ==========================================================================
+  pub let completion_encode_record : (u64, u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (dst_len: u64) (name_ptr: u64) (name_len: u64) (kind: u64) (score: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M3-002 (#10): serialise one CommandCompletion record per SH-D7 (design/terminal/semantic-shell.md). Wire layout: 16-byte header (magic u32 | record_len u32 fused into qword0; kind u16 | score u16 | name_len u32 fused into qword1), then name_len bytes of UTF-8 candidate text, then 0..7 zero bytes to align total to 8. Every header qword is a single MOV so a torn write between fields inside one header is impossible on x86-64. Byte-copy loop uses the #1248 pattern (`xor rax, rax; mov_b rax, [r13 + rbx]` then `mov_b [r12 + <hdr> + rbx], rax`); this matches history.pdx and pipe_passthrough.pdx byte-copy discipline. Fail-fast gates: dst != 0, dst_len > 0, name_ptr != 0, name_len > 0 (empty candidate is COMP_ERR_EMPTY_NAME; distinct code so a caller-side ranker bug is diagnosable), name_len <= COMP_NAME_MAX (512), kind in 1..COMP_KIND_MAX (5), score <= COMP_SCORE_MAX (1000), dst_len >= record_len. Score and kind bounds fit imm <= 0x7FFFFFFF trivially. record_len = (16 + name_len + 7) / 8 * 8 via shr/shl (no large-imm mask); same idiom as history.pdx. 5 pushes (rbx copy index, r12 dst, r13 name_ptr, r14 record_len cache, r15 fused qword1) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 for shell_note. r11 used only in the singleton-write LEA on the happy path. Labels prefixed cp_er_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rdx;                        // name_ptr
+        // dst_len stays in rsi; name_len stays in rcx;
+        // kind stays in r8; score stays in r9
+
+        // Bump SH_ST_COMPLETIONS (slot 9) unconditionally.
+        mov rdi, 9;                          // SH_ST_COMPLETIONS
+        call shell_note;
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  cp_er_bad_args;
+        // Gate: dst_len non-zero.
+        cmp rsi, 0;
+        je  cp_er_bad_args;
+        // Gate: name_ptr non-null.
+        cmp r13, 0;
+        je  cp_er_bad_args;
+        // Gate: name_len non-zero (empty candidate is a bug).
+        cmp rcx, 0;
+        je  cp_er_empty_name;
+        // Gate: name_len <= COMP_NAME_MAX.
+        cmp rcx, 512;                        // COMP_NAME_MAX
+        ja  cp_er_too_long;
+        // Gate: kind in 1..COMP_KIND_MAX.
+        cmp r8, 0;
+        je  cp_er_bad_args;
+        cmp r8, 5;                           // COMP_KIND_MAX
+        ja  cp_er_bad_args;
+        // Gate: score <= COMP_SCORE_MAX.
+        cmp r9, 1000;                        // COMP_SCORE_MAX
+        ja  cp_er_bad_args;
+
+        // Compute record_len = (16 + name_len + 7) & ~7 rounded up to
+        // the next 8-multiple. Done via shr 3 / shl 3 rather than an
+        // AND with a 64-bit immediate mask -- both shifts take imm8.
+        // COMP_HEADER_SIZE (16) is already an 8-multiple, so the
+        // round-up only affects name_len's low 3 bits.
+        mov rax, rcx;
+        add rax, 16;                         // + header size
+        add rax, 7;                          // + rounding constant
+        shr rax, 3;                          // drop low 3 bits
+        shl rax, 3;                          // padded to next 8-mul
+        mov r14, rax;                        // r14 = record_len
+
+        // Gate: dst_len >= record_len.
+        cmp rsi, r14;
+        jb  cp_er_truncated;
+
+        // --- Compute qword1 = kind | (score << 16) | (name_len << 32)
+        // r15 accumulator. kind fits u16 (bounded above), score fits
+        // u16 (<= 1000), name_len fits u32 (<= 512).
+        mov r15, r8;                         // r15 = kind (low 16)
+        mov rax, r9;
+        shl rax, 16;                         // rax = score << 16
+        or  r15, rax;
+        mov rax, rcx;                        // name_len
+        shl rax, 32;                         // rax = name_len << 32
+        or  r15, rax;
+
+        // --- Write qword0 = magic | (record_len << 32) -------------
+        mov rax, r14;
+        shl rax, 32;                         // rax = record_len << 32
+        mov r10, 0x504d4f43;                 // COMP_MAGIC
+        or  rax, r10;                        // rax = magic | (record_len << 32)
+        mov [r12 + 0], rax;
+
+        // --- Write qword1 = kind | (score << 16) | (name_len << 32)
+        mov [r12 + 8], r15;
+
+        // --- Byte-copy candidate name -----------------------------
+        xor rbx, rbx;                        // i = 0
+      cp_er_copy_head:
+        cmp rbx, rcx;
+        jae cp_er_copy_done;
+        // Read one byte from name_ptr[i] via #1248 pattern.
+        xor rax, rax;
+        mov_b rax, [r13 + rbx];
+        // Write it at dst[COMP_HEADER_SIZE + i] = dst[16 + i].
+        mov_b [r12 + rbx + 16], rax;
+        add rbx, 1;
+        jmp cp_er_copy_head;
+      cp_er_copy_done:
+
+      cp_er_pad:
+        // Zero-pad from dst[COMP_HEADER_SIZE + name_len] to
+        // dst[record_len - 1]. Gap length is 0..7 bytes.
+        mov rbx, rcx;
+        add rbx, 16;                         // rbx = cursor
+      cp_er_pad_head:
+        cmp rbx, r14;
+        jae cp_er_pad_done;
+        xor rax, rax;
+        mov_b [r12 + rbx], rax;              // zero byte
+        add rbx, 1;
+        jmp cp_er_pad_head;
+      cp_er_pad_done:
+
+        // Record bytes_written = record_len.
+        lea r11, [rip + completion_bytes_written];
+        mov [r11], r14;
+
+        xor rax, rax;                        // COMP_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cp_er_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC80;                 // COMP_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cp_er_too_long:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC81;                 // COMP_ERR_TOO_LONG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cp_er_truncated:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC82;                 // COMP_ERR_TRUNCATED
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cp_er_empty_name:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC83;                 // COMP_ERR_EMPTY_NAME
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
