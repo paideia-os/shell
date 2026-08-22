@@ -1,0 +1,366 @@
+// src/session.pdx -- shell.M2-001 (paideia-os/shell#4)
+//
+// Session module: KIND_SHELL_SESSION = 0x194 wire builder.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The session-lifetime cap the shell mints once at _start (the login
+// path) and then derives sub-caps from for every child process. The
+// KIND itself is `KIND_SHELL_SESSION = 0x194`, derived over `KIND_USER`
+// per the R49-wave KIND ordinal table (design/tooling/r49-r50-plan.md
+// §5). The ordinal was reserved at M1 (`SH_KIND_SHELL_SESSION` in
+// src/shell.pdx line 89); M2-001 lands the mint helper + the sub-cap
+// derivation helper that produces the wire records the InitCap sidecar
+// carries to a child.
+//
+// The wire record shape is the same 16-byte Cap layout every capability
+// in the paideia-os ecosystem shares (per libpdx-cap M1 documentation,
+// src/cap.pdx §"Record layout"):
+//
+//   +0    u16 slot            target slot in the child's cap_table (0..255)
+//   +2    u16 kind            KIND_SHELL_SESSION = 0x194
+//   +4    u32 rights          SS_RIGHTS_* mask
+//   +8    u64 target_ptr      session_id (parent's session_id on a subcap)
+//
+// The wire is deliberately identical to libpdx-cap's Cap format so a
+// KIND_SHELL_SESSION Cap and a KIND_USER Cap ride the InitCap sidecar
+// with one loader-side validator. Shell does not link libpdx-cap for
+// this module -- the WIRE FORMAT is the public contract both modules
+// agree on. This mirrors how libpdx-cap and paideia-os's InitCap
+// sidecar validator agree on wire without either linking the other.
+//
+// =============================================================================
+// RIGHTS MASK
+// =============================================================================
+//
+//   SS_RIGHTS_READ   = 0x1   session-scope reads (history, prompt state)
+//   SS_RIGHTS_WRITE  = 0x2   session-scope writes (audit-log join point)
+//   SS_RIGHTS_MINT   = 0x4   authority to derive further sub-caps
+//   SS_RIGHTS_ALL    = 0x7   parent session-owner rights
+//   SS_RIGHTS_CHILD  = 0x3   child sub-cap rights (read + write, no mint)
+//
+// A child process receives its session cap with SS_RIGHTS_CHILD rights
+// so it can identify itself as belonging to this session (read) and
+// join the shell's audit stream (write) but cannot derive further
+// sub-caps of its own. Only the shell itself (which holds
+// SS_RIGHTS_MINT) can derive sub-caps. This is the strict-monotone-
+// narrowing discipline every cap forwarder in the ecosystem obeys --
+// same rule libpdx-cap's cap_pack_narrowed enforces at the byte level.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Session`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (slot bound = 256,
+//     rights masks fit in 3 bits, session_id compare is `cmp reg, 0`).
+//   - r11 is scratch. Not used here -- no .bss reach from this module;
+//     rdi / rsi / rdx / rcx / r8 remain untouched inputs and the two-
+//     qword store idiom needs only rax + r10.
+//   - No byte reads.
+//   - Both entry points are LEAF functions (call shell_note is the only
+//     nested call, wrapped in a single `sub rsp, 8` / `add rsp, 8`
+//     bracket after two callee-save pushes for the caller-owned dst).
+
+module Session = structure {
+
+  // ==========================================================================
+  // Format constants
+  // ==========================================================================
+
+  // Size of one Session Cap record on the wire (16 bytes). Same as
+  // libpdx-cap's CAP_ENTRY_SIZE and paideia-os's INIT_CAP_ENTRY_SIZE --
+  // deliberate: KIND_SHELL_SESSION rides the same InitCap sidecar as
+  // every other KIND.
+  pub let SS_CAP_ENTRY_SIZE : u64 = 16
+
+  // Maximum slot value (exclusive). Mirrors libpdx-cap's CAP_SLOT_MAX
+  // (256). A slot >= this bound cannot address a valid cap_table entry
+  // in the child; refused before touching dst.
+  pub let SS_SLOT_MAX : u64 = 256
+
+  // KIND_SHELL_SESSION ordinal -- mirror of SH_KIND_SHELL_SESSION in
+  // src/shell.pdx line 89. Local mirror keeps the two-qword store
+  // idiom's compare-immediate window small.
+  pub let SS_KIND : u64 = 0x194
+
+  // ==========================================================================
+  // Rights mask
+  // ==========================================================================
+  pub let SS_RIGHTS_READ   : u64 = 0x1
+  pub let SS_RIGHTS_WRITE  : u64 = 0x2
+  pub let SS_RIGHTS_MINT   : u64 = 0x4
+  pub let SS_RIGHTS_ALL    : u64 = 0x7    // read | write | mint
+  pub let SS_RIGHTS_CHILD  : u64 = 0x3    // read | write
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEC3x (Session module)
+  //
+  // The 0xFFFFECxx return-code band is owned by Shell (see
+  // design/architecture.md §5). Session uses the 0xFFFFEC3x row.
+  // ==========================================================================
+
+  // Success. session_mint and session_derive_subcap return 0 on the
+  // happy path (matches SH_OK convention: value 0 means "no error").
+  pub let SS_OK               : u64 = 0
+
+  // dst == 0 -- caller-owned buffer pointer must be non-null.
+  pub let SS_ERR_BAD_DST      : u64 = 0xFFFFEC30
+
+  // session_id == 0 -- a zero session_id is reserved for "unbound"
+  // and cannot appear in a live Cap. Refused before touching dst so
+  // the caller's buffer is not corrupted by a rejected mint.
+  pub let SS_ERR_BAD_ID       : u64 = 0xFFFFEC31
+
+  // slot >= SS_SLOT_MAX -- names a nonexistent cap_table entry.
+  pub let SS_ERR_BAD_SLOT     : u64 = 0xFFFFEC32
+
+  // ==========================================================================
+  // session_mint(dst, slot, session_id) -> u64
+  //
+  // Signature: session_mint : (u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst          -- VA of a 16-byte destination buffer
+  //                              (8-byte aligned; caller-owned)
+  // RSI (input): slot          -- target slot in the child's cap_table
+  //                              (0..255); else SS_ERR_BAD_SLOT
+  // RDX (input): session_id    -- non-zero session_id; else SS_ERR_BAD_ID
+  // RAX (output): SS_OK on success, else SS_ERR_BAD_DST | SS_ERR_BAD_ID |
+  //               SS_ERR_BAD_SLOT.
+  //
+  // Writes exactly 16 bytes to dst:
+  //   [dst+0]  = slot | (0x194 << 16) | (SS_RIGHTS_ALL << 32)
+  //   [dst+8]  = session_id
+  //
+  // This is the ROOT mint: the returned Cap carries SS_RIGHTS_ALL
+  // (read | write | MINT), so the shell itself can derive sub-caps
+  // for children. Called once at _start when the shell binds to the
+  // login-path session identifier the loader hands it.
+  //
+  // Fail-fast on dst / id / slot bounds; dst is NOT touched on any
+  // reject path so a caller that recycles a buffer sees the old
+  // contents when mint refuses -- same discipline as libpdx-cap
+  // cap_pack returning CAP_BAD_SLOT before any store.
+  //
+  // Bumps SH_ST_SESSIONS (slot 5) on every entry. Bumps SH_ST_ERRORS
+  // on every reject path.
+  //
+  // Register plan:
+  //   r12 = dst          (callee-save; preserved through shell_note)
+  //   r13 = slot         (callee-save; preserved through shell_note)
+  //   r14 = session_id   (callee-save; preserved through shell_note)
+  //   rax = qword0 accumulator / return value
+  //   r10 = 0xFFFF mask constant
+  //   rdi = which (for shell_note)
+  //
+  // Prologue: 3 pushes + `sub rsp, 8` = 32 bytes; rsp % 16 == 0 for
+  // the nested shell_note call. Matched `add rsp, 8` + 3 pops before
+  // every ret.
+  // ==========================================================================
+  pub let session_mint : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (slot: u64) (session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-001 (#4): mint the root KIND_SHELL_SESSION Cap. Wire layout matches libpdx-cap's Cap format (16 bytes, qword0 = slot | (kind << 16) | (rights << 32), qword1 = target_ptr). SS_RIGHTS_ALL includes the MINT bit so the shell can derive sub-caps for children -- this is the only Cap in the shell's own cap_table that carries the mint right. Three pushes (r12 dst, r13 slot, r14 session_id) preserve the args across the SH_ST_SESSIONS shell_note call; `sub rsp, 8` balances rsp % 16 to 0 (paideia-as SysV discipline, same idiom as elevate_client_lookup_broker in libpdx-elevate). dst / id / slot gates use `cmp reg, 0` and `cmp reg, 256` (both fit imm <= 0x7FFFFFFF). No byte reads; leaf memory writes are two qword stores. r11 unused (no .bss reach). Labels prefixed ss_mt_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;                          // align rsp % 16 for shell_note
+
+        mov r12, rdi;                        // dst
+        mov r13, rsi;                        // slot
+        mov r14, rdx;                        // session_id
+
+        // Bump SH_ST_SESSIONS (slot 5) unconditionally -- attempt-not-
+        // success counter, same discipline as line_reader / exec.
+        mov rdi, 5;                          // SH_ST_SESSIONS
+        call shell_note;
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  ss_mt_bad_dst;
+
+        // Gate: session_id non-zero.
+        cmp r14, 0;
+        je  ss_mt_bad_id;
+
+        // Gate: slot < SS_SLOT_MAX.
+        cmp r13, 256;
+        jae ss_mt_bad_slot;
+
+        // Assemble qword0 = slot | (SS_KIND << 16) | (SS_RIGHTS_ALL << 32).
+        // Slot fits in 16 bits (bound check above ensures < 256); KIND
+        // 0x194 fits in 16 bits by construction; rights 0x7 fits in 32
+        // bits with room to spare.
+        mov r10, 0xFFFF;                     // lane mask for slot lane
+
+        mov rax, r13;
+        and rax, r10;                        // rax = slot & 0xFFFF
+
+        // KIND lane: SS_KIND << 16 = 0x01940000 (fits imm32).
+        mov r10, 0x01940000;
+        or  rax, r10;
+
+        // Rights lane: SS_RIGHTS_ALL << 32 = 0x0000000700000000.
+        // Value exceeds imm32 window -- use r10 as large-imm scratch.
+        mov r10, 0x0000000700000000;
+        or  rax, r10;
+
+        // Store two qwords.
+        mov [r12 + 0], rax;                  // wire[0..7]
+        mov [r12 + 8], r14;                  // wire[8..15] = session_id
+
+        xor rax, rax;                        // SS_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      ss_mt_bad_dst:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC30;                 // SS_ERR_BAD_DST
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      ss_mt_bad_id:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC31;                 // SS_ERR_BAD_ID
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      ss_mt_bad_slot:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC32;                 // SS_ERR_BAD_SLOT
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // session_derive_subcap(dst, slot, parent_session_id) -> u64
+  //
+  // Signature: session_derive_subcap : (u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst                -- VA of a 16-byte destination buffer
+  // RSI (input): slot                -- target slot in the child's cap_table
+  // RDX (input): parent_session_id  -- session_id of the parent (this shell)
+  // RAX (output): SS_OK on success, else SS_ERR_BAD_DST | SS_ERR_BAD_ID |
+  //               SS_ERR_BAD_SLOT.
+  //
+  // Writes exactly 16 bytes to dst:
+  //   [dst+0]  = slot | (0x194 << 16) | (SS_RIGHTS_CHILD << 32)
+  //   [dst+8]  = parent_session_id
+  //
+  // This is the DERIVED sub-cap: the returned Cap carries SS_RIGHTS_CHILD
+  // (read | write, NO MINT), so the child cannot itself derive further
+  // sub-caps. This enforces strict monotone narrowing across the exec
+  // boundary -- same rule libpdx-cap's cap_pack_narrowed enforces at the
+  // byte level (`(narrowed & ~original) == 0` — SS_RIGHTS_CHILD is a
+  // strict subset of SS_RIGHTS_ALL, so the check succeeds trivially).
+  //
+  // Called once per child at exec time by the InitCap sidecar builder
+  // (M2-002's pipeline_plan will emit multiple derived-subcap requests
+  // per pipeline). The child's session_id is the parent's session_id --
+  // the whole pipeline shares one session so audit-journal readers can
+  // correlate a pipe of tools as a single unit of work.
+  //
+  // Bumps SH_ST_SESSIONS (slot 5) on every entry. Bumps SH_ST_ERRORS on
+  // every reject path.
+  //
+  // Register plan: identical to session_mint (only the rights mask
+  // constant differs).
+  // ==========================================================================
+  pub let session_derive_subcap : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (slot: u64) (parent_session_id: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-001 (#4): derive a child KIND_SHELL_SESSION Cap. Same wire idiom as session_mint but rights lane is SS_RIGHTS_CHILD (0x3 = read | write, no mint) so the strict-monotone-narrowing invariant is enforced at the constant level -- there is no way to accidentally hand a child the MINT right through this entry point. Parent's session_id becomes the child's session_id so audit-journal readers can correlate a pipeline as one work-unit. Same prologue / epilogue / gate discipline as session_mint. Labels prefixed ss_ds_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // dst
+        mov r13, rsi;                        // slot
+        mov r14, rdx;                        // parent_session_id
+
+        mov rdi, 5;                          // SH_ST_SESSIONS
+        call shell_note;
+
+        cmp r12, 0;
+        je  ss_ds_bad_dst;
+
+        cmp r14, 0;
+        je  ss_ds_bad_id;
+
+        cmp r13, 256;
+        jae ss_ds_bad_slot;
+
+        // qword0 = slot | (SS_KIND << 16) | (SS_RIGHTS_CHILD << 32).
+        mov r10, 0xFFFF;
+        mov rax, r13;
+        and rax, r10;                        // rax = slot & 0xFFFF
+
+        mov r10, 0x01940000;                 // SS_KIND << 16
+        or  rax, r10;
+
+        // Rights lane: SS_RIGHTS_CHILD << 32 = 0x0000000300000000.
+        mov r10, 0x0000000300000000;
+        or  rax, r10;
+
+        mov [r12 + 0], rax;
+        mov [r12 + 8], r14;
+
+        xor rax, rax;                        // SS_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      ss_ds_bad_dst:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC30;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      ss_ds_bad_id:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC31;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      ss_ds_bad_slot:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC32;
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+}

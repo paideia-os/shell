@@ -122,7 +122,9 @@ module Shell = structure {
   //   2 SH_ST_SPAWNS   exec_spawn_and_wait entries
   //   3 SH_ST_EXITS    exec_spawn_and_wait successful returns (M2+)
   //   4 SH_ST_ERRORS   any error / reject path from any shell module
-  //   5..7 reserved    for M2 (pipeline mints, session mints, ...)
+  //   5 SH_ST_SESSIONS session_mint + session_derive_subcap entries (M2-001)
+  //   6 SH_ST_PIPELINES pipeline_plan entries (M2-002)
+  //   7 SH_ST_HISTORY  history_encode_record entries (M2-005)
   //
   // Cache-line alignment matches _elevate_broker_stats / _elevate_
   // client_stats -- keeps a future SMP counter path a mechanical
@@ -130,12 +132,15 @@ module Shell = structure {
   // ==========================================================================
   pub let mut _shell_stats : [u64; 8] = uninit @align(64)
 
-  pub let SH_ST_PROMPTS : u64 = 0
-  pub let SH_ST_LINES   : u64 = 1
-  pub let SH_ST_SPAWNS  : u64 = 2
-  pub let SH_ST_EXITS   : u64 = 3
-  pub let SH_ST_ERRORS  : u64 = 4
-  pub let SH_ST_MAX     : u64 = 8
+  pub let SH_ST_PROMPTS  : u64 = 0
+  pub let SH_ST_LINES    : u64 = 1
+  pub let SH_ST_SPAWNS   : u64 = 2
+  pub let SH_ST_EXITS    : u64 = 3
+  pub let SH_ST_ERRORS   : u64 = 4
+  pub let SH_ST_SESSIONS : u64 = 5   // M2-001
+  pub let SH_ST_PIPELINES: u64 = 6   // M2-002
+  pub let SH_ST_HISTORY  : u64 = 7   // M2-005
+  pub let SH_ST_MAX      : u64 = 8
 
   // ==========================================================================
   // shell_reset() -> ()

@@ -138,6 +138,47 @@ keys; `led_history_up` / `led_history_down` for history browsing;
 the caller. The M1 skeleton predates the KIND_TTY wire that carries
 those keypresses, so the call graph is documented but not yet built.
 
+## 3a. `Session` module (src/session.pdx) — M2-001
+
+### 3a.1 Contract
+
+```
+session_mint(dst: u64, slot: u64, session_id: u64) -> u64
+session_derive_subcap(dst: u64, slot: u64, parent_session_id: u64) -> u64
+```
+
+Both entry points write a 16-byte `KIND_SHELL_SESSION` Cap record into
+the caller-owned `dst` buffer using the same wire layout every Cap in
+the ecosystem shares (matches libpdx-cap's `Cap` format at
+`src/cap.pdx`). `session_mint` writes with `SS_RIGHTS_ALL` (read | write
+| mint) — the shell's own root session Cap. `session_derive_subcap`
+writes with `SS_RIGHTS_CHILD` (read | write only, no mint) — a child's
+session Cap, strict-monotone-narrowed at the constant level.
+
+### 3a.2 Rights masks
+
+- `SS_RIGHTS_READ = 0x1` — session-scope reads.
+- `SS_RIGHTS_WRITE = 0x2` — session-scope writes (audit-log join).
+- `SS_RIGHTS_MINT = 0x4` — authority to derive further sub-caps.
+- `SS_RIGHTS_ALL = 0x7` — parent (this shell).
+- `SS_RIGHTS_CHILD = 0x3` — child (read + write only).
+
+### 3a.3 Error codes
+
+`SS_ERR_BAD_DST` (0xFFFFEC30), `SS_ERR_BAD_ID` (0xFFFFEC31), and
+`SS_ERR_BAD_SLOT` (0xFFFFEC32) — all three are fail-fast before any
+store to `dst`, matching libpdx-cap `cap_pack`'s "reject leaves the
+caller's buffer untouched" discipline.
+
+### 3a.4 Interaction with the InitCap sidecar
+
+The 16-byte wire record produced by these helpers is one entry in the
+child's InitCap sidecar (paideia-os `src/kernel/core/loader/
+init_caps.pdx`, R20b.M4-001). At M2-002 the pipeline planner emits one
+`session_derive_subcap` request per child stage; the returned bytes
+land contiguously in the child's sidecar buffer alongside the pipe
+endpoint Caps and the per-tool caps.decl requirements.
+
 ## 4. `Exec` module (src/exec.pdx)
 
 ### 4.1 Contract
@@ -189,6 +230,21 @@ stdin/stdout via a second InitCap sidecar entry.
 0xFFFFEC21  EX_ERR_BAD_ARGV     argv == 0 or argv_count == 0
 0xFFFFEC22  EX_ERR_EXECVE_FAIL  M2+: sys_execve refused the child
 0xFFFFEC23  EX_ERR_WAIT_FAIL    M2+: sys_wait4 returned an unexpected code
+0xFFFFEC24  EX_ERR_MISSING_CAP  M2+: child caps.decl names a KIND parent lacks
+0xFFFFEC25  EX_ERR_WIDENING     M2+: child asks for rights parent does not hold
+0xFFFFEC26  EX_ERR_SIDECAR_FULL M2+: sidecar dst buffer too small
+0xFFFFEC30  SS_ERR_BAD_DST      Session.M2: dst == 0
+0xFFFFEC31  SS_ERR_BAD_ID       Session.M2: session_id == 0
+0xFFFFEC32  SS_ERR_BAD_SLOT     Session.M2: slot >= 256
+0xFFFFEC40  PL_ERR_BAD_ARGS     Pipeline.M2: dst == 0 or stages == 0
+0xFFFFEC41  PL_ERR_TOO_MANY     Pipeline.M2: stages > PL_MAX_STAGES
+0xFFFFEC42  PL_ERR_DST_OVERFLOW Pipeline.M2: dst_max_entries insufficient
+0xFFFFEC50  PDS_ERR_BAD_ARGS    Pds.M2: buf == 0 or buf_len == 0
+0xFFFFEC51  PDS_ERR_MALFORMED   Pds.M2: pragma name not recognised
+0xFFFFEC52  PDS_ERR_OVERFLOW    Pds.M2: too many caps/imports/schemas
+0xFFFFEC60  HIST_ERR_BAD_ARGS   History.M2: dst == 0 or cmd_ptr == 0
+0xFFFFEC61  HIST_ERR_TOO_LONG   History.M2: cmd_len > HIST_CMD_MAX
+0xFFFFEC62  HIST_ERR_TRUNCATED  History.M2: dst_len < required
 ```
 
 The band sits below libpdx-elevate's `0xFFFFEA00..0xFFFFEA0F` and
