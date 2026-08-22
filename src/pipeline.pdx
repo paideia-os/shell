@@ -1,0 +1,397 @@
+// src/pipeline.pdx -- shell.M2-002 (paideia-os/shell#5)
+//
+// Pipeline module: plan the sidecar entries for a shell pipeline.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Given a pipeline of N stages (`a | b | c` has N = 3, two `|`
+// operators, and requires N - 1 = 2 pipe endpoints), pipeline_plan
+// produces the InitCap sidecar entries the exec layer will hand to
+// each child's loader. Each `|` mints one KIND_IPC_ENDPOINT (base
+// kind 5, R20b at paideia-os src/kernel/core/cap/kind_endpoint.pdx)
+// and every pipe produces TWO wire records: one for the writer stage
+// (stage[i], stdout slot 1), one for the reader stage (stage[i+1],
+// stdin slot 0). The two records carry the SAME pipe id in their
+// target_ptr so the loader-side validator can pair them.
+//
+// M2 semantics -- the SUBSTRATE for pipe endpoint mint is not yet
+// wired at HEAD (2026-08-21):
+//
+//   * KIND_IPC_ENDPOINT exists (R20b), and sys_svc_lookup /
+//     sys_ipc_send / sys_ipc_recv all land at R20b.M3.
+//   * The userspace syscall wrappers the shell needs (sys_ipc_recv
+//     into a fresh endpoint slot to MINT a new endpoint per pipe)
+//     do not exist in the shell repo at HEAD -- same substrate gap
+//     as line_reader.pdx and exec.pdx's M1 skeleton documents.
+//   * pipeline_plan writes wire records that CARRY placeholder pipe
+//     ids (0, 1, 2, ...); the M3+ substrate replaces the placeholders
+//     with the real endpoint ids sys_ipc_recv returns.
+//
+// The value of building the planner at M2 (and not deferring the
+// entire pipeline to M3) is that the sidecar LAYOUT -- which slots
+// each child needs, which rights each pipe endpoint carries -- is
+// fully determined at M2 and does not change when the substrate
+// lands. The M3 wiring only fills in the target_ptr field. This
+// mirrors libpdx-cap M2's "structure first, kernel-side wiring later"
+// discipline.
+//
+// =============================================================================
+// SIDECAR LAYOUT
+// =============================================================================
+//
+// A 3-stage pipeline `a | b | c` produces 4 wire records in the
+// sidecar (2 pipes x 2 records per pipe):
+//
+//   entry[0] : stage[0] (a) stdout slot 1  --> pipe 0 (writer, WRITE)
+//   entry[1] : stage[1] (b) stdin  slot 0  --> pipe 0 (reader, READ)
+//   entry[2] : stage[1] (b) stdout slot 1  --> pipe 1 (writer, WRITE)
+//   entry[3] : stage[2] (c) stdin  slot 0  --> pipe 1 (reader, READ)
+//
+// A 2-stage pipeline `a | b` produces 2 entries; a 4-stage pipeline
+// produces 6 entries. Pattern: 2 * (stages_count - 1). The exec layer
+// concatenates these with each child's session-cap entry (M2-001) and
+// each child's caps.decl-narrowed entries (M2-003) into a single
+// per-child sidecar.
+//
+// Each entry uses the 16-byte Cap wire format (per libpdx-cap
+// src/cap.pdx). The KIND field carries KIND_IPC_ENDPOINT = 5 (base
+// kind slot per R20b, mirror at SH_KIND_IPC_ENDPOINT in shell.pdx).
+// The rights lane carries either PL_RIGHTS_READ or PL_RIGHTS_WRITE
+// (never both -- pipes are unidirectional wire).
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Pipeline`), no directory prefix.
+//   - No `test` mnemonic; `cmp reg, 0` and `cmp reg, 8` (PL_MAX_STAGES)
+//     are the only compares; both fit imm <= 0x7FFFFFFF.
+//   - Every large immediate emitted via mov r10, imm64 (kind lane
+//     0x00050000, rights lanes 0x0000000100000000 / 0x0000000200000000,
+//     return codes 0xFFFFEC40..0xFFFFEC42).
+//   - r11 unused (no .bss reach; caller-owned buffer only).
+//   - No byte reads.
+//   - Non-leaf function -- calls shell_note. Four callee-save pushes
+//     (r12 dst, r13 stages_count, r14 dst_max, r15 first_slot) + `sub
+//     rsp, 8` = 40 bytes prologue; rsp % 16 == 0 for the nested call.
+
+module Pipeline = structure {
+
+  // ==========================================================================
+  // Format constants
+  // ==========================================================================
+
+  // Size of one pipe-endpoint Cap record on the wire (16 bytes). Same
+  // as Session.SS_CAP_ENTRY_SIZE and libpdx-cap CAP_ENTRY_SIZE.
+  pub let PL_CAP_ENTRY_SIZE : u64 = 16
+
+  // Two wire records per `|`: one WRITE for the upstream stage, one
+  // READ for the downstream stage.
+  pub let PL_ENTRIES_PER_PIPE : u64 = 2
+
+  // Maximum stages in a single pipeline. 8 is the practical ceiling
+  // for interactive shell use (a real pipeline of `a | b | c | d | e |
+  // f | g | h` is already at the edge of what a human reasons about);
+  // scripted / .pds pipelines exceeding this bound are rejected and
+  // the .pds M2-004 driver can split them across intermediate temps.
+  // Fits imm <= 0x7FFFFFFF by wide margin.
+  pub let PL_MAX_STAGES : u64 = 8
+
+  // KIND_IPC_ENDPOINT ordinal -- mirror of SH_KIND_IPC_ENDPOINT in
+  // src/shell.pdx (base kind slot 5, R20b).
+  pub let PL_KIND_IPC_ENDPOINT : u64 = 5
+
+  // Standard stdin / stdout slot indices in a child's cap_table --
+  // POSIX-analogous, adopted for muscle-memory: slot 0 = stdin,
+  // slot 1 = stdout, slot 2 = stderr. Session cap lands at slot 3
+  // (see M2-001 / M2-003). The pipeline planner uses slots 0 and 1
+  // only.
+  pub let PL_STDIN_SLOT  : u64 = 0
+  pub let PL_STDOUT_SLOT : u64 = 1
+
+  // ==========================================================================
+  // Rights masks
+  // ==========================================================================
+
+  // A pipe endpoint is unidirectional: the writer holds WRITE, the
+  // reader holds READ. Handing a single child both would create a
+  // loopback the loader-side validator would reject anyway; enforce
+  // the unidirectional invariant at the planner level (there is no
+  // code path in this module that writes both bits for one endpoint).
+  pub let PL_RIGHTS_READ  : u64 = 0x1
+  pub let PL_RIGHTS_WRITE : u64 = 0x2
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEC4x (Pipeline module)
+  // ==========================================================================
+
+  // Success. pipeline_plan returns SS_OK (0) on the happy path; the
+  // NUMBER OF ENTRIES written is placed in a caller-visible .bss slot
+  // (pipeline_entries_written below) so the caller can read the count
+  // without needing a two-return-value calling convention.
+  pub let PL_OK               : u64 = 0
+
+  // dst == 0 or stages_count == 0.
+  pub let PL_ERR_BAD_ARGS     : u64 = 0xFFFFEC40
+
+  // stages_count > PL_MAX_STAGES. Refused before any store to dst.
+  pub let PL_ERR_TOO_MANY     : u64 = 0xFFFFEC41
+
+  // dst_max_entries < 2 * (stages_count - 1). Refused before any
+  // store to dst so the caller's buffer stays untouched.
+  pub let PL_ERR_DST_OVERFLOW : u64 = 0xFFFFEC42
+
+  // ==========================================================================
+  // Caller-visible outputs (singleton .bss)
+  //
+  // pipeline_plan writes the number of entries produced into
+  // pipeline_entries_written so the caller can advance its sidecar
+  // cursor without recomputing the formula. Singleton pattern
+  // mirrors libpdx-cap's unpacked_* slots -- one pipeline_plan per
+  // exec is enough for M2's consumers.
+  // ==========================================================================
+  pub let mut pipeline_entries_written : u64 = uninit @align(8)
+
+  // ==========================================================================
+  // pipeline_reset()
+  //
+  // Signature: pipeline_reset : () -> () !{mem} @{}
+  //
+  // Zero the pipeline_entries_written slot. Called by tests before
+  // each fixture and by the exec layer before each new pipeline
+  // planning. Leaf function; r11 scratch; no push/pop parity.
+  // ==========================================================================
+  pub let pipeline_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-002 (#5): zero the pipeline_entries_written slot so a subsequent pipeline_plan starts from a known-empty baseline. xor rax, rax produces the zero; one lea + one mov write it. r11 scratch (paideia-as conformance). Leaf function.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + pipeline_entries_written];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pipeline_plan(dst, stages_count, dst_max_entries, first_slot) -> u64
+  //
+  // Signature: pipeline_plan : (u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input): dst              -- VA of the sidecar dst buffer
+  //                                  (must be 8-byte aligned; each
+  //                                  entry is 16 bytes)
+  // RSI (input): stages_count      -- number of pipeline stages
+  //                                  (2..PL_MAX_STAGES; 1 stage means
+  //                                  no pipes, returns entries=0
+  //                                  without error)
+  // RDX (input): dst_max_entries   -- maximum entries dst can hold
+  //                                  (16 * dst_max_entries = buffer
+  //                                  size in bytes)
+  // RCX (input): first_slot        -- unused at M2 (reserved for M3
+  //                                  when the shell mints endpoints
+  //                                  into its own cap_table before
+  //                                  handing them to children)
+  // RAX (output): PL_OK on success (entry count in
+  //               pipeline_entries_written), else PL_ERR_BAD_ARGS |
+  //               PL_ERR_TOO_MANY | PL_ERR_DST_OVERFLOW.
+  //
+  // Writes 2 * (stages_count - 1) 16-byte entries to dst. For each
+  // pipe p in 0..stages_count-1:
+  //
+  //   dst[2p + 0] : upstream WRITER  (KIND=5, rights=WRITE, ptr=p)
+  //   dst[2p + 1] : downstream READER (KIND=5, rights=READ,  ptr=p)
+  //
+  // The two entries carry the same target_ptr (the pipe id p) so a
+  // downstream consumer can pair them by ptr equality. Placeholder
+  // ids at M2; the M3 substrate wiring replaces them with real
+  // endpoint ids after sys_ipc_recv mints the actual endpoints.
+  //
+  // The per-child assignment (which entries go to which child's
+  // sidecar) is the exec layer's responsibility (M2-003), not this
+  // planner's -- the planner produces a FLAT sequence of entries; the
+  // exec layer splits them per child at spawn time.
+  //
+  // Fail-fast on stages_count / dst_max gates: dst is NOT touched on
+  // any reject path.
+  //
+  // Bumps SH_ST_PIPELINES (slot 6) on every entry. Bumps SH_ST_ERRORS
+  // on every reject path.
+  //
+  // Register plan:
+  //   r12 = dst              (callee-save; preserved through shell_note)
+  //   r13 = stages_count     (callee-save; preserved through shell_note)
+  //   r14 = dst_max_entries  (callee-save; preserved through shell_note)
+  //   r15 = pipe_count = stages_count - 1 (cached)
+  //   rbx = pipe index p (loop counter, 0..pipe_count-1)
+  //   rax = qword0 accumulator / return value
+  //   r10 = large-imm scratch
+  //   rdi = which (for shell_note)
+  //
+  // Prologue: 5 pushes (rbx, r12, r13, r14, r15) + sub rsp, 8 = 48
+  // bytes; rsp % 16 == 0 for shell_note. Matched epilogue at every
+  // return.
+  // ==========================================================================
+  pub let pipeline_plan : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (dst: u64) (stages_count: u64) (dst_max_entries: u64) (first_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.M2-002 (#5): produce the InitCap sidecar entries for a shell pipeline. For each `|` in `a | b | c ...`, emits two 16-byte Cap wire records: one WRITE cap for the upstream stage's stdout, one READ cap for the downstream stage's stdin. Both entries carry the same target_ptr (pipe id p) so the loader-side validator can pair them. 5 callee-save pushes (rbx pipe index, r12 dst, r13 stages_count, r14 dst_max, r15 pipe_count cache) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 for the nested shell_note call. Gates check dst != 0, stages_count > 0, stages_count <= 8 (PL_MAX_STAGES; fits imm <= 0x7FFFFFFF), and 2*(stages_count-1) <= dst_max_entries. Fail-fast on every gate before touching dst; the caller's buffer stays untouched on reject. Loop body writes qword0 = slot | (5 << 16) | (rights << 32); qword1 = pipe id p. All large immediates emitted via mov r10, imm64. Special case: stages_count == 1 means no pipes; returns PL_OK with entries=0 (a bare command is a valid pipeline of length 1). r11 unused. Labels prefixed pl_pl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                          // align rsp % 16 for shell_note
+
+        mov r12, rdi;                        // dst
+        mov r13, rsi;                        // stages_count
+        mov r14, rdx;                        // dst_max_entries
+        // rcx (first_slot) unused at M2
+
+        // Bump SH_ST_PIPELINES (slot 6) unconditionally.
+        mov rdi, 6;                          // SH_ST_PIPELINES
+        call shell_note;
+
+        // Gate: dst non-null.
+        cmp r12, 0;
+        je  pl_pl_bad_args;
+
+        // Gate: stages_count non-zero.
+        cmp r13, 0;
+        je  pl_pl_bad_args;
+
+        // Gate: stages_count <= PL_MAX_STAGES.
+        cmp r13, 8;                          // PL_MAX_STAGES
+        ja  pl_pl_too_many;
+
+        // Compute pipe_count = stages_count - 1. If stages_count == 1
+        // this is 0 and we skip the loop entirely, returning PL_OK
+        // with entries=0 (bare command is a valid pipeline).
+        mov r15, r13;
+        sub r15, 1;                          // r15 = pipe_count
+
+        // Gate: 2 * pipe_count <= dst_max_entries.
+        // Compute required = 2 * pipe_count via shl (no imul needed).
+        mov rax, r15;
+        shl rax, 1;                          // rax = 2 * pipe_count
+        cmp rax, r14;
+        ja  pl_pl_dst_overflow;
+
+        // If pipe_count == 0, skip the loop.
+        cmp r15, 0;
+        je  pl_pl_done_empty;
+
+        // Loop: for rbx = 0; rbx < pipe_count; rbx++
+        xor rbx, rbx;
+
+      pl_pl_loop_head:
+        // Entry 2p+0: upstream WRITER.
+        //   qword0 = PL_STDOUT_SLOT (1)
+        //           | (PL_KIND_IPC_ENDPOINT << 16)  (5 << 16 = 0x00050000)
+        //           | (PL_RIGHTS_WRITE << 32)        (2 << 32 = 0x200000000)
+        //   qword1 = rbx (pipe id p)
+        // Byte offset in dst = rbx * 32 + 0.
+        mov rax, 1;                          // slot = PL_STDOUT_SLOT
+        mov r10, 0x00050000;                 // kind lane: 5 << 16
+        or  rax, r10;
+        mov r10, 0x0000000200000000;         // rights lane: WRITE << 32
+        or  rax, r10;
+
+        // dst offset = rbx * 32 + 0 (each pipe = 2 entries = 32 bytes)
+        // Use scale=8 indexing via a temporary shift for x86-64 SIB
+        // (scale 32 is not a native SIB scale; compute the base ptr).
+        mov r10, rbx;
+        shl r10, 5;                          // r10 = rbx * 32
+        mov [r12 + r10 + 0], rax;            // wire[0..7] of writer
+        mov [r12 + r10 + 8], rbx;            // wire[8..15] = pipe id
+
+        // Entry 2p+1: downstream READER.
+        //   qword0 = PL_STDIN_SLOT (0)
+        //           | (PL_KIND_IPC_ENDPOINT << 16)
+        //           | (PL_RIGHTS_READ << 32)
+        //   qword1 = rbx (pipe id p)
+        // Byte offset in dst = rbx * 32 + 16.
+        xor rax, rax;                        // slot = PL_STDIN_SLOT (0)
+        mov r10, 0x00050000;                 // kind lane
+        or  rax, r10;
+        mov r10, 0x0000000100000000;         // rights lane: READ << 32
+        or  rax, r10;
+
+        mov r10, rbx;
+        shl r10, 5;                          // r10 = rbx * 32
+        mov [r12 + r10 + 16], rax;           // wire[0..7] of reader
+        mov [r12 + r10 + 24], rbx;           // wire[8..15] = pipe id
+
+        // Advance.
+        add rbx, 1;
+        cmp rbx, r15;                        // rbx < pipe_count?
+        jb  pl_pl_loop_head;
+
+        // Fall through to done: entries_written = 2 * pipe_count.
+        mov rax, r15;
+        shl rax, 1;
+        lea r11, [rip + pipeline_entries_written];
+        mov [r11], rax;
+        xor rax, rax;                        // PL_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pl_pl_done_empty:
+        // Bare command; entries_written = 0.
+        xor rax, rax;
+        lea r11, [rip + pipeline_entries_written];
+        mov [r11], rax;
+        xor rax, rax;                        // PL_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pl_pl_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC40;                 // PL_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pl_pl_too_many:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC41;                 // PL_ERR_TOO_MANY
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pl_pl_dst_overflow:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC42;                 // PL_ERR_DST_OVERFLOW
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

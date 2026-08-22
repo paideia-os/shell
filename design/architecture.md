@@ -179,6 +179,54 @@ init_caps.pdx`, R20b.M4-001). At M2-002 the pipeline planner emits one
 land contiguously in the child's sidecar buffer alongside the pipe
 endpoint Caps and the per-tool caps.decl requirements.
 
+## 3b. `Pipeline` module (src/pipeline.pdx) — M2-002
+
+### 3b.1 Contract
+
+```
+pipeline_plan(dst: u64, stages_count: u64, dst_max_entries: u64,
+              first_slot: u64) -> u64
+pipeline_reset() -> ()
+```
+
+Given a pipeline of N stages (`a | b | c` has N = 3, two `|`
+operators, and requires N-1 = 2 pipe endpoints), `pipeline_plan`
+writes `2*(N-1)` 16-byte Cap wire records into the caller-owned
+`dst` buffer. For each pipe p in `0..N-1`:
+
+- `dst[2p+0]` — upstream stage's stdout: KIND=5 (KIND_IPC_ENDPOINT),
+  rights=WRITE, target_ptr=p (placeholder pipe id).
+- `dst[2p+1]` — downstream stage's stdin: KIND=5, rights=READ,
+  target_ptr=p.
+
+The number of entries written is placed in the singleton
+`pipeline_entries_written` (`.bss`, 8-byte aligned) so the caller can
+advance its sidecar cursor without recomputing the formula.
+
+### 3b.2 Sidecar layout
+
+A 3-stage pipeline `a | b | c` produces 4 entries; a 4-stage pipeline
+produces 6. Pattern: `2 * (stages_count - 1)`. Bare command
+(`stages_count == 1`) produces 0 entries — valid pipeline of length 1.
+
+### 3b.3 Substrate deferral
+
+At M2 the `target_ptr` field carries a placeholder pipe id (`0, 1, 2,
+...`). The M3+ substrate wiring replaces these with real endpoint ids
+returned by `sys_ipc_recv`. This is the same "structure first, kernel-
+side wiring later" discipline libpdx-cap M2 followed for
+`cap_manifest_verify` — the layout is fully determined at M2, only
+the byte value in one field changes.
+
+### 3b.4 Error codes
+
+- `PL_ERR_BAD_ARGS` (0xFFFFEC40) — `dst == 0` or `stages_count == 0`.
+- `PL_ERR_TOO_MANY` (0xFFFFEC41) — `stages_count > PL_MAX_STAGES (8)`.
+- `PL_ERR_DST_OVERFLOW` (0xFFFFEC42) — dst too small for
+  `2*(stages_count-1)` entries.
+
+All three are fail-fast — `dst` is not touched on any reject path.
+
 ## 4. `Exec` module (src/exec.pdx)
 
 ### 4.1 Contract
