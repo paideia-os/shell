@@ -4,6 +4,36 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## 0.1.0 — 2026-09-03 — R106.SHELL-001 scaffold consolidation
+
+R106 wave opens. Repo version resets to the R106 wave's 0.1.0 baseline;
+R49's v1.0.0 encoder body remains in `src/` and continues to build
+under paideia-as v0.29.2. Scaffold consolidation lands the last
+pre-landing chores so R106.SHELL-002 (tokenizer) and R106.SHELL-003
+(test infra) can move code in without setup friction.
+
+### Added
+
+- `.gitignore` — build-out/, target/, *.o, *.elf, .DS_Store, and
+  common editor scratch.
+- README.md — R106 mission line, dependency chain (paideia-as +
+  libpdx-argv), cross-refs to paideia-os
+  `design/roadmap/persistent-home-wave.md` (wave plan) and
+  `design/user/content-addressed-identity.md` (novel identity model),
+  and cross-refs to R106.SHELL-002 (#41) and R106.SHELL-003 (#42).
+- STATUS.md — R106 milestone header + placeholder progress table;
+  R49 v1.0.0 material demoted to a historical section.
+
+### Changed
+
+- `manifest.pdxproj` version 1.0.0 → 0.1.0 (R106 wave baseline).
+
+### Cross-refs
+
+- Wave plan: paideia-os `design/roadmap/persistent-home-wave.md` §R106
+  + §"Cross-repo scaffolding".
+- Paired paideia-os issue: R106.M4-KERNEL.
+
 ## 1.0.0 — 2026-08-22
 
 **First stable release.** Shell binds itself to the `svc.login-shell`

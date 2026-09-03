@@ -1,8 +1,30 @@
 # shell — status
 
-**Wave:** R49 (Wave 1)
-**Current milestone:** M5 (1.0 signed release) — encoder half + doc source landed; substrate deferred
-**Version:** 1.0.0 (see `CHANGELOG.md`)
+**Current milestone:** R106 — shell scaffolding + tokenizer novel semantics
+**Version:** 0.1.0 (see `CHANGELOG.md`)
+**Wave plan:** paideia-os `design/roadmap/persistent-home-wave.md` §R106
+**Identity model:** paideia-os `design/user/content-addressed-identity.md`
+
+## R106 progress
+
+Placeholder — each row lands as its issue closes.
+
+| ID              | Title                                                  | State   |
+|-----------------|--------------------------------------------------------|---------|
+| R106.SHELL-001  | scaffold consolidation (.gitignore, README, STATUS, CHANGELOG) | LANDED  |
+| R106.SHELL-002  | tokenizer novel-tilde + bare-cd errors + dispatch entrypoint (#41) | pending |
+| R106.SHELL-003  | tokenizer + dispatcher test infrastructure (#42)       | pending |
+
+Cross-repo pair: paideia-os R106.M4-KERNEL (kernel-side integration
+surface).
+
+---
+
+## Historical: R49 (Wave 1) — v1.0.0
+
+**Prior wave:** R49 (Wave 1)
+**Prior milestone:** M5 (1.0 signed release) — encoder half + doc source landed; substrate deferred
+**Prior version:** 1.0.0
 **Release tag:** `v1.0.0`
 
 See `design/tooling/r49-r50-plan.md` §5.2 in paideia-os for the full

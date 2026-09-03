@@ -17,7 +17,7 @@
 # pkgs.paideia-os mirror push (see design/mirror-push.md).
 
 name        = shell
-version     = 1.0.0
+version     = 0.1.0
 kind        = tool
 entry       = Shell::shell_main
 output      = build-out/shell
