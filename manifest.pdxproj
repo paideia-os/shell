@@ -35,6 +35,7 @@ sources:
   - src/syscall.pdx               # ENH-001 (#28): SC+ sysno constants + wrappers
   - src/shell.pdx                 # M1-001: top-level scaffold + stats
   - src/lexer.pdx                 # ENH-002 (#29): command-line tokenizer
+  - src/parser.pdx                # ENH-003 (#30): pipeline/argv parser over Lexer's token stream
   - src/line_reader.pdx           # M1-002: LineReader skeleton
   - src/exec.pdx                  # M1-003 + M2-003: Exec skeleton + narrow-caps
   - src/session.pdx               # M2-001: KIND_SHELL_SESSION mint + derive
@@ -77,6 +78,7 @@ tests:
   - tests/test_release_manifest.pdx # M5-001: release-manifest encoder goldens
   - tests/test_syscall_floor.pdx   # ENH-001 (#28): SC+ shim runtime fingerprint
   - tests/test_lexer.pdx           # ENH-002 (#29): lexer golden-fingerprint matrix
+  - tests/test_parser.pdx          # ENH-003 (#30): parser fingerprint + parser->pipeline_plan golden feed
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

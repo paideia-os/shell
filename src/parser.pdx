@@ -1,0 +1,565 @@
+// src/parser.pdx -- shell.ENH-003 (paideia-os/shell#30)
+//
+// Parser module: consume the Lexer token stream and produce a
+// command list of pipelines-of-stages.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The v1.0.0 audit (design/enhancement-plan.md §4 Stage 1) noted that
+// `Pipeline::pipeline_plan` (src/pipeline.pdx:236) takes a pre-counted
+// integer `stages_count`, and `CommandRecord::command_record_begin`
+// (src/command_record.pdx) takes per-stage null-separated argv text +
+// byte length -- both were written to be FED but nobody wrote the
+// feeder. ENH-002 (#29) closed the byte-level split by landing the
+// Lexer. ENH-003 closes the pipeline-level split by landing this
+// parser.
+//
+// Given the token stream the Lexer produced in `_lx_tokens` /
+// `_lx_token_count` (populated by a prior lexer_tokenize call on the
+// same input buffer), the parser builds:
+//
+//   * A per-stage record table `_pr_stages`, one entry per pipeline
+//     stage. Each entry is three qwords:
+//       qword0 = argv_offset (byte offset into _pr_argv_pool)
+//       qword1 = argv_bytes  (total pool bytes for this stage,
+//                             including the NUL separators and the
+//                             trailing NUL after the last word)
+//       qword2 = argc        (number of words / arguments)
+//   * A contiguous byte pool `_pr_argv_pool`, into which each stage's
+//     words are copied byte-for-byte from the caller-owned source
+//     buffer, NUL-separated, with a trailing NUL after the last word.
+//     A 3-word stage `ls -la /tmp` becomes `ls\0-la\0/tmp\0` in the
+//     pool -- 12 bytes, argc=3, argv_bytes=12.
+//   * A count singleton `_pr_stage_count` (0..PR_MAX_STAGES).
+//
+// The output shape is designed against the input signatures the two
+// existing encoders already expose:
+//
+//   - stage_count      -> Pipeline::pipeline_plan's stages_count
+//   - argv pool base + stage's argv_offset
+//                      -> CommandRecord::command_record_begin's
+//                         argv_ptr
+//   - stage's argv_bytes
+//                      -> CommandRecord::command_record_begin's
+//                         argv_bytes
+//
+// The 2-stage smoke fixture `ls | cat` yields stage_count=2 and two
+// argv slices (`ls\0` at offset 0 length 3 argc=1; `cat\0` at offset
+// 3 length 4 argc=1); the tests/test_parser.pdx golden-feed case
+// wires this parser output into pipeline_plan and asserts the
+// resulting bytes byte-match the tsm_case_pipeline golden.
+//
+// =============================================================================
+// TOKEN CLASSES HANDLED
+// =============================================================================
+//
+// TOK_WORD (kind=1) and TOK_PIPE (kind=2) are handled directly. The
+// remaining four lexer token kinds (TOK_REDIR_IN=3, TOK_REDIR_OUT=4,
+// TOK_SEMI=5, TOK_AMP=6) are SILENTLY SKIPPED at ENH-003 -- the
+// issue's scope is pipes-and-argv only. Redirection lands with
+// ENH-004/ENH-005; semicolon/ampersand (statement separator, async)
+// with the REPL work in ENH-006. Any semantics that would give those
+// operators effect is deferred to those enhancements; the parser at
+// ENH-003 walks past them so a caller running `ls > /tmp/f` today
+// gets one stage with argv `ls\0/tmp/f\0` (which is wrong for a real
+// shell, but is out of scope for this issue and will be corrected
+// when redirection lands).
+//
+// =============================================================================
+// STORAGE
+// =============================================================================
+//
+//   _pr_stages       [u64; 24]     -- 8 stages * 3 qwords each
+//                                     byte offset for stage i: i * 24
+//   _pr_stage_count  u64           -- number of stages populated
+//                                     (0..PR_MAX_STAGES)
+//   _pr_argv_pool    [u8; 4096]    -- contiguous byte pool for all
+//                                     stages' argv text
+//
+// Written to the count + stages table + pool ONLY on the PR_OK success
+// path; on any error path they may hold partial state that the caller
+// must not read -- the return code is the authoritative signal.
+// Mirrors lexer_tokenize's discipline for _lx_token_count.
+//
+// Pool size 4096 is a generous headroom for interactive shell lines
+// (a typical line is well under 256 bytes; 128 tokens * ~30 bytes each
+// is the pessimistic ceiling and still fits). PR_ERR_ARGV_POOL_OVERFLOW
+// gates the write path so a pathological input rejects rather than
+// scribbles.
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFECDx
+// =============================================================================
+//
+// Fresh sub-band; disjoint from every existing shell 0xFFFFECxx
+// allocation. The 0xFFFFECCx band is Lexer (ENH-002); the next unused
+// sub-band above it is 0xFFFFECDx.
+//
+//   PR_OK                     = 0
+//   PR_ERR_TOO_MANY_STAGES    = 0xFFFFECD0   > PR_MAX_STAGES (8) stages
+//   PR_ERR_LEADING_PIPE       = 0xFFFFECD1   line starts with `|`
+//   PR_ERR_TRAILING_PIPE      = 0xFFFFECD2   line ends with `|`
+//   PR_ERR_EMPTY_STAGE        = 0xFFFFECD3   two `|` with nothing between
+//   PR_ERR_ARGV_POOL_OVERFLOW = 0xFFFFECD4   words don't fit in _pr_argv_pool
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Parser`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest is
+//     PR_ARGV_POOL_SIZE = 4096 in the overflow gate; kind/stage_count
+//     compares use single-digit imms.
+//   - Large immediates (0xFFFFECD0..0xFFFFECD4 error sentinels) emitted
+//     via `mov rax, imm32` (same form Lexer uses for 0xFFFFECC0..3).
+//   - r11 reserved as .bss LEA scratch for the singletons.
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr]`; byte writes via
+//     `mov_b [ptr], rax`. Same #1248 pattern history.pdx / command_
+//     record.pdx / completion.pdx use.
+//   - Non-leaf function: nested `call shell_note` on reject paths. 5
+//     callee-save pushes (rbx tok index, r12 input_ptr, r13 pool_base,
+//     r14 pool_write_ptr, r15 stage_count) + `sub rsp, 16` (local
+//     scratch: argv_start_ptr + argc) = 56 bytes prologue; rsp % 16
+//     == 0 for shell_note. Matched epilogue at every return.
+//   - Labels prefixed `pr_ps_` (parser_parse) and `pr_rs_`
+//     (parser_reset) per issue directive.
+
+module Parser = structure {
+
+  // ==========================================================================
+  // Storage caps
+  // ==========================================================================
+
+  // Maximum pipeline stages; matches Pipeline::PL_MAX_STAGES so a valid
+  // parser output can always be handed to pipeline_plan without a
+  // second gate. Fits imm <= 0x7FFFFFFF.
+  pub let PR_MAX_STAGES     : u64 = 8
+
+  // Bytes per stage record (argv_offset + argv_bytes + argc, three qwords).
+  pub let PR_STAGE_REC_SIZE : u64 = 24
+
+  // Bytes in the argv pool. Sized well above the working set for
+  // interactive lines (typical <256 bytes) with headroom for a
+  // Lexer-max 128-word line. Fits imm <= 0x7FFFFFFF by wide margin.
+  pub let PR_ARGV_POOL_SIZE : u64 = 4096
+
+  // ==========================================================================
+  // Token kind discriminators (mirror Lexer)
+  //
+  // Redeclared here so the parser body can name them without an
+  // explicit Lexer module import at every compare. Same values as
+  // Lexer::TOK_WORD (=1) and Lexer::TOK_PIPE (=2); a drift is caught
+  // at build time by the smoke matrix (a parser that read the wrong
+  // kind constants would emit obviously wrong stage bounds).
+  // ==========================================================================
+  pub let PR_TOK_WORD : u64 = 1
+  pub let PR_TOK_PIPE : u64 = 2
+
+  // ==========================================================================
+  // Return-code band 0xFFFFECDx (Parser module)
+  // ==========================================================================
+  pub let PR_OK                     : u64 = 0
+  pub let PR_ERR_TOO_MANY_STAGES    : u64 = 0xFFFFECD0
+  pub let PR_ERR_LEADING_PIPE       : u64 = 0xFFFFECD1
+  pub let PR_ERR_TRAILING_PIPE      : u64 = 0xFFFFECD2
+  pub let PR_ERR_EMPTY_STAGE        : u64 = 0xFFFFECD3
+  pub let PR_ERR_ARGV_POOL_OVERFLOW : u64 = 0xFFFFECD4
+
+  // ==========================================================================
+  // Singleton state (.bss)
+  //
+  // _pr_stages layout: 8 stages * 3 qwords = 24 qwords = 192 bytes.
+  // Byte offset for stage i:  i * 24
+  //   [i*24 +  0]  qword0 = argv_offset in _pr_argv_pool
+  //   [i*24 +  8]  qword1 = argv_bytes  (total bytes for this stage
+  //                          in the pool, including all NULs)
+  //   [i*24 + 16]  qword2 = argc        (number of words)
+  //
+  // @align(16) for cache-line-friendly access and to match the 16-byte
+  // Cap wire record boundary the downstream planners use.
+  // ==========================================================================
+  pub let mut _pr_stages      : [u64; 24]   = uninit @align(16)
+  pub let mut _pr_stage_count : u64         = uninit @align(8)
+  pub let mut _pr_argv_pool   : [u8; 4096]  = uninit @align(16)
+
+  // ==========================================================================
+  // parser_reset()
+  //
+  // Signature: parser_reset : () -> () !{mem} @{}
+  //
+  // Zero the _pr_stage_count slot. The _pr_stages array and the
+  // _pr_argv_pool byte pool need not be zeroed -- callers only read
+  // stage entries [0..stage_count) and pool bytes referenced by those
+  // stages' (argv_offset, argv_bytes) spans; stale bytes past those
+  // bounds are unobservable. Mirrors lexer_reset's discipline.
+  //
+  // Leaf function; r11 as .bss scratch.
+  // ==========================================================================
+  pub let parser_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): zero the _pr_stage_count slot so a subsequent parser_parse starts from a known-empty count. Only the count needs zeroing -- the _pr_stages array and _pr_argv_pool hold slots read only up to `stage_count` and bytes read only within each stage's (argv_offset, argv_bytes) span; stale content past those boundaries is unobservable. xor rax, rax produces the zero; one lea + one mov write it. r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed pr_rs_.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _pr_stage_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // parser_parse(input_ptr, input_len) -> u64
+  //
+  // Signature: parser_parse : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): input_ptr -- VA of the SAME caller-owned byte buffer
+  //                            a prior lexer_tokenize was invoked on.
+  //                            The lexer's tokens carry offsets INTO
+  //                            this buffer; the parser resolves each
+  //                            word's bytes by adding tok.offset to
+  //                            input_ptr.
+  // RSI (input): input_len -- length in bytes of that buffer (unused
+  //                            in the body after prologue; kept in
+  //                            the signature for symmetry with
+  //                            lexer_tokenize and defensively usable
+  //                            by a future bounds check).
+  // RAX (output): PR_OK on success (stage_count in _pr_stage_count,
+  //               per-stage records in _pr_stages, argv text in
+  //               _pr_argv_pool), else PR_ERR_TOO_MANY_STAGES |
+  //               PR_ERR_LEADING_PIPE | PR_ERR_TRAILING_PIPE |
+  //               PR_ERR_EMPTY_STAGE | PR_ERR_ARGV_POOL_OVERFLOW.
+  //
+  // Algorithm:
+  //
+  //   pool_write_ptr = pool_base
+  //   argv_start_ptr = pool_base       (start of current stage)
+  //   argc = 0                          (words in current stage)
+  //   stage_count = 0
+  //   for i in 0..n_tokens:
+  //     tok = _lx_tokens[i]
+  //     if tok.kind == PIPE:
+  //       if argc == 0:                (starting_new_stage)
+  //         if stage_count == 0: return PR_ERR_LEADING_PIPE
+  //         else:                return PR_ERR_EMPTY_STAGE
+  //       if stage_count >= PR_MAX_STAGES: return PR_ERR_TOO_MANY_STAGES
+  //       stages[stage_count] = (argv_start_ptr - pool_base,
+  //                              pool_write_ptr - argv_start_ptr,
+  //                              argc)
+  //       stage_count += 1
+  //       argv_start_ptr = pool_write_ptr
+  //       argc = 0
+  //     elif tok.kind == WORD:
+  //       need = pool_write_ptr - pool_base + tok.length + 1
+  //       if need > PR_ARGV_POOL_SIZE: return PR_ERR_ARGV_POOL_OVERFLOW
+  //       for j in 0..tok.length:
+  //         *pool_write_ptr++ = input_ptr[tok.offset + j]
+  //       *pool_write_ptr++ = 0             (NUL separator)
+  //       argc += 1
+  //     else:  # REDIR_IN / REDIR_OUT / SEMI / AMP -- skip at ENH-003
+  //       pass
+  //
+  //   # End of tokens.
+  //   if argc > 0:
+  //     if stage_count >= PR_MAX_STAGES: return PR_ERR_TOO_MANY_STAGES
+  //     stages[stage_count] = (..., ..., argc); stage_count += 1
+  //   else:
+  //     if stage_count > 0: return PR_ERR_TRAILING_PIPE
+  //     # else: empty input, 0 stages, PR_OK
+  //   _pr_stage_count = stage_count
+  //   return PR_OK
+  //
+  // starting_new_stage is IMPLICITLY encoded as (argc == 0): a WORD
+  // increments argc; a PIPE resets it after finalizing. This avoids a
+  // separate boolean flag.
+  //
+  // Bumps SH_ST_ERRORS on every reject path (matches lexer_tokenize
+  // discipline). No SH_ST_PIPELINES bump here -- that slot belongs to
+  // pipeline_plan (the downstream consumer).
+  //
+  // Register plan:
+  //   r12 = input_ptr           (callee-save; preserved through shell_note)
+  //   r13 = pool_base           (callee-save; loaded once via lea)
+  //   r14 = pool_write_ptr      (callee-save; advances as bytes land)
+  //   r15 = stage_count         (callee-save)
+  //   rbx = token index i       (callee-save)
+  //   [rsp + 0] = argv_start_ptr (stack scratch; start of current stage)
+  //   [rsp + 8] = argc           (stack scratch; words in current stage)
+  //   rax = general scratch (byte load / tok kind / return value)
+  //   rcx = word length loop counter / general scratch
+  //   rdx = tok.offset / source byte pointer scratch
+  //   r10 = arithmetic scratch (token-record byte-offset compute)
+  //   r11 = .bss LEA scratch
+  //
+  // Prologue: 5 callee-save pushes (40 bytes) + `sub rsp, 16` (16
+  // bytes) = 56 bytes. Entry rsp % 16 == 8 (return addr); after 5
+  // pushes rsp % 16 == 0; `sub rsp, 16` preserves that, so rsp % 16
+  // == 0 at every nested `call shell_note`. Matched epilogue at every
+  // return.
+  // ==========================================================================
+  pub let parser_parse : (u64, u64) -> u64 !{mem} @{} =
+    fn (input_ptr: u64) (input_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): consume the Lexer's _lx_tokens / _lx_token_count singletons (populated by a prior lexer_tokenize call on the SAME input_ptr the parser now receives) and produce a command list of pipelines-of-stages. Each pipeline stage is emitted as (argv_offset, argv_bytes, argc) into _pr_stages, with the stage's words copied byte-for-byte into _pr_argv_pool NUL-separated and NUL-terminated. Output shape is designed against Pipeline::pipeline_plan's stages_count input and CommandRecord::command_record_begin's (argv_ptr, argv_bytes) inputs -- both encoders were written to be fed but had no feeder until this issue. Enforces PR_MAX_STAGES (=Pipeline::PL_MAX_STAGES=8), and rejects leading pipe / trailing pipe / empty stage / pool overflow with distinct 0xFFFFECDx codes. Ignores non-WORD, non-PIPE tokens (REDIR_*, SEMI, AMP) at ENH-003 -- those operators need semantics that land in ENH-004 / ENH-005 / ENH-006. starting_new_stage is IMPLICITLY (argc == 0): a WORD increments argc, a PIPE resets it after finalizing the just-completed stage. Byte reads via `xor rax, rax; mov_b rax, [rdx]`; byte writes via `mov_b [r14], rax` (r14 is a live pool_write_ptr, no base+index needed for the store). Token record byte offset = i * 24 computed via r10 shl/add/shl (avoids 2-op imul r,imm pitfall from feedback_pdx_encoder_pitfalls). All large immediates (0xFFFFECD0..0xFFFFECD4) emitted via mov rax, imm32 (same form Lexer uses for 0xFFFFECCx). Prologue: 5 callee-save pushes (rbx tok index, r12 input_ptr, r13 pool_base, r14 pool_write_ptr, r15 stage_count) + `sub rsp, 16` (local scratch [rsp+0]=argv_start_ptr, [rsp+8]=argc) = 56 bytes; rsp % 16 == 0 for shell_note. Matched epilogue at every return. Bumps SH_ST_ERRORS on every reject path (matches lexer_tokenize discipline). Labels prefixed pr_ps_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 16;                         // [rsp+0] argv_start_ptr, [rsp+8] argc
+
+        mov r12, rdi;                        // input_ptr
+        // rsi (input_len) unused after prologue; kept alive for signature parity
+
+        // Init state.
+        lea r13, [rip + _pr_argv_pool];      // pool_base
+        mov r14, r13;                        // pool_write_ptr = pool_base
+        mov [rsp + 0], r13;                  // argv_start_ptr = pool_base
+        xor rax, rax;
+        mov [rsp + 8], rax;                  // argc = 0
+        xor r15, r15;                        // stage_count = 0
+        xor rbx, rbx;                        // tok index = 0
+
+      pr_ps_loop:
+        // n_tokens := _lx_token_count (reload each iteration; cheap
+        // and keeps rax free elsewhere in the body).
+        lea r11, [rip + _lx_token_count];
+        mov rax, [r11];
+        cmp rbx, rax;
+        jae pr_ps_end_of_tokens;
+
+        // Compute token record byte offset r10 = rbx * 24
+        // = (rbx * 3) << 3.
+        mov r10, rbx;
+        shl r10, 1;                          // r10 = rbx * 2
+        add r10, rbx;                        // r10 = rbx * 3
+        shl r10, 3;                          // r10 = rbx * 24
+
+        // Load token[rbx].kind.
+        lea r11, [rip + _lx_tokens];
+        mov rax, [r11 + r10 * 1 + 16];
+
+        cmp rax, 2;                          // PR_TOK_PIPE
+        je  pr_ps_on_pipe;
+        cmp rax, 1;                          // PR_TOK_WORD
+        je  pr_ps_on_word;
+
+        // Other tokens (REDIR_IN=3, REDIR_OUT=4, SEMI=5, AMP=6) --
+        // silently skipped at ENH-003; semantics land in later
+        // enhancements.
+        add rbx, 1;
+        jmp pr_ps_loop;
+
+        // ------------------------------------------------------------
+        // On TOK_PIPE.
+        // ------------------------------------------------------------
+      pr_ps_on_pipe:
+        // If argc == 0 the current stage has no words -- either
+        // leading pipe (stage_count == 0) or empty stage between two
+        // pipes (stage_count > 0).
+        mov rax, [rsp + 8];
+        cmp rax, 0;
+        jne pr_ps_pipe_finalize;
+        cmp r15, 0;
+        je  pr_ps_leading_pipe;
+        jmp pr_ps_empty_stage;
+
+      pr_ps_pipe_finalize:
+        // Overflow gate before finalize: stage_count < PR_MAX_STAGES?
+        cmp r15, 8;
+        jae pr_ps_too_many_stages;
+
+        // Compute stage record byte offset r10 = r15 * 24.
+        mov r10, r15;
+        shl r10, 1;
+        add r10, r15;
+        shl r10, 3;
+
+        lea r11, [rip + _pr_stages];
+        // qword0 = argv_offset = argv_start_ptr - pool_base.
+        mov rax, [rsp + 0];
+        sub rax, r13;
+        mov [r11 + r10 * 1 + 0], rax;
+        // qword1 = argv_bytes = pool_write_ptr - argv_start_ptr.
+        mov rax, r14;
+        sub rax, [rsp + 0];
+        mov [r11 + r10 * 1 + 8], rax;
+        // qword2 = argc.
+        mov rax, [rsp + 8];
+        mov [r11 + r10 * 1 + 16], rax;
+
+        add r15, 1;                          // stage_count++
+        // Reset for next stage.
+        mov [rsp + 0], r14;                  // argv_start_ptr = pool_write_ptr
+        xor rax, rax;
+        mov [rsp + 8], rax;                  // argc = 0
+
+        add rbx, 1;                          // consume the pipe token
+        jmp pr_ps_loop;
+
+        // ------------------------------------------------------------
+        // On TOK_WORD.
+        // ------------------------------------------------------------
+      pr_ps_on_word:
+        // Reload tok.offset (qword0) and tok.length (qword1).
+        // r10 already = rbx * 24 from the top of this iteration.
+        lea r11, [rip + _lx_tokens];
+        mov rdx, [r11 + r10 * 1 + 0];        // tok.offset (into source)
+        mov rcx, [r11 + r10 * 1 + 8];        // tok.length
+
+        // Pool overflow gate: (pool_write_ptr - pool_base) + tok.length
+        // + 1 > PR_ARGV_POOL_SIZE?
+        mov rax, r14;
+        sub rax, r13;                        // current pool offset
+        add rax, rcx;                        // + word length
+        add rax, 1;                          // + trailing NUL
+        cmp rax, 4096;                       // PR_ARGV_POOL_SIZE (imm32)
+        ja  pr_ps_pool_overflow;
+
+        // Resolve source byte pointer: rdx = input_ptr + tok.offset.
+        add rdx, r12;
+
+      pr_ps_copy_loop:
+        cmp rcx, 0;
+        je  pr_ps_copy_done;
+        xor rax, rax;
+        mov_b rax, [rdx];
+        mov_b [r14 + 0], rax;
+        add rdx, 1;
+        add r14, 1;
+        sub rcx, 1;
+        jmp pr_ps_copy_loop;
+
+      pr_ps_copy_done:
+        // Write NUL separator after the word.
+        xor rax, rax;
+        mov_b [r14 + 0], rax;
+        add r14, 1;
+
+        // argc++.
+        mov rax, [rsp + 8];
+        add rax, 1;
+        mov [rsp + 8], rax;
+
+        add rbx, 1;                          // consume the word token
+        jmp pr_ps_loop;
+
+        // ------------------------------------------------------------
+        // End of tokens: finalize the trailing stage (if any).
+        // ------------------------------------------------------------
+      pr_ps_end_of_tokens:
+        mov rax, [rsp + 8];
+        cmp rax, 0;
+        je  pr_ps_check_final;
+
+        // argc > 0: emit the final stage.
+        cmp r15, 8;
+        jae pr_ps_too_many_stages;
+
+        mov r10, r15;
+        shl r10, 1;
+        add r10, r15;
+        shl r10, 3;
+        lea r11, [rip + _pr_stages];
+        mov rax, [rsp + 0];
+        sub rax, r13;
+        mov [r11 + r10 * 1 + 0], rax;
+        mov rax, r14;
+        sub rax, [rsp + 0];
+        mov [r11 + r10 * 1 + 8], rax;
+        mov rax, [rsp + 8];
+        mov [r11 + r10 * 1 + 16], rax;
+        add r15, 1;
+        jmp pr_ps_publish;
+
+      pr_ps_check_final:
+        // argc == 0. Either empty input (stage_count == 0) OR trailing
+        // pipe (stage_count > 0 -- last token was a PIPE that reset
+        // argc but there was no following word).
+        cmp r15, 0;
+        je  pr_ps_publish;
+        jmp pr_ps_trailing_pipe;
+
+        // ------------------------------------------------------------
+        // Success epilogue.
+        // ------------------------------------------------------------
+      pr_ps_publish:
+        lea r11, [rip + _pr_stage_count];
+        mov [r11], r15;
+        xor rax, rax;                        // PR_OK
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        // ------------------------------------------------------------
+        // Reject epilogues. Each bumps SH_ST_ERRORS (slot 4) and
+        // returns the corresponding 0xFFFFECDx sentinel.
+        // ------------------------------------------------------------
+      pr_ps_too_many_stages:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECD0;                 // PR_ERR_TOO_MANY_STAGES
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pr_ps_leading_pipe:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECD1;                 // PR_ERR_LEADING_PIPE
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pr_ps_trailing_pipe:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECD2;                 // PR_ERR_TRAILING_PIPE
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pr_ps_empty_stage:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECD3;                 // PR_ERR_EMPTY_STAGE
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      pr_ps_pool_overflow:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECD4;                 // PR_ERR_ARGV_POOL_OVERFLOW
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

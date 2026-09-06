@@ -319,6 +319,124 @@ The umbrella driver `tlx_run_all` matches the
 `taf_run_all` shape so the future boot-time smoke harness invokes
 all six drivers in one loop with a uniform return-code contract.
 
+## 2c. `Parser` module (src/parser.pdx) — ENH-003 (#30)
+
+### 2c.1 Purpose
+
+The missing pipeline-level split. At `v1.0.0` (and through ENH-002)
+`Pipeline::pipeline_plan` (`src/pipeline.pdx:236`) took a pre-counted
+integer `stages_count`, and `CommandRecord::command_record_begin`
+(`src/command_record.pdx`) took per-stage null-separated argv text —
+both were written to be FED but nobody wrote the feeder. ENH-002
+landed the byte-level split (Lexer); ENH-003 lands the pipeline-level
+split. Every downstream consumer (builtin dispatch at ENH-004, real
+exec at ENH-005, REPL at ENH-006) will consume this parser's output.
+
+### 2c.2 Contract
+
+```
+parser_parse(input_ptr: u64, input_len: u64) -> u64
+parser_reset() -> ()
+```
+
+Given the token stream a prior `lexer_tokenize` populated in
+`_lx_tokens` / `_lx_token_count` on the SAME input buffer, the parser
+resolves each `TOK_WORD`'s bytes (via `input_ptr + tok.offset`) into a
+contiguous argv byte pool, and emits a per-stage record table.
+
+### 2c.3 Output shape
+
+- `_pr_stages : [u64; 24]` — 8 stages × 3 qwords each (byte offset
+  `i*24` = stage `i`). Layout per stage: qword0 = argv_offset (byte
+  offset into `_pr_argv_pool`), qword1 = argv_bytes (total pool
+  bytes for this stage INCLUDING the NUL separators and the trailing
+  NUL after the last word), qword2 = argc (number of words).
+- `_pr_stage_count : u64` — number of stages populated on success
+  (0..`PR_MAX_STAGES`). Written only on the `PR_OK` path; on any
+  error the slot is left untouched (return code is the authoritative
+  signal). Mirrors `_lx_token_count`'s discipline.
+- `_pr_argv_pool : [u8; 4096]` — the contiguous byte pool. Each
+  stage's `argv_ptr` for `command_record_begin` is
+  `_pr_argv_pool + stage.argv_offset`; the corresponding
+  `argv_bytes` is `stage.argv_bytes`.
+
+A 3-word stage `ls -la /tmp` becomes `ls\0-la\0/tmp\0` in the pool
+(12 bytes, argc=3, argv_bytes=12).
+
+### 2c.4 Downstream contract
+
+The output is designed against the input signatures the two existing
+encoders already expose:
+
+- `_pr_stage_count` → `Pipeline::pipeline_plan`'s `stages_count`.
+  `PR_MAX_STAGES = PL_MAX_STAGES = 8` so a valid parser output is
+  always handable to `pipeline_plan` without a second gate.
+- `_pr_argv_pool + stage.argv_offset` →
+  `CommandRecord::command_record_begin`'s `argv_ptr`.
+- `stage.argv_bytes` →
+  `CommandRecord::command_record_begin`'s `argv_bytes`.
+
+The `tpr_case_golden_feed` test in `tests/test_parser.pdx` wires the
+parser output into `pipeline_plan` for the `ls | cat` 2-stage line
+and asserts the resulting 4 qwords byte-match the existing
+`tsm_case_pipeline` golden — the load-bearing check that the
+parser+planner integration produces the same bytes the M4 smoke
+matrix pinned.
+
+### 2c.5 Token classes handled
+
+- `TOK_WORD` (kind=1) and `TOK_PIPE` (kind=2) are handled directly.
+- `TOK_REDIR_IN` (3), `TOK_REDIR_OUT` (4), `TOK_SEMI` (5), and
+  `TOK_AMP` (6) are silently skipped at ENH-003. Redirection
+  semantics land with ENH-004/ENH-005; semicolon/ampersand with the
+  REPL work in ENH-006. A caller running `ls > /tmp/f` today gets one
+  stage with argv `ls\0/tmp/f\0` — semantically wrong for a real
+  shell but out of scope for this issue.
+
+### 2c.6 Error codes
+
+- `PR_ERR_TOO_MANY_STAGES = 0xFFFFECD0` — more than `PR_MAX_STAGES`
+  (8) pipeline stages.
+- `PR_ERR_LEADING_PIPE = 0xFFFFECD1` — line starts with `|`.
+- `PR_ERR_TRAILING_PIPE = 0xFFFFECD2` — line ends with `|`.
+- `PR_ERR_EMPTY_STAGE = 0xFFFFECD3` — two `|` with nothing between.
+- `PR_ERR_ARGV_POOL_OVERFLOW = 0xFFFFECD4` — words do not fit in
+  `_pr_argv_pool` (4096 bytes).
+
+The band `0xFFFFECDx` is the first unused sub-band above Lexer
+(`0xFFFFECCx`); the Shell module mirrors these as `SH_PR_*` alongside
+the existing `SH_LX_*` mirrors.
+
+### 2c.7 Substrate deferral
+
+None. The parser is a pure-function transformer over the Lexer's
+`.bss` singletons and the caller-owned source buffer; it makes no
+syscall and touches no substrate. This is what lets it land BEFORE
+any of ENH-004 through ENH-006 (builtins through REPL) that will
+consume its output.
+
+### 2c.8 Fingerprint (`tests/test_parser.pdx`)
+
+Eight cases in the `0xFFFFED6x` fail-code band cover the parser's
+contract:
+
+- `tpr_case_bare_ls` — `ls` → 1 stage, argv `ls\0`, argc=1.
+- `tpr_case_pipe` — `ls | cat` → 2 stages, argv `ls\0`+`cat\0`,
+  each argc=1.
+- `tpr_case_pipe_flags` — `ls -la | cat` → 2 stages,
+  `ls\0-la\0`+`cat\0` (argc=2, argc=1).
+- `tpr_case_leading_pipe` — `|` → `PR_ERR_LEADING_PIPE`.
+- `tpr_case_trailing_pipe` — `ls |` → `PR_ERR_TRAILING_PIPE`.
+- `tpr_case_empty_stage` — `ls | | cat` → `PR_ERR_EMPTY_STAGE`.
+- `tpr_case_too_many` — `a|b|c|d|e|f|g|h|i` (9 stages) →
+  `PR_ERR_TOO_MANY_STAGES`.
+- `tpr_case_golden_feed` — `ls | cat` → parser → `pipeline_plan`
+  → asserts 4 qwords byte-match the existing `tsm_case_pipeline`
+  golden. The LOAD-BEARING downstream-contract check.
+
+The umbrella driver `tpr_run_all` matches the family shape so a
+boot-time smoke harness invokes all seven drivers uniformly.
+
 ## 3. `LineReader` module (src/line_reader.pdx)
 
 ### 3.1 Contract
@@ -864,6 +982,11 @@ the smoke matrix pulls both sides into one build.
 0xFFFFECC1  LX_ERR_UNTERMINATED_QUOTE Lexer.ENH-002: '...' or "..." not closed
 0xFFFFECC2  LX_ERR_INVALID_ESCAPE     Lexer.ENH-002: `\` at end of input
 0xFFFFECC3  LX_ERR_BAD_ARGS           Lexer.ENH-002: input_ptr==0 && len>0
+0xFFFFECD0  PR_ERR_TOO_MANY_STAGES    Parser.ENH-003: >PR_MAX_STAGES (8) stages
+0xFFFFECD1  PR_ERR_LEADING_PIPE       Parser.ENH-003: line starts with `|`
+0xFFFFECD2  PR_ERR_TRAILING_PIPE      Parser.ENH-003: line ends with `|`
+0xFFFFECD3  PR_ERR_EMPTY_STAGE        Parser.ENH-003: `|| ` -- empty stage
+0xFFFFECD4  PR_ERR_ARGV_POOL_OVERFLOW Parser.ENH-003: words > _pr_argv_pool (4096)
 ```
 
 (Sub-bands `0xFFFFECAx` (ReleaseManifest) and `0xFFFFECBx` (BrokerBind)
@@ -978,6 +1101,7 @@ golden bytes don't match, there's no point booting the guest.
 - `0xFFFFED3x` — TestReleaseManifest (M5-001).
 - `0xFFFFED4x` — TestSyscallFloor (ENH-001, #28).
 - `0xFFFFED5x` — TestLexer (ENH-002, #29).
+- `0xFFFFED6x` — TestParser (ENH-003, #30).
 
 These are disjoint from the shell's own `0xFFFFECxx` band so an
 operator reading a test-run log can tell "SUT rejected input" from

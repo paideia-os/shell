@@ -234,6 +234,11 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFECC1 | LX_ERR_UNTERMINATED_QUOTE | Lexer.ENH-002: `'..'` or `".."` not closed         |
 | 0xFFFFECC2 | LX_ERR_INVALID_ESCAPE     | Lexer.ENH-002: trailing `\` at end of input        |
 | 0xFFFFECC3 | LX_ERR_BAD_ARGS           | Lexer.ENH-002: input_ptr == 0 && input_len > 0     |
+| 0xFFFFECD0 | PR_ERR_TOO_MANY_STAGES    | Parser.ENH-003: > 8 pipeline stages (PR_MAX_STAGES) |
+| 0xFFFFECD1 | PR_ERR_LEADING_PIPE       | Parser.ENH-003: line begins with `\|`               |
+| 0xFFFFECD2 | PR_ERR_TRAILING_PIPE      | Parser.ENH-003: line ends with `\|`                 |
+| 0xFFFFECD3 | PR_ERR_EMPTY_STAGE        | Parser.ENH-003: two `\|` with no words between      |
+| 0xFFFFECD4 | PR_ERR_ARGV_POOL_OVERFLOW | Parser.ENH-003: words exceed 4096-byte argv pool    |
 
 ## Milestone rollup
 

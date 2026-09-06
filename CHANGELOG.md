@@ -4,6 +4,67 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-003: parser (#30)
+
+The v1.0.0 audit found that `Pipeline::pipeline_plan` took a
+pre-counted `stages_count` and `CommandRecord::command_record_begin`
+took per-stage null-separated argv text — both were written to be
+FED but nobody wrote the feeder. ENH-002 closed the byte-level split
+(Lexer); ENH-003 closes the pipeline-level split. Consumes the Lexer
+token stream in `_lx_tokens` / `_lx_token_count` and produces a
+command list of pipelines-of-stages in fresh `.bss` singletons.
+Pure-function; no substrate touch.
+
+### Added
+
+- `src/parser.pdx` — `Parser` module. `parser_parse(input_ptr,
+  input_len) → u64` reads the Lexer singletons and populates
+  `_pr_stages` (8 stages × 3 qwords: argv_offset, argv_bytes, argc),
+  `_pr_stage_count`, and `_pr_argv_pool` (4096-byte contiguous byte
+  pool). Words are copied byte-for-byte from the source buffer,
+  NUL-separated with a trailing NUL after each word. `PR_MAX_STAGES
+  = PL_MAX_STAGES = 8` — a valid parser output is always handable to
+  `pipeline_plan` without a second gate. Fresh return-code sub-band
+  `0xFFFFECDx`: `PR_ERR_TOO_MANY_STAGES`, `PR_ERR_LEADING_PIPE`,
+  `PR_ERR_TRAILING_PIPE`, `PR_ERR_EMPTY_STAGE`,
+  `PR_ERR_ARGV_POOL_OVERFLOW`. Non-WORD, non-PIPE tokens (REDIR_*,
+  SEMI, AMP) silently skipped at ENH-003; semantics land in
+  ENH-004/ENH-005/ENH-006.
+- `tests/test_parser.pdx` — `TestParser` module. Eight cases in the
+  `0xFFFFED6x` band: `bare_ls`, `pipe`, `pipe_flags`,
+  `leading_pipe`, `trailing_pipe`, `empty_stage`, `too_many` (9
+  stages), and the LOAD-BEARING `golden_feed` case that wires
+  parser output into `pipeline_plan` for `ls | cat` and asserts the
+  4 qwords byte-match the existing `tsm_case_pipeline` golden.
+  Umbrella `tpr_run_all` matches the family shape.
+- `design/architecture.md` §2c — Parser module documentation
+  (contract, output shape, downstream contract, error codes,
+  fingerprint) matching the §2b Lexer shape.
+- `design/architecture.md` §5 and §7.4 — return-code table extended
+  with the `0xFFFFECDx` Parser rows and the `0xFFFFED6x` TestParser
+  row.
+
+### Changed
+
+- `src/shell.pdx` — mirrored `SH_PR_*` constants in the
+  `0xFFFFECDx` band alongside the existing `SH_LX_*` mirrors, so a
+  Shell-level caller can spell every parser sentinel without an
+  explicit Parser import.
+- `manifest.pdxproj` — `src/parser.pdx` registered after
+  `src/lexer.pdx` and before `src/line_reader.pdx` (parser consumes
+  lexer output, feeds line_reader-driven exec at ENH-006);
+  `tests/test_parser.pdx` appended to the test list.
+- `STATUS.md` — return-code table extended with the five
+  `0xFFFFECDx` Parser rows.
+
+### Unblocks
+
+`#31` builtin dispatch (consumes `_pr_stages[0]`'s first argv word to
+choose between builtin and exec paths), `#32` real exec (needs the
+per-stage argv slices this parser produces), `#33` `shell_main` REPL
+(assembles read → lex → parse → exec). The critical path from
+ENH-002 through ENH-006 is now open at the parser boundary.
+
 ## Unreleased — ENH-002: lexer (#29)
 
 The v1.0.0 audit found no lexer in the tree; ENH-002 lands one. `Lexer`

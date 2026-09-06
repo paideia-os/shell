@@ -1,0 +1,877 @@
+// tests/test_parser.pdx -- shell.ENH-003 (paideia-os/shell#30)
+//
+// TestParser module: golden-fingerprint driver for Parser.parser_parse
+// AND the downstream-contract golden-feed test that wires the parser's
+// output into Pipeline::pipeline_plan and asserts byte-for-byte
+// equivalence with the existing tsm_case_pipeline (2-stage) golden.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Eight cases exhaust the parser's contract:
+//
+//   tpr_case_bare_ls        "ls"            -> 1 stage, argv "ls\0",  argc=1
+//   tpr_case_pipe           "ls | cat"      -> 2 stages, argv "ls\0"+"cat\0"
+//   tpr_case_pipe_flags     "ls -la | cat"  -> 2 stages, "ls\0-la\0"+"cat\0"
+//   tpr_case_leading_pipe   "|"             -> PR_ERR_LEADING_PIPE
+//   tpr_case_trailing_pipe  "ls |"          -> PR_ERR_TRAILING_PIPE
+//   tpr_case_empty_stage    "ls | | cat"    -> PR_ERR_EMPTY_STAGE
+//   tpr_case_too_many       "a|b|c|d|e|f|g|h|i"  -> PR_ERR_TOO_MANY_STAGES
+//   tpr_case_golden_feed    "ls | cat" -> parser -> pipeline_plan
+//                                       -> byte-match tsm_case_pipeline golden
+//
+// The final case is the LOAD-BEARING downstream-contract check: the
+// parser + pipeline_plan pair must together reproduce the encoded
+// bytes the existing tsm_run_all pinned as golden. If the parser
+// under-counts or over-counts stages, or if it drifts pipe_id or
+// slot semantics, the golden feed test fires immediately with a
+// distinct sentinel (TPR_FAIL_GOLDEN_FEED) that names this specific
+// integration failure.
+//
+// =============================================================================
+// WHY BYTE-WRITE FIXTURES (not string literals)
+// =============================================================================
+//
+// Every fixture contains at least one of the bytes `|`, `>`, or `'`
+// whose behaviour inside a paideia-as string literal is under-
+// documented in this tree. test_lexer.pdx and test_smoke_matrix.pdx
+// both establish the byte-write pattern (populate `[u8; N] uninit
+// @align(8)` slots from mov_b constants); this module follows suit.
+//
+// =============================================================================
+// FAIL-CODE BAND
+// =============================================================================
+//
+//   0            TPR_PASS               all cases passed
+//   0xFFFFED60   TPR_FAIL_BARE_LS       bare_ls case failed
+//   0xFFFFED61   TPR_FAIL_PIPE          two-stage pipe case failed
+//   0xFFFFED62   TPR_FAIL_PIPE_FLAGS    multi-arg pipe case failed
+//   0xFFFFED63   TPR_FAIL_LEADING       leading-pipe reject case failed
+//   0xFFFFED64   TPR_FAIL_TRAILING      trailing-pipe reject case failed
+//   0xFFFFED65   TPR_FAIL_EMPTY_STAGE   empty-stage reject case failed
+//   0xFFFFED66   TPR_FAIL_TOO_MANY      9-stage overflow case failed
+//   0xFFFFED67   TPR_FAIL_GOLDEN_FEED   parser->pipeline_plan golden mismatch
+//
+// The 0xFFFFED6x band extends the family
+//   0xFFFFED0x  TestCapsNarrow
+//   0xFFFFED1x  TestAuditFirst
+//   0xFFFFED2x  TestSmokeMatrix
+//   0xFFFFED3x  TestReleaseManifest
+//   0xFFFFED4x  TestSyscallFloor
+//   0xFFFFED5x  TestLexer
+//   0xFFFFED6x  TestParser                <-- this module
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestParser`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (small counts +
+//     ASCII byte literals; the largest is 33 for the 9-stage input
+//     length and 4096 for the pool-size compare -- not exercised
+//     directly by these tests).
+//   - r11 scratch for .bss reach + large-imm compare temporaries.
+//   - Byte writes to fixtures use mov_b.
+//   - Case entries push 2 callee-saves (rbx, r12) + `sub rsp, 8` =
+//     24 bytes prologue; matched pop sequence at every return.
+
+module TestParser = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED6x band)
+  // ==========================================================================
+  pub let TPR_PASS              : u64 = 0
+  pub let TPR_FAIL_BARE_LS      : u64 = 0xFFFFED60
+  pub let TPR_FAIL_PIPE         : u64 = 0xFFFFED61
+  pub let TPR_FAIL_PIPE_FLAGS   : u64 = 0xFFFFED62
+  pub let TPR_FAIL_LEADING      : u64 = 0xFFFFED63
+  pub let TPR_FAIL_TRAILING     : u64 = 0xFFFFED64
+  pub let TPR_FAIL_EMPTY_STAGE  : u64 = 0xFFFFED65
+  pub let TPR_FAIL_TOO_MANY     : u64 = 0xFFFFED66
+  pub let TPR_FAIL_GOLDEN_FEED  : u64 = 0xFFFFED67
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  //   _tpr_in_ls          "ls"                       2  bytes
+  //   _tpr_in_pipe        "ls | cat"                 8  bytes
+  //   _tpr_in_pipe_flags  "ls -la | cat"            12  bytes
+  //   _tpr_in_leading     "|"                        1  byte
+  //   _tpr_in_trailing    "ls |"                     4  bytes
+  //   _tpr_in_empty       "ls | | cat"              10  bytes
+  //   _tpr_in_too_many    "a|b|c|d|e|f|g|h|i"       17  bytes
+  //   _tpr_pipe_dst       [u64; 8]                  64  bytes  (pipeline_plan output)
+  // ==========================================================================
+  pub let mut _tpr_in_ls          : [u8; 8]  = uninit @align(8)
+  pub let mut _tpr_in_pipe        : [u8; 16] = uninit @align(8)
+  pub let mut _tpr_in_pipe_flags  : [u8; 16] = uninit @align(8)
+  pub let mut _tpr_in_leading     : [u8; 8]  = uninit @align(8)
+  pub let mut _tpr_in_trailing    : [u8; 8]  = uninit @align(8)
+  pub let mut _tpr_in_empty       : [u8; 16] = uninit @align(8)
+  pub let mut _tpr_in_too_many    : [u8; 24] = uninit @align(8)
+  pub let mut _tpr_pipe_dst       : [u64; 8] = uninit @align(16)
+
+  // ==========================================================================
+  // tpr_reset() -> ()
+  //
+  // Zero every fixture qword and populate the input buffers via mov_b.
+  // Followed by lexer_reset + parser_reset implicit calls in each case.
+  // Leaf function; r10 base, rax byte constant.
+  // ==========================================================================
+  pub let tpr_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): zero all 7 input fixtures + the pipeline_plan dst fixture, then populate the 7 inputs with their fingerprint literals. Each populate sequence uses the mov_b idiom test_lexer.pdx / test_smoke_matrix.pdx established. All literal bytes are ASCII (0x20..0x7c range). Leaf function -- no push/pop parity. Labels prefixed tpr_rs_.",
+      block: {
+        // Zero _tpr_in_ls (1 qword).
+        xor rax, rax;
+        lea r10, [rip + _tpr_in_ls];
+        mov [r10 + 0], rax;
+
+        // Zero _tpr_in_pipe (2 qwords).
+        lea r10, [rip + _tpr_in_pipe];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // Zero _tpr_in_pipe_flags (2 qwords).
+        lea r10, [rip + _tpr_in_pipe_flags];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // Zero _tpr_in_leading (1 qword).
+        lea r10, [rip + _tpr_in_leading];
+        mov [r10 + 0], rax;
+
+        // Zero _tpr_in_trailing (1 qword).
+        lea r10, [rip + _tpr_in_trailing];
+        mov [r10 + 0], rax;
+
+        // Zero _tpr_in_empty (2 qwords).
+        lea r10, [rip + _tpr_in_empty];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // Zero _tpr_in_too_many (3 qwords).
+        lea r10, [rip + _tpr_in_too_many];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+
+        // Zero _tpr_pipe_dst (8 qwords).
+        lea r10, [rip + _tpr_pipe_dst];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+
+        // Populate _tpr_in_ls: "ls" (2 bytes).
+        lea r10, [rip + _tpr_in_ls];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+
+        // Populate _tpr_in_pipe: "ls | cat" (8 bytes).
+        lea r10, [rip + _tpr_in_pipe];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+        mov rax, 0x20; mov_b [r10 + 2], rax;    // ' '
+        mov rax, 0x7c; mov_b [r10 + 3], rax;    // '|'
+        mov rax, 0x20; mov_b [r10 + 4], rax;    // ' '
+        mov rax, 0x63; mov_b [r10 + 5], rax;    // 'c'
+        mov rax, 0x61; mov_b [r10 + 6], rax;    // 'a'
+        mov rax, 0x74; mov_b [r10 + 7], rax;    // 't'
+
+        // Populate _tpr_in_pipe_flags: "ls -la | cat" (12 bytes).
+        lea r10, [rip + _tpr_in_pipe_flags];
+        mov rax, 0x6c; mov_b [r10 +  0], rax;   // 'l'
+        mov rax, 0x73; mov_b [r10 +  1], rax;   // 's'
+        mov rax, 0x20; mov_b [r10 +  2], rax;   // ' '
+        mov rax, 0x2d; mov_b [r10 +  3], rax;   // '-'
+        mov rax, 0x6c; mov_b [r10 +  4], rax;   // 'l'
+        mov rax, 0x61; mov_b [r10 +  5], rax;   // 'a'
+        mov rax, 0x20; mov_b [r10 +  6], rax;   // ' '
+        mov rax, 0x7c; mov_b [r10 +  7], rax;   // '|'
+        mov rax, 0x20; mov_b [r10 +  8], rax;   // ' '
+        mov rax, 0x63; mov_b [r10 +  9], rax;   // 'c'
+        mov rax, 0x61; mov_b [r10 + 10], rax;   // 'a'
+        mov rax, 0x74; mov_b [r10 + 11], rax;   // 't'
+
+        // Populate _tpr_in_leading: "|" (1 byte).
+        lea r10, [rip + _tpr_in_leading];
+        mov rax, 0x7c; mov_b [r10 + 0], rax;    // '|'
+
+        // Populate _tpr_in_trailing: "ls |" (4 bytes).
+        lea r10, [rip + _tpr_in_trailing];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+        mov rax, 0x20; mov_b [r10 + 2], rax;    // ' '
+        mov rax, 0x7c; mov_b [r10 + 3], rax;    // '|'
+
+        // Populate _tpr_in_empty: "ls | | cat" (10 bytes).
+        lea r10, [rip + _tpr_in_empty];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+        mov rax, 0x20; mov_b [r10 + 2], rax;    // ' '
+        mov rax, 0x7c; mov_b [r10 + 3], rax;    // '|'
+        mov rax, 0x20; mov_b [r10 + 4], rax;    // ' '
+        mov rax, 0x7c; mov_b [r10 + 5], rax;    // '|'
+        mov rax, 0x20; mov_b [r10 + 6], rax;    // ' '
+        mov rax, 0x63; mov_b [r10 + 7], rax;    // 'c'
+        mov rax, 0x61; mov_b [r10 + 8], rax;    // 'a'
+        mov rax, 0x74; mov_b [r10 + 9], rax;    // 't'
+
+        // Populate _tpr_in_too_many: "a|b|c|d|e|f|g|h|i" (17 bytes).
+        // Byte layout: letters at even offsets, '|' at odd offsets.
+        lea r10, [rip + _tpr_in_too_many];
+        mov rax, 0x61; mov_b [r10 +  0], rax;   // 'a'
+        mov rax, 0x7c; mov_b [r10 +  1], rax;   // '|'
+        mov rax, 0x62; mov_b [r10 +  2], rax;   // 'b'
+        mov rax, 0x7c; mov_b [r10 +  3], rax;   // '|'
+        mov rax, 0x63; mov_b [r10 +  4], rax;   // 'c'
+        mov rax, 0x7c; mov_b [r10 +  5], rax;   // '|'
+        mov rax, 0x64; mov_b [r10 +  6], rax;   // 'd'
+        mov rax, 0x7c; mov_b [r10 +  7], rax;   // '|'
+        mov rax, 0x65; mov_b [r10 +  8], rax;   // 'e'
+        mov rax, 0x7c; mov_b [r10 +  9], rax;   // '|'
+        mov rax, 0x66; mov_b [r10 + 10], rax;   // 'f'
+        mov rax, 0x7c; mov_b [r10 + 11], rax;   // '|'
+        mov rax, 0x67; mov_b [r10 + 12], rax;   // 'g'
+        mov rax, 0x7c; mov_b [r10 + 13], rax;   // '|'
+        mov rax, 0x68; mov_b [r10 + 14], rax;   // 'h'
+        mov rax, 0x7c; mov_b [r10 + 15], rax;   // '|'
+        mov rax, 0x69; mov_b [r10 + 16], rax;   // 'i'
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_bare_ls() -> u64
+  //
+  // Input: "ls" (2 bytes). Expected:
+  //   stage_count == 1
+  //   stages[0] = (argv_offset=0, argv_bytes=3, argc=1)
+  //   pool[0..3] = "ls\0"
+  //
+  // Prologue: 2 pushes (rbx, r12) + `sub rsp, 8` = 24 bytes.
+  // ==========================================================================
+  pub let tpr_case_bare_ls : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): the bare-command case. 'ls' has no pipes; the parser emits one stage containing one word 'ls' followed by a NUL. argv_bytes counts the NUL, so it is 3, not 2. If the parser were to emit argv_bytes = 2 (excluding NUL) the downstream command_record_begin would build a header claiming 50-byte record_len instead of 51/56 rounded; the round-trip breaks on the first golden compare. 2 pushes prologue; labels prefixed tpr_ls_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+
+        // Lex "ls" first.
+        lea rdi, [rip + _tpr_in_ls];
+        mov rsi, 2;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_ls_fail;
+
+        // Parse.
+        lea rdi, [rip + _tpr_in_ls];
+        mov rsi, 2;
+        call parser_parse;
+        cmp rax, 0;
+        jne tpr_ls_fail;
+
+        // stage_count == 1.
+        lea r10, [rip + _pr_stage_count];
+        mov rax, [r10];
+        cmp rax, 1;
+        jne tpr_ls_fail;
+
+        // stages[0] = (0, 3, 1).
+        lea r12, [rip + _pr_stages];
+        mov rax, [r12 + 0];                  // argv_offset
+        cmp rax, 0;
+        jne tpr_ls_fail;
+        mov rax, [r12 + 8];                  // argv_bytes
+        cmp rax, 3;
+        jne tpr_ls_fail;
+        mov rax, [r12 + 16];                 // argc
+        cmp rax, 1;
+        jne tpr_ls_fail;
+
+        // pool bytes: 'l' 's' NUL.
+        lea r12, [rip + _pr_argv_pool];
+        xor rax, rax;
+        mov_b rax, [r12 + 0];
+        cmp rax, 0x6c;
+        jne tpr_ls_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 1];
+        cmp rax, 0x73;
+        jne tpr_ls_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 2];
+        cmp rax, 0;
+        jne tpr_ls_fail;
+
+        xor rax, rax;                        // TPR_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_ls_fail:
+        mov rax, 0xFFFFED60;                 // TPR_FAIL_BARE_LS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_pipe() -> u64
+  //
+  // Input: "ls | cat" (8 bytes). Expected:
+  //   stage_count == 2
+  //   stages[0] = (0, 3, 1)   -- "ls\0"
+  //   stages[1] = (3, 4, 1)   -- "cat\0"
+  //   pool[0..7] = "ls\0cat\0"
+  // ==========================================================================
+  pub let tpr_case_pipe : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): the load-bearing 2-stage case, the same shape tsm_case_pipeline consumes at pipeline_plan(stages_count=2). Parser must count 2 stages, allocate argv_offset=0 for the first and argv_offset=3 for the second (start-of-cat is one past 'ls\\0'), and produce argc=1 for both. If the parser miscounts stages, the immediate consumer pipeline_plan under-mints pipe endpoints and the child sidecars are wrong for the smoke's exec pair. 2 pushes prologue; labels prefixed tpr_pi_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+
+        lea rdi, [rip + _tpr_in_pipe];
+        mov rsi, 8;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_pi_fail;
+
+        lea rdi, [rip + _tpr_in_pipe];
+        mov rsi, 8;
+        call parser_parse;
+        cmp rax, 0;
+        jne tpr_pi_fail;
+
+        lea r10, [rip + _pr_stage_count];
+        mov rax, [r10];
+        cmp rax, 2;
+        jne tpr_pi_fail;
+
+        lea r12, [rip + _pr_stages];
+
+        // stages[0] = (0, 3, 1).
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne tpr_pi_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 3;
+        jne tpr_pi_fail;
+        mov rax, [r12 + 16];
+        cmp rax, 1;
+        jne tpr_pi_fail;
+
+        // stages[1] = (3, 4, 1).  Byte offset = 24.
+        mov rax, [r12 + 24];
+        cmp rax, 3;
+        jne tpr_pi_fail;
+        mov rax, [r12 + 32];
+        cmp rax, 4;
+        jne tpr_pi_fail;
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne tpr_pi_fail;
+
+        // pool bytes: 'l' 's' NUL 'c' 'a' 't' NUL.
+        lea r12, [rip + _pr_argv_pool];
+        xor rax, rax;
+        mov_b rax, [r12 + 0];
+        cmp rax, 0x6c;
+        jne tpr_pi_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 1];
+        cmp rax, 0x73;
+        jne tpr_pi_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 2];
+        cmp rax, 0;
+        jne tpr_pi_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 3];
+        cmp rax, 0x63;
+        jne tpr_pi_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 4];
+        cmp rax, 0x61;
+        jne tpr_pi_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 5];
+        cmp rax, 0x74;
+        jne tpr_pi_fail;
+        xor rax, rax;
+        mov_b rax, [r12 + 6];
+        cmp rax, 0;
+        jne tpr_pi_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_pi_fail:
+        mov rax, 0xFFFFED61;                 // TPR_FAIL_PIPE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_pipe_flags() -> u64
+  //
+  // Input: "ls -la | cat" (12 bytes). Expected:
+  //   stage_count == 2
+  //   stages[0] = (0, 7, 2)   -- "ls\0-la\0"
+  //   stages[1] = (7, 4, 1)   -- "cat\0"
+  // ==========================================================================
+  pub let tpr_case_pipe_flags : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): the multi-arg stage case. `ls -la | cat` has two words in the first stage, which stresses the argc counter and the NUL-separator write between words. Expected argv_bytes for stage 0 is 7: `ls` (2) + NUL + `-la` (3) + NUL = 7. Stage 1's argv_offset is 7 (one past stage 0's trailing NUL). If the parser miscounts a stage's arguments, downstream command_record_begin builds the wrong argv envelope and execve receives a truncated argv. 2 pushes prologue; labels prefixed tpr_pf_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+
+        lea rdi, [rip + _tpr_in_pipe_flags];
+        mov rsi, 12;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_pf_fail;
+
+        lea rdi, [rip + _tpr_in_pipe_flags];
+        mov rsi, 12;
+        call parser_parse;
+        cmp rax, 0;
+        jne tpr_pf_fail;
+
+        lea r10, [rip + _pr_stage_count];
+        mov rax, [r10];
+        cmp rax, 2;
+        jne tpr_pf_fail;
+
+        lea r12, [rip + _pr_stages];
+
+        // stages[0] = (0, 7, 2).
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne tpr_pf_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 7;
+        jne tpr_pf_fail;
+        mov rax, [r12 + 16];
+        cmp rax, 2;
+        jne tpr_pf_fail;
+
+        // stages[1] = (7, 4, 1).
+        mov rax, [r12 + 24];
+        cmp rax, 7;
+        jne tpr_pf_fail;
+        mov rax, [r12 + 32];
+        cmp rax, 4;
+        jne tpr_pf_fail;
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne tpr_pf_fail;
+
+        // pool bytes: 'l' 's' NUL '-' 'l' 'a' NUL 'c' 'a' 't' NUL.
+        lea r12, [rip + _pr_argv_pool];
+        xor rax, rax; mov_b rax, [r12 + 0];  cmp rax, 0x6c; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 1];  cmp rax, 0x73; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 2];  cmp rax, 0;    jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 3];  cmp rax, 0x2d; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 4];  cmp rax, 0x6c; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 5];  cmp rax, 0x61; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 6];  cmp rax, 0;    jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 7];  cmp rax, 0x63; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 8];  cmp rax, 0x61; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 9];  cmp rax, 0x74; jne tpr_pf_fail;
+        xor rax, rax; mov_b rax, [r12 + 10]; cmp rax, 0;    jne tpr_pf_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_pf_fail:
+        mov rax, 0xFFFFED62;                 // TPR_FAIL_PIPE_FLAGS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_leading_pipe() -> u64
+  //
+  // Input: "|" (1 byte). Expected: PR_ERR_LEADING_PIPE (0xFFFFECD1).
+  // ==========================================================================
+  pub let tpr_case_leading_pipe : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): leading-pipe reject. A line beginning with `|` has no left-hand producer and is a syntax error the parser must refuse before wasting a pipeline_plan mint. The parser sees stage_count == 0 and argc == 0 at the PIPE token and returns PR_ERR_LEADING_PIPE with distinct sentinel semantics (as opposed to EMPTY_STAGE, which requires stage_count > 0). 2 pushes prologue; labels prefixed tpr_lp_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+
+        lea rdi, [rip + _tpr_in_leading];
+        mov rsi, 1;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_lp_fail;
+
+        lea rdi, [rip + _tpr_in_leading];
+        mov rsi, 1;
+        call parser_parse;
+        // Expect PR_ERR_LEADING_PIPE = 0xFFFFECD1.
+        mov r11, 0xFFFFECD1;
+        cmp rax, r11;
+        jne tpr_lp_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_lp_fail:
+        mov rax, 0xFFFFED63;                 // TPR_FAIL_LEADING
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_trailing_pipe() -> u64
+  //
+  // Input: "ls |" (4 bytes). Expected: PR_ERR_TRAILING_PIPE.
+  // ==========================================================================
+  pub let tpr_case_trailing_pipe : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): trailing-pipe reject. `ls |` finalizes stage 0 on the PIPE but no following word arrives before EOF, so the second stage would be empty. Distinct sentinel PR_ERR_TRAILING_PIPE is helpful because a caller redirecting stderr wants to know the trailing pipe is the culprit; a generic EMPTY_STAGE conflates the two. 2 pushes prologue; labels prefixed tpr_tp_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+
+        lea rdi, [rip + _tpr_in_trailing];
+        mov rsi, 4;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_tp_fail;
+
+        lea rdi, [rip + _tpr_in_trailing];
+        mov rsi, 4;
+        call parser_parse;
+        // Expect PR_ERR_TRAILING_PIPE = 0xFFFFECD2.
+        mov r11, 0xFFFFECD2;
+        cmp rax, r11;
+        jne tpr_tp_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_tp_fail:
+        mov rax, 0xFFFFED64;                 // TPR_FAIL_TRAILING
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_empty_stage() -> u64
+  //
+  // Input: "ls | | cat" (10 bytes). Expected: PR_ERR_EMPTY_STAGE.
+  // ==========================================================================
+  pub let tpr_case_empty_stage : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): empty-stage reject. Two pipes in a row with no word between them is a syntax error the parser catches at the second PIPE: stage_count > 0 (the first stage finalized) but argc == 0 (no words yet in the new stage). Distinct sentinel PR_ERR_EMPTY_STAGE is intentionally not folded into LEADING_PIPE because the fix (delete one `|`) is different from the leading case (delete the leading `|` and its following whitespace). 2 pushes prologue; labels prefixed tpr_es_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+
+        lea rdi, [rip + _tpr_in_empty];
+        mov rsi, 10;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_es_fail;
+
+        lea rdi, [rip + _tpr_in_empty];
+        mov rsi, 10;
+        call parser_parse;
+        // Expect PR_ERR_EMPTY_STAGE = 0xFFFFECD3.
+        mov r11, 0xFFFFECD3;
+        cmp rax, r11;
+        jne tpr_es_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_es_fail:
+        mov rax, 0xFFFFED65;                 // TPR_FAIL_EMPTY_STAGE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_too_many() -> u64
+  //
+  // Input: "a|b|c|d|e|f|g|h|i" (17 bytes, 9 stages, 8 pipes).
+  // Expected: PR_ERR_TOO_MANY_STAGES.
+  //
+  // The 9th stage's finalization at end-of-tokens hits `cmp r15, 8;
+  // jae pr_ps_too_many_stages`. The check is symmetric on both
+  // finalize paths (mid-loop after PIPE, and end-of-tokens); either
+  // could fire depending on where the ninth stage completes. In this
+  // input the ninth stage is `i` (a WORD followed by end-of-tokens),
+  // so the end-of-tokens path fires. A `|` in position 10 would fire
+  // the mid-loop path -- either way the sentinel is the same.
+  // ==========================================================================
+  pub let tpr_case_too_many : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): overflow reject. 9 pipeline stages exceed PR_MAX_STAGES=8 (which matches Pipeline::PL_MAX_STAGES for a reason: a valid parser output must always be handable to pipeline_plan without a second gate). The parser catches this at the ninth-stage finalize -- which in this input's end-of-tokens finalize path. Distinct sentinel PR_ERR_TOO_MANY_STAGES because a caller can react by splitting the pipeline across temps (as .pds scripts already do at PDS_ERR_OVERFLOW) rather than falling into the generic bad-syntax bucket. 2 pushes prologue; labels prefixed tpr_tm_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+
+        lea rdi, [rip + _tpr_in_too_many];
+        mov rsi, 17;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_tm_fail;
+
+        lea rdi, [rip + _tpr_in_too_many];
+        mov rsi, 17;
+        call parser_parse;
+        // Expect PR_ERR_TOO_MANY_STAGES = 0xFFFFECD0.
+        mov r11, 0xFFFFECD0;
+        cmp rax, r11;
+        jne tpr_tm_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_tm_fail:
+        mov rax, 0xFFFFED66;                 // TPR_FAIL_TOO_MANY
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_case_golden_feed() -> u64
+  //
+  // LOAD-BEARING downstream-contract check.
+  //
+  // Input: "ls | cat" (8 bytes). Feed through: lex -> parse ->
+  // pipeline_plan(dst=_tpr_pipe_dst, stages_count=<parser output>,
+  //                dst_max=4, first_slot=0). Verify PL_OK and byte-
+  // for-byte match against the tsm_case_pipeline golden:
+  //   qword0 = 0x0000000200050001  (slot=1, kind=5, rights=WRITE)
+  //   qword1 = 0                    (pipe id 0)
+  //   qword2 = 0x0000000100050000  (slot=0, kind=5, rights=READ)
+  //   qword3 = 0                    (same pipe id)
+  //
+  // If any byte differs the smoke's downstream contract has drifted
+  // and the parser is the load-bearing suspect.
+  // ==========================================================================
+  pub let tpr_case_golden_feed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): the load-bearing downstream contract. Lex `ls | cat`, parse it, then pass the parser's stage_count (which MUST be 2) straight into pipeline_plan. The resulting 4 qwords in _tpr_pipe_dst must byte-match the tsm_case_pipeline golden -- if the parser miscounts stages, pipeline_plan under-mints pipe endpoints and the smoke's downstream QEMU run either hangs on an unpaired reader or exec'es both children into stdio (no pipe). A distinct sentinel TPR_FAIL_GOLDEN_FEED names the parser+pipeline_plan integration cleanly so a smoke-log reader knows to bisect between parser and planner rather than encoder drift. 2 pushes prologue; labels prefixed tpr_gf_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tpr_reset;
+        call pipeline_reset;
+
+        // Lex.
+        lea rdi, [rip + _tpr_in_pipe];
+        mov rsi, 8;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tpr_gf_fail;
+
+        // Parse.
+        lea rdi, [rip + _tpr_in_pipe];
+        mov rsi, 8;
+        call parser_parse;
+        cmp rax, 0;
+        jne tpr_gf_fail;
+
+        // stage_count MUST be 2.
+        lea r10, [rip + _pr_stage_count];
+        mov rax, [r10];
+        cmp rax, 2;
+        jne tpr_gf_fail;
+
+        // Feed the count straight into pipeline_plan.
+        // pipeline_plan(_tpr_pipe_dst, stage_count=2, dst_max=4, first_slot=0).
+        lea rdi, [rip + _tpr_pipe_dst];
+        mov rsi, 2;
+        mov rdx, 4;
+        mov rcx, 0;
+        call pipeline_plan;
+        cmp rax, 0;
+        jne tpr_gf_fail;
+
+        // Verify pipeline_entries_written == 2.
+        lea r10, [rip + pipeline_entries_written];
+        mov rax, [r10];
+        cmp rax, 2;
+        jne tpr_gf_fail;
+
+        // Byte-match the tsm_case_pipeline golden.
+        lea r12, [rip + _tpr_pipe_dst];
+
+        // entry[0] qword0 = 0x0000000200050001 (slot=1, kind=5, WRITE).
+        mov rax, [r12 + 0];
+        mov r11, 0x0000000200050001;
+        cmp rax, r11;
+        jne tpr_gf_fail;
+
+        // entry[0] qword1 = 0 (pipe id).
+        mov rax, [r12 + 8];
+        cmp rax, 0;
+        jne tpr_gf_fail;
+
+        // entry[1] qword0 = 0x0000000100050000 (slot=0, kind=5, READ).
+        mov rax, [r12 + 16];
+        mov r11, 0x0000000100050000;
+        cmp rax, r11;
+        jne tpr_gf_fail;
+
+        // entry[1] qword1 = 0 (same pipe id).
+        mov rax, [r12 + 24];
+        cmp rax, 0;
+        jne tpr_gf_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tpr_gf_fail:
+        mov rax, 0xFFFFED67;                 // TPR_FAIL_GOLDEN_FEED
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tpr_run_all() -> u64
+  //
+  // Umbrella: drive all 8 cases in fingerprint order. Short-circuit on
+  // first non-zero. Matches the tsf_run_all / tlx_run_all family shape.
+  //
+  // Prologue: 1 push (rbx) + `sub rsp, 8` = 16 bytes; rsp % 16 == 0.
+  // ==========================================================================
+  pub let tpr_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-003 (#30): drive all 8 parser fingerprint cases in issue order (bare_ls, pipe, pipe_flags, leading_pipe, trailing_pipe, empty_stage, too_many, golden_feed). The golden_feed case is intentionally LAST -- if any earlier case fails, the umbrella returns before wasting a pipeline_plan call. Short-circuit on first non-zero. Matches the tsf_run_all / tlx_run_all family shape so the future boot-time smoke harness invokes all seven umbrellas uniformly. 1 push + sub rsp 8 prologue; labels prefixed tpr_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call tpr_case_bare_ls;
+        cmp rax, 0;
+        jne tpr_ra_out;
+
+        call tpr_case_pipe;
+        cmp rax, 0;
+        jne tpr_ra_out;
+
+        call tpr_case_pipe_flags;
+        cmp rax, 0;
+        jne tpr_ra_out;
+
+        call tpr_case_leading_pipe;
+        cmp rax, 0;
+        jne tpr_ra_out;
+
+        call tpr_case_trailing_pipe;
+        cmp rax, 0;
+        jne tpr_ra_out;
+
+        call tpr_case_empty_stage;
+        cmp rax, 0;
+        jne tpr_ra_out;
+
+        call tpr_case_too_many;
+        cmp rax, 0;
+        jne tpr_ra_out;
+
+        call tpr_case_golden_feed;
+
+      tpr_ra_out:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}

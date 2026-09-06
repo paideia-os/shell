@@ -126,6 +126,20 @@ module Shell = structure {
   pub let SH_LX_ERR_INVALID_ESCAPE      : u64 = 0xFFFFECC2
   pub let SH_LX_ERR_BAD_ARGS            : u64 = 0xFFFFECC3
 
+  // Parser errors (0xFFFFECDx) -- ENH-003 (#30). Authoritative
+  // definitions in src/parser.pdx; mirrored here for the same reason
+  // the Lexer sentinels are mirrored (shell.pdx is the single point
+  // where a downstream consumer can spell every 0xFFFFECxx sentinel
+  // without linking every module). Kept in the SH_PR_* namespace so
+  // a Shell-level caller can spell them without an explicit Parser
+  // module import.
+  pub let SH_PR_OK                       : u64 = 0            // == PR_OK
+  pub let SH_PR_ERR_TOO_MANY_STAGES      : u64 = 0xFFFFECD0
+  pub let SH_PR_ERR_LEADING_PIPE         : u64 = 0xFFFFECD1
+  pub let SH_PR_ERR_TRAILING_PIPE        : u64 = 0xFFFFECD2
+  pub let SH_PR_ERR_EMPTY_STAGE          : u64 = 0xFFFFECD3
+  pub let SH_PR_ERR_ARGV_POOL_OVERFLOW   : u64 = 0xFFFFECD4
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //
