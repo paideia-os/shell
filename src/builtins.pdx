@@ -1,0 +1,705 @@
+// src/builtins.pdx -- shell.ENH-004 (paideia-os/shell#31)
+//
+// Builtins module: cd / exit / export / pwd handlers.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// ENH-002 landed the Lexer; ENH-003 landed the Parser. Both produce
+// argv byte pools NUL-separated per stage. This module lands the four
+// minimum-viable builtin handlers the enhancement plan enumerates
+// (design/enhancement-plan.md §Stage 2 -- in-process commands):
+//
+//   bi_cd      cd  <path>          -> sys_chdir(argv[1], 255)   (SC+ 85)
+//   bi_exit    exit [code]         -> sys_exit(code|0)          (SC+ 60)
+//   bi_export  export NAME=VALUE   -> shell-local env table
+//   bi_pwd     pwd                 -> sys_getcwd + sys_write    (SC+ 86/1)
+//
+// The lookup / dispatch surface (dispatch_line + the triple table
+// _bi_names / _bi_name_lens / _bi_handlers) lives in src/dispatch.pdx
+// so this module holds handler bodies and the shell-local env storage
+// only. Dispatch drives the handler; each handler receives the
+// per-stage argv byte pool pointer and argc directly (not a Parser
+// stage-record pointer -- keeps this module free of any coupling to
+// `_pr_stages`'s 24-byte layout; the REPL at ENH-006 resolves argv_ptr
+// from _pr_argv_pool + stage.argv_offset before dispatching).
+//
+// =============================================================================
+// SIGNATURE OF EVERY HANDLER
+// =============================================================================
+//
+//   fn (argv_ptr: u64, argc: u64) -> u64
+//
+// argv_ptr    -- VA of the stage's argv byte pool slice
+//                (typically `_pr_argv_pool + stage.argv_offset`). The
+//                slice is `argv[0]\0argv[1]\0...argv[argc-1]\0`; each
+//                argv[i] can be resolved by scanning `i` NULs from the
+//                base pointer.
+// argc        -- total number of words in the slice (from stage.argc).
+// Return value -- BI_OK (0) on success; BI_ERR_* on handler-specific
+//                 reject. sys_exit's handler does not return on the
+//                 success path; the wrapper's `ret` is unreachable
+//                 (paideia-as function-shape terminator only).
+//
+// =============================================================================
+// DESIGN TENSION: `export` vs D5 ambient authority
+// =============================================================================
+//
+// design/enhancement-plan.md §Stage 2 flags the tension: README /
+// design/architecture.md D5 state the shell reads NO environment
+// variables and treats env as an ambient-authority channel the project
+// avoids (plan.md D5). An `export` builtin appears in conflict.
+//
+// ENH-004 CHOOSES OPTION A per the issue's recommendation: scope
+// `export` to a SHELL-LOCAL variable table that is NOT inherited by
+// children. No amendment to D5 (D5 stands). No change to caps.decl.
+// No envp addition to the sys_execve path. The exported table serves
+// the shell's own subsequent line evaluations (variable expansion at
+// ENH-006's REPL) -- children see nothing new.
+//
+// This matches the D2/D5 stance the project has held since the
+// v1.0.0 encoder body: capabilities are the ONLY inheritable authority.
+// Any future need for "genuine" env inheritance would land as a
+// distinct KIND (e.g., KIND_ENV_SLOT) with explicit narrowing, not by
+// widening ambient env.
+//
+// Storage:
+//   _bi_env           : [u64; 128] uninit @align(16) -- 32 records * 4 qw each
+//                       record layout per issue directive:
+//                         [i*32 +  0]  name_ptr   (into _bi_env_pool)
+//                         [i*32 +  8]  name_len
+//                         [i*32 + 16]  value_ptr  (into _bi_env_pool)
+//                         [i*32 + 24]  value_len
+//   _bi_env_count     : u64                       -- populated records
+//   _bi_env_pool      : [u8; 4096] uninit @align(16) -- NUL-separated backing
+//   _bi_env_pool_used : u64                       -- bytes consumed (write ptr)
+//   _bi_pwd_buf       : [u8; 256] uninit @align(16) -- sys_getcwd scratch
+//   bi_nl             : [u8; 2] = "\n\0"          -- newline after pwd's write
+//
+// Reset via bi_env_reset() (called from Dispatch::dispatch_init at
+// startup + from the ENH-006 REPL if a session-restart primitive lands
+// later). The pool bytes and record slots past _bi_env_count /
+// _bi_env_pool_used are unobservable; only the two counts need zeroing.
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFECEx (Builtins module)
+// =============================================================================
+//
+// Fresh sub-band above Parser's 0xFFFFECDx:
+//
+//   BI_OK                       = 0
+//   BI_ERR_CD_NO_ARG            = 0xFFFFECE1   argc == 1 (no path arg)
+//   BI_ERR_CD_FAIL              = 0xFFFFECE2   sys_chdir returned negative
+//   BI_ERR_EXIT_BAD_CODE        = 0xFFFFECE3   argv[1] does not start with a digit
+//   BI_ERR_EXPORT_MALFORMED     = 0xFFFFECE4   no '=' in argv[1], or empty name
+//   BI_ERR_EXPORT_TABLE_FULL    = 0xFFFFECE5   _bi_env_count == BI_ENV_TABLE_MAX
+//   BI_ERR_EXPORT_POOL_FULL     = 0xFFFFECE6   copy would exceed _bi_env_pool
+//   BI_ERR_PWD_TOO_LONG         = 0xFFFFECE7   sys_getcwd returned negative
+//
+// (0xFFFFECE0 is BI_MISS, defined in Dispatch. Handlers never emit
+// BI_MISS -- it is dispatcher-scoped.)
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Builtins`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (largest is 4096 for
+//     the pool overflow gate, and 255/256 for sys_chdir/sys_getcwd
+//     caps; all fit imm32 with room).
+//   - Large immediates (0xFFFFECE1..0xFFFFECE7 error sentinels) emitted
+//     via `mov rax, imm32` (same form Parser uses for 0xFFFFECDx).
+//   - r11 reserved as .bss LEA scratch for the singletons.
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr]`; byte writes via
+//     `xor rax, rax; mov_b [ptr], rax` (NUL) or `mov rax, val; mov_b
+//     [ptr], rax` (literal).
+//   - Every handler is either a leaf (bi_cd/bi_exit/bi_pwd -- no
+//     callee-save touched, alignment via `sub rsp, 8` for nested calls)
+//     or a 5-push non-leaf (bi_export -- named callee-save state for
+//     name_ptr/name_len/value_ptr/value_len across the two copy loops).
+//   - Labels prefixed `bi_` (bi_cd / bi_exit / bi_export / bi_pwd
+//     / bi_env_reset).
+
+module Builtins = structure {
+
+  // ==========================================================================
+  // Storage caps
+  // ==========================================================================
+  pub let BI_ENV_TABLE_MAX  : u64 = 32
+  pub let BI_ENV_POOL_SIZE  : u64 = 4096
+  pub let BI_PWD_BUF_SIZE   : u64 = 256
+
+  // ==========================================================================
+  // Return-code band 0xFFFFECEx (Builtins module)
+  // ==========================================================================
+  pub let BI_OK                     : u64 = 0
+  pub let BI_ERR_CD_NO_ARG          : u64 = 0xFFFFECE1
+  pub let BI_ERR_CD_FAIL            : u64 = 0xFFFFECE2
+  pub let BI_ERR_EXIT_BAD_CODE      : u64 = 0xFFFFECE3
+  pub let BI_ERR_EXPORT_MALFORMED   : u64 = 0xFFFFECE4
+  pub let BI_ERR_EXPORT_TABLE_FULL  : u64 = 0xFFFFECE5
+  pub let BI_ERR_EXPORT_POOL_FULL   : u64 = 0xFFFFECE6
+  pub let BI_ERR_PWD_TOO_LONG       : u64 = 0xFFFFECE7
+
+  // ==========================================================================
+  // Storage (.bss)
+  //
+  // _bi_env: 32 records * 4 qwords = 128 qwords total. Record i lives at
+  // byte offset i*32; qwords are (name_ptr, name_len, value_ptr, value_len).
+  //
+  // _bi_env_pool: NUL-separated backing storage. name and value bytes
+  // for each record land here contiguously (name bytes + NUL + value
+  // bytes + NUL) with the pointers in the record slot recording where
+  // each begins.
+  //
+  // _bi_pwd_buf: sys_getcwd(_bi_pwd_buf, 256) scratch. Not touched by
+  // any other handler -- pwd is idempotent per invocation.
+  //
+  // bi_nl: two bytes ('\n' + NUL) so the trailing newline after the pwd
+  // path can be emitted via sys_write with count=1 without a separate
+  // fixture. Same shape as the tests/test_syscall_floor.pdx _tsf_msg
+  // fixture (NUL-terminated .rodata; sys_write count excludes NUL).
+  // ==========================================================================
+  pub let mut _bi_env           : [u64; 128]  = uninit @align(16)
+  pub let mut _bi_env_count     : u64         = uninit @align(8)
+  pub let mut _bi_env_pool      : [u8; 4096]  = uninit @align(16)
+  pub let mut _bi_env_pool_used : u64         = uninit @align(8)
+  pub let mut _bi_pwd_buf       : [u8; 256]   = uninit @align(16)
+  pub let bi_nl                 : [u8; 2]     = "\n\0"
+
+  // ==========================================================================
+  // bi_env_reset()
+  //
+  // Signature: bi_env_reset : () -> () !{mem} @{}
+  //
+  // Zero _bi_env_count and _bi_env_pool_used. The _bi_env record array
+  // and _bi_env_pool byte pool themselves need not be zeroed -- readers
+  // only walk records [0.._bi_env_count) and only touch pool bytes
+  // referenced by an existing record's (name_ptr/name_len,
+  // value_ptr/value_len) spans, so stale content past those bounds is
+  // unobservable. Mirrors Parser::parser_reset's discipline.
+  //
+  // Called from Dispatch::dispatch_init at startup (module-loader
+  // sequence). Leaf function; r11 as .bss LEA scratch.
+  // ==========================================================================
+  pub let bi_env_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-004 (#31): zero the two env-table count singletons so a fresh startup or session reset starts from a known-empty state. Only the counts need zeroing -- readers only walk records [0.._bi_env_count) and only touch pool bytes referenced by an existing record's spans, so stale content past those bounds is unobservable (same discipline as parser_reset for _pr_stage_count). xor rax, rax produces the zero; one lea + one mov per singleton. r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed bi_er_.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _bi_env_count];
+        mov [r11], rax;
+        lea r11, [rip + _bi_env_pool_used];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bi_cd(argv_ptr, argc) -> u64
+  //
+  // Signature: bi_cd : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI: argv_ptr -- pointer to NUL-separated argv byte slice for this stage.
+  // RSI: argc     -- number of words in that slice.
+  //
+  // Returns BI_OK on sys_chdir success, BI_ERR_CD_NO_ARG when argc < 2
+  // (distinct from BI_ERR_CD_FAIL per issue -- the fix is different: no
+  // arg means "user forgot to type a path", fail means "path is bad"),
+  // BI_ERR_CD_FAIL when sys_chdir returned a negative errno.
+  //
+  // Path argument is argv[1]: skip past the NUL following argv[0] to
+  // land on the first byte of argv[1]. Walker cap for sys_chdir is 255
+  // (matches the syscall.pdx sys_chdir wrapper's own hint semantics --
+  // the kernel copies min(hint, PATH_MAX-1)=255 bytes until NUL, so
+  // 255 is the standard cap for a walker-length hint over a NUL-
+  // terminated string; a `strlen` on argv[1] would also work but wastes
+  // a walker pass; matches the monorepo cd_builtin at
+  // src/user/dispatch.pdx:602 `mov rsi, 255`).
+  //
+  // Prologue: `sub rsp, 8` alone -- no callee-save state to preserve
+  // across the single nested `call sys_chdir`. Entry rsp % 16 == 8;
+  // sub rsp, 8 -> rsp % 16 == 0 for the SysV call.
+  //
+  // Register plan (function-scope):
+  //   r10 = argv walker (finds NUL past argv[0])
+  //   rax = byte scratch / return code
+  //   rdi, rsi = call args to sys_chdir (reloaded fresh)
+  // ==========================================================================
+  pub let bi_cd : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): cd builtin. argc==1 (no path arg) is a distinct error case per issue -- BI_ERR_CD_NO_ARG names it separately from BI_ERR_CD_FAIL so a user can distinguish 'forgot the path' from 'path is bad' via the return code. argc>=2 walks past argv[0]'s trailing NUL to get argv[1]'s pointer, then calls sys_chdir(argv[1], 255). Walker cap 255 matches syscall.pdx sys_chdir's own hint semantics (kernel copies min(hint, 255) bytes until NUL); mirrors monorepo cd_builtin at src/user/dispatch.pdx:602. On sys_chdir negative errno (signed test rax<0 per the shell repo's own errno-check convention in cd/pwd), return BI_ERR_CD_FAIL. Effect/cap set {mem, sysreg} @{fs} lifted from sys_chdir. Prologue: `sub rsp, 8` alone (no callee-save state; leaf modulo the nested sys_chdir call); matched `add rsp, 8` before every ret. Labels prefixed bi_cd_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16 for sys_chdir call
+
+        cmp rsi, 2;                          // argc < 2 → no path arg
+        jb bi_cd_no_arg;
+
+        // Walk past argv[0]'s trailing NUL to land on argv[1].
+        mov r10, rdi;                        // r10 = walker
+      bi_cd_scan_a0:
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0;
+        je bi_cd_after_a0;
+        add r10, 1;
+        jmp bi_cd_scan_a0;
+      bi_cd_after_a0:
+        add r10, 1;                          // r10 = argv[1]
+
+        // sys_chdir(argv[1], 255)
+        mov rdi, r10;
+        mov rsi, 255;                        // walker CAP (see justification)
+        call sys_chdir;
+        // rax = 0 on success, negative errno on failure.
+        cmp rax, 0;
+        jl bi_cd_fail;
+
+        xor rax, rax;                        // BI_OK
+        add rsp, 8;
+        ret;
+
+      bi_cd_no_arg:
+        mov rax, 0xFFFFECE1;                 // BI_ERR_CD_NO_ARG
+        add rsp, 8;
+        ret;
+
+      bi_cd_fail:
+        mov rax, 0xFFFFECE2;                 // BI_ERR_CD_FAIL
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bi_exit(argv_ptr, argc) -> u64
+  //
+  // Signature: bi_exit : (u64, u64) -> u64 !{sysreg} @{sched}
+  // RDI: argv_ptr -- pointer to NUL-separated argv byte slice for this stage.
+  // RSI: argc     -- number of words in that slice.
+  //
+  // Success path does NOT return (sys_exit terminates the task); the
+  // wrapper's post-call `add rsp, 8; xor rax, rax; ret` is unreachable
+  // and exists only for paideia-as's function-shape terminator check
+  // (every block must end in a return-shaped instruction).
+  //
+  // Failure path (argv[1] does not start with a decimal digit) returns
+  // BI_ERR_EXIT_BAD_CODE without invoking sys_exit so the shell stays
+  // alive and can print an error at ENH-006's REPL.
+  //
+  // Default: argc == 1 (no code arg) => sys_exit(0).
+  //
+  // Parse: argv[1] is walked digit-by-digit into an accumulator
+  // (rax*10 + digit); non-digit terminates. Rejects if the FIRST byte
+  // is not a digit -- the leniency for trailing garbage is intentional
+  // and matches the monorepo dec_parse at src/user/dispatch.pdx:356
+  // (a shell caller typing `exit 0extra` gets exit(0), not a hard
+  // reject; a shell caller typing `exit abc` gets a clean error).
+  //
+  // Prologue: `sub rsp, 8` alone -- no callee-save state; single
+  // nested call to sys_exit.
+  //
+  // Register plan (function-scope):
+  //   r10 = argv walker (finds NUL past argv[0], then walks argv[1])
+  //   rax = accumulator / return code
+  //   rcx = current byte scratch
+  //   r8  = accumulator*10 staging (avoids `imul r,imm` 2-op pitfall)
+  //   rdi = sys_exit arg (parsed code)
+  // ==========================================================================
+  pub let bi_exit : (u64, u64) -> u64 !{sysreg} @{sched} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {sched},
+      justification: "shell.ENH-004 (#31): exit builtin. argc==1 (no code arg) defaults to exit(0). argc>=2 walks argv[1] as a decimal accumulator (acc*10+digit) into rdi, then sys_exit(rdi). If the FIRST byte of argv[1] is not a decimal digit (0x30..0x39), returns BI_ERR_EXIT_BAD_CODE without calling sys_exit -- keeps the shell alive so ENH-006's REPL can print an error. Trailing garbage after a valid digit sequence is silently truncated (matches monorepo dec_parse leniency at src/user/dispatch.pdx:356; a user typing 'exit 0extra' gets exit(0)). Accumulator*10 staged via r8 shl+add+add (r8 = acc*8 + acc + acc) to avoid the 2-op `imul r,imm` encoder pitfall from feedback_pdx_encoder_pitfalls. Effect/cap set {sysreg} @{sched} lifted from sys_exit (kernel does not touch user memory for exit, only reschedules). Prologue: `sub rsp, 8` alone; sys_exit's post-call `add rsp, 8; xor rax, rax; ret` is unreachable but satisfies paideia-as's function-shape terminator. Labels prefixed bi_ex_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16
+
+        cmp rsi, 2;                          // argc < 2 → default exit(0)
+        jb bi_ex_default;
+
+        // Walk past argv[0]'s trailing NUL to land on argv[1].
+        mov r10, rdi;
+      bi_ex_scan_a0:
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0;
+        je bi_ex_after_a0;
+        add r10, 1;
+        jmp bi_ex_scan_a0;
+      bi_ex_after_a0:
+        add r10, 1;                          // r10 = argv[1]
+
+        // First byte must be a digit; else BI_ERR_EXIT_BAD_CODE.
+        xor rcx, rcx;
+        mov_b rcx, [r10];
+        cmp rcx, 0x30;
+        jb bi_ex_bad_code;
+        cmp rcx, 0x39;
+        ja bi_ex_bad_code;
+
+        // Parse loop.
+        xor rax, rax;                        // accumulator = 0
+      bi_ex_parse:
+        xor rcx, rcx;
+        mov_b rcx, [r10];
+        cmp rcx, 0x30;
+        jb bi_ex_parse_done;
+        cmp rcx, 0x39;
+        ja bi_ex_parse_done;
+        // acc = acc*10 + (byte - '0'), staged via r8 shl/add/add to
+        // avoid 2-op imul r,imm.
+        mov r8, rax;
+        shl r8, 3;                           // r8 = acc * 8
+        add r8, rax;                         // r8 = acc * 9
+        add r8, rax;                         // r8 = acc * 10
+        sub rcx, 0x30;
+        add r8, rcx;
+        mov rax, r8;
+        add r10, 1;
+        jmp bi_ex_parse;
+
+      bi_ex_parse_done:
+        mov rdi, rax;
+        jmp bi_ex_go;
+
+      bi_ex_default:
+        xor rdi, rdi;                        // exit(0)
+
+      bi_ex_go:
+        call sys_exit;
+        // Unreachable: sys_exit does not return. The paideia-as function-
+        // shape checker requires a return-shaped terminator; if by some
+        // pathology sys_exit returned, we exit the wrapper cleanly.
+        add rsp, 8;
+        xor rax, rax;
+        ret;
+
+      bi_ex_bad_code:
+        mov rax, 0xFFFFECE3;                 // BI_ERR_EXIT_BAD_CODE
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bi_export(argv_ptr, argc) -> u64
+  //
+  // Signature: bi_export : (u64, u64) -> u64 !{mem} @{}
+  // RDI: argv_ptr -- pointer to NUL-separated argv byte slice for this stage.
+  // RSI: argc     -- number of words in that slice.
+  //
+  // Parses argv[1] as `NAME=VALUE` and stores in the shell-local
+  // _bi_env table. Returns:
+  //
+  //   BI_OK                      -- record added at _bi_env[count]
+  //                                 (name+value copied into _bi_env_pool)
+  //   BI_ERR_EXPORT_MALFORMED    -- argc < 2, or no '=' in argv[1], or
+  //                                 name empty (argv[1] starts with '=')
+  //   BI_ERR_EXPORT_TABLE_FULL   -- _bi_env_count == BI_ENV_TABLE_MAX (32)
+  //   BI_ERR_EXPORT_POOL_FULL    -- pool_used + name_len+1 + value_len+1
+  //                                 > BI_ENV_POOL_SIZE (4096)
+  //
+  // Storage layout:
+  //   The pool receives `NAME\0VALUE\0` at the current pool_used offset.
+  //   Record[count] gets:
+  //     name_ptr   = &_bi_env_pool[pool_used]
+  //     name_len   = strlen(NAME)
+  //     value_ptr  = &_bi_env_pool[pool_used + name_len + 1]
+  //     value_len  = strlen(VALUE)
+  //   Then _bi_env_count += 1 and _bi_env_pool_used += name_len+1+value_len+1.
+  //
+  // Value CAN be empty (`export FOO=`): value_len = 0, value_ptr points
+  // at the trailing NUL byte (a valid zero-length C string). This
+  // matches POSIX `export FOO=` semantics; the D5 caveat is that these
+  // are NEVER exported to children, only readable by later shell lines.
+  //
+  // No duplicate detection at ENH-004: `export FOO=a` followed by
+  // `export FOO=b` allocates two records. The ENH-006 REPL's variable
+  // expansion will read from the LAST record with a matching name (LIFO)
+  // once that path lands; ENH-004 is the storage layer only.
+  //
+  // Prologue: 5 callee-save pushes (rbx name_ptr, r12 name_len, r13
+  // value_ptr, r14 value_len, r15 .bss LEA + walker) = 40 bytes. Entry
+  // rsp % 16 == 8; after 5 pushes rsp % 16 == 0; no local scratch, so
+  // no `sub rsp, N`. rsp % 16 == 0 at every nested `call shell_note`
+  // in the reject paths.
+  //
+  // Register plan:
+  //   rbx = name_ptr in argv[1] (callee-save)
+  //   r12 = name_len (callee-save)
+  //   r13 = value_ptr in argv[1] (callee-save)
+  //   r14 = value_len (callee-save)
+  //   r15 = walker / .bss LEA scratch (callee-save; multi-use)
+  //   r11 = short-scratch .bss LEA (caller-save)
+  //   r10 = saved name_dst_in_pool across the name-copy loop
+  //   r9  = saved value_dst_in_pool across the value-copy loop
+  //   r8  = record byte offset (count * 32) during record write
+  //   rax = general scratch (byte load / arithmetic / return)
+  //   rcx, rdi, rsi, rdx = short-scratch across the copy loops
+  // ==========================================================================
+  pub let bi_export : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-004 (#31): export builtin, Option A (shell-local scope, D5-preserving). Parses argv[1] as NAME=VALUE and appends a record to _bi_env with name/value bytes copied into _bi_env_pool NUL-separated. Rejects: argc<2 -> MALFORMED; no '=' in argv[1] -> MALFORMED; empty name (argv[1] starts with '=') -> MALFORMED; table at cap -> TABLE_FULL; pool would overflow -> POOL_FULL. Value CAN be empty ('export FOO='); value_ptr then points at the trailing NUL, matching POSIX empty-value semantics. No duplicate-name dedup at this layer -- ENH-006's REPL will LIFO-scan for lookup. Byte reads via `xor rax, rax; mov_b rax, [ptr]`; byte writes via `mov_b [ptr], rax`. Record byte offset = count * 32 computed via r8 shl 5 (single shift, no 2-op imul). All large immediates (0xFFFFECE4..0xFFFFECE6 error sentinels) emitted via mov rax, imm32. Prologue: 5 callee-save pushes (40 bytes, no local scratch). Entry rsp%16==8; after 5 pushes rsp%16==0; every nested `call shell_note` sees rsp%16==0. Bumps SH_ST_ERRORS (slot 4) on every reject path (matches parser/lexer discipline). Labels prefixed bi_ex_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // rdi = argv_ptr, rsi = argc
+        cmp rsi, 2;
+        jb bi_exp_malformed;
+
+        // Walk past argv[0]'s trailing NUL to land on argv[1].
+        mov r15, rdi;
+      bi_exp_scan_a0:
+        xor rax, rax;
+        mov_b rax, [r15];
+        cmp rax, 0;
+        je bi_exp_after_a0;
+        add r15, 1;
+        jmp bi_exp_scan_a0;
+      bi_exp_after_a0:
+        add r15, 1;                          // r15 = argv[1]
+
+        // rbx = name_ptr, r15 = walker, r12 = name_len
+        mov rbx, r15;
+        xor r12, r12;
+      bi_exp_find_eq:
+        xor rax, rax;
+        mov_b rax, [r15];
+        cmp rax, 0;
+        je bi_exp_malformed;                 // NUL before '=': malformed
+        cmp rax, 0x3D;                       // '='
+        je bi_exp_eq_found;
+        add r15, 1;
+        add r12, 1;
+        jmp bi_exp_find_eq;
+
+      bi_exp_eq_found:
+        cmp r12, 0;
+        je bi_exp_malformed;                 // empty name
+
+        // r15 -> '='. value_ptr = r15 + 1.
+        mov r13, r15;
+        add r13, 1;
+
+        // Walk value to find NUL, r14 = value_len.
+        mov r15, r13;
+        xor r14, r14;
+      bi_exp_val_len:
+        xor rax, rax;
+        mov_b rax, [r15];
+        cmp rax, 0;
+        je bi_exp_val_len_done;
+        add r15, 1;
+        add r14, 1;
+        jmp bi_exp_val_len;
+      bi_exp_val_len_done:
+        // rbx = name_ptr, r12 = name_len, r13 = value_ptr, r14 = value_len
+
+        // Table full?
+        lea r15, [rip + _bi_env_count];
+        mov rax, [r15];
+        cmp rax, 32;                         // BI_ENV_TABLE_MAX
+        jae bi_exp_table_full;
+
+        // Pool overflow? pool_used + name_len + 1 + value_len + 1 > 4096
+        lea r15, [rip + _bi_env_pool_used];
+        mov r11, [r15];                      // r11 = pool_used (write offset)
+        mov rax, r11;
+        add rax, r12;                        // + name_len
+        add rax, 1;                          // + NUL after name
+        add rax, r14;                        // + value_len
+        add rax, 1;                          // + NUL after value
+        cmp rax, 4096;                       // BI_ENV_POOL_SIZE
+        ja bi_exp_pool_full;
+
+        // Copy name (r12 bytes) from rbx to _bi_env_pool + r11.
+        lea rdi, [rip + _bi_env_pool];
+        add rdi, r11;
+        mov r10, rdi;                        // r10 = saved name_dst_in_pool
+        mov rsi, rbx;
+        mov rcx, r12;
+      bi_exp_copy_name:
+        cmp rcx, 0;
+        je bi_exp_name_done;
+        xor rax, rax;
+        mov_b rax, [rsi];
+        mov_b [rdi], rax;
+        add rsi, 1;
+        add rdi, 1;
+        sub rcx, 1;
+        jmp bi_exp_copy_name;
+      bi_exp_name_done:
+        xor rax, rax;
+        mov_b [rdi], rax;                    // NUL after name
+        add rdi, 1;
+
+        // rdi now points at value_dst_in_pool.
+        mov r9, rdi;                         // r9 = saved value_dst_in_pool
+        mov rsi, r13;
+        mov rcx, r14;
+      bi_exp_copy_value:
+        cmp rcx, 0;
+        je bi_exp_value_done;
+        xor rax, rax;
+        mov_b rax, [rsi];
+        mov_b [rdi], rax;
+        add rsi, 1;
+        add rdi, 1;
+        sub rcx, 1;
+        jmp bi_exp_copy_value;
+      bi_exp_value_done:
+        xor rax, rax;
+        mov_b [rdi], rax;                    // NUL after value
+
+        // Update _bi_env_pool_used = r11 + r12 + 1 + r14 + 1
+        mov rax, r11;
+        add rax, r12;
+        add rax, 1;
+        add rax, r14;
+        add rax, 1;
+        lea r15, [rip + _bi_env_pool_used];
+        mov [r15], rax;
+
+        // Load current count and write record.
+        lea r15, [rip + _bi_env_count];
+        mov rax, [r15];
+        mov r8, rax;
+        shl r8, 5;                           // r8 = record byte offset = count * 32
+        lea r11, [rip + _bi_env];
+        mov [r11 + r8 * 1 + 0], r10;         // name_ptr
+        mov [r11 + r8 * 1 + 8], r12;         // name_len
+        mov [r11 + r8 * 1 + 16], r9;         // value_ptr
+        mov [r11 + r8 * 1 + 24], r14;        // value_len
+
+        // count++
+        add rax, 1;
+        mov [r15], rax;
+
+        xor rax, rax;                        // BI_OK
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_exp_malformed:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECE4;                 // BI_ERR_EXPORT_MALFORMED
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_exp_table_full:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECE5;                 // BI_ERR_EXPORT_TABLE_FULL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_exp_pool_full:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECE6;                 // BI_ERR_EXPORT_POOL_FULL
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bi_pwd(argv_ptr, argc) -> u64
+  //
+  // Signature: bi_pwd : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI: argv_ptr -- unused (pwd takes no args)
+  // RSI: argc     -- unused
+  //
+  // Calls sys_getcwd(_bi_pwd_buf, 256), then sys_write(1, _bi_pwd_buf,
+  // strlen) + sys_write(1, bi_nl, 1). Returns BI_OK on success, or
+  // BI_ERR_PWD_TOO_LONG when sys_getcwd returned a negative errno
+  // (impossible in practice at R86 -- getcwd is called with a full
+  // 256-byte buffer and a task's cwd is always a valid vnode -- but
+  // checked defensively matching the monorepo pwd_builtin's own
+  // negative-errno path at src/user/dispatch.pdx:400).
+  //
+  // sys_getcwd return contract discrepancy: syscall.pdx §sys_getcwd
+  // documents "strlen (excl. NUL) of the written path on success", but
+  // the monorepo cd_builtin/pwd_builtin treat the return as INCLUSIVE
+  // of NUL (they `sub 1` before feeding sys_write). Since the LIVE
+  // monorepo behavior is what the running kernel actually delivers, we
+  // follow the monorepo idiom (`sub 1`) here rather than the shell
+  // repo's own comment. If the shell repo's contract is right and the
+  // monorepo's is wrong, a runtime smoke will trip a short-write and
+  // the fix lands as a one-line change here plus a syscall.pdx comment
+  // audit. Deliberately conservative: matches what runs today.
+  //
+  // Prologue: `sub rsp, 8` alone (three nested syscall wrapper calls;
+  // no callee-save state).
+  //
+  // Register plan (function-scope):
+  //   rax = sys_getcwd return / strlen accumulator
+  //   r10 = strlen (rax - 1) staged across the first sys_write call
+  //         (SysV caller-save, but the sys_write wrapper is a `mov rax
+  //         imm; syscall; ret` leaf that only clobbers rax/rcx/r11 per
+  //         SYSCALL semantics -- r10 survives)
+  //   rdi, rsi, rdx = call args (reloaded fresh each call)
+  // ==========================================================================
+  pub let bi_pwd : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): pwd builtin. Calls sys_getcwd(_bi_pwd_buf, 256) then emits the path via sys_write(1, buf, strlen) + sys_write(1, '\\n', 1). The `sub 1` on sys_getcwd's rax follows the monorepo cd_builtin/pwd_builtin idiom (LIVE runtime treats the return as inclusive of NUL, per src/user/dispatch.pdx:400/628); the shell repo's own syscall.pdx §sys_getcwd comment says exclusive-of-NUL -- discrepancy noted here and in the module header, we defer to LIVE behavior over documentation. Effect/cap set {mem, sysreg} @{fs} lifted from sys_getcwd + sys_write. Prologue: `sub rsp, 8` (aligns rsp%16==0 for the three nested syscall calls; no callee-save state). r10 survives across sys_write per SYSCALL semantics (kernel only clobbers rax/rcx/r11). On sys_getcwd negative errno, return BI_ERR_PWD_TOO_LONG without emitting anything -- matches monorepo pwd_builtin's own fail-silent-return-nonzero convention. argv_ptr / argc parameters are unused (pwd takes no args); kept in signature for uniform dispatcher signature. Labels prefixed bi_pw_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16 for syscalls
+
+        lea rdi, [rip + _bi_pwd_buf];
+        mov rsi, 256;
+        call sys_getcwd;
+        // rax = bytes (incl NUL per monorepo runtime idiom), negative errno on failure.
+
+        cmp rax, 0;
+        jl bi_pw_fail;
+
+        // r10 = strlen (excl NUL) for sys_write count.
+        mov r10, rax;
+        sub r10, 1;
+
+        mov rdi, 1;                          // stdout
+        lea rsi, [rip + _bi_pwd_buf];
+        mov rdx, r10;
+        call sys_write;
+
+        // Trailing newline.
+        mov rdi, 1;
+        lea rsi, [rip + bi_nl];
+        mov rdx, 1;
+        call sys_write;
+
+        xor rax, rax;                        // BI_OK
+        add rsp, 8;
+        ret;
+
+      bi_pw_fail:
+        mov rax, 0xFFFFECE7;                 // BI_ERR_PWD_TOO_LONG
+        add rsp, 8;
+        ret
+      }
+    }
+}

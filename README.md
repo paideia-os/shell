@@ -54,6 +54,34 @@ under R106.
 - **Test infrastructure:** [R106.SHELL-003 (#42)](https://github.com/paideia-os/shell/issues/42)
   — tokenizer + dispatcher test infrastructure.
 
+## Built-in commands (ENH-004)
+
+Four in-process builtins land at ENH-004; the dispatch layer is
+`src/dispatch.pdx` and the handler bodies live in `src/builtins.pdx`.
+Every handler has signature `(argv_ptr, argc) -> u64`; `dispatch_line`
+looks up `argv[0]` against a runtime-loaded table and either calls
+the matching handler (returning its result) or returns `BI_MISS =
+0xFFFFECE0` so the REPL can try the external command path.
+
+| Name     | Description                                                            |
+|----------|------------------------------------------------------------------------|
+| `cd`     | Change working directory via real `sys_chdir` (SC+ 85).                |
+| `exit`   | Terminate the shell via real `sys_exit` (SC+ 60). Optional decimal code. |
+| `export` | Set a **shell-local** variable (see D5 note below).                    |
+| `pwd`    | Print the current directory via real `sys_getcwd` (SC+ 86) + `sys_write`. |
+
+**D5 note on `export`.** The shell reads no environment variables
+(D5, `design/architecture.md`). `export NAME=VALUE` therefore populates
+a **shell-local** variable table (`_bi_env`, cap 32 records / 4096
+bytes) that is **NOT inherited by children** -- `sys_execve` does not
+receive an `envp`, and the shell does not forward the table. The
+table is available for variable expansion at the ENH-006 REPL; it is
+never visible outside this shell process. A future "genuine" env
+inheritance would land as a distinct KIND (e.g. `KIND_ENV_SLOT`) with
+explicit narrowing, not by widening ambient env. This matches the D2
+capability-is-the-only-inheritable-authority stance the project has
+held since v1.0.0.
+
 ## Layout
 
 ```

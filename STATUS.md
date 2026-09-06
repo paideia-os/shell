@@ -239,6 +239,14 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFECD2 | PR_ERR_TRAILING_PIPE      | Parser.ENH-003: line ends with `\|`                 |
 | 0xFFFFECD3 | PR_ERR_EMPTY_STAGE        | Parser.ENH-003: two `\|` with no words between      |
 | 0xFFFFECD4 | PR_ERR_ARGV_POOL_OVERFLOW | Parser.ENH-003: words exceed 4096-byte argv pool    |
+| 0xFFFFECE0 | BI_MISS                   | Dispatch.ENH-004: argv[0] matched no builtin (try external) |
+| 0xFFFFECE1 | BI_ERR_CD_NO_ARG          | Builtins.ENH-004: `cd` invoked with no path argument |
+| 0xFFFFECE2 | BI_ERR_CD_FAIL            | Builtins.ENH-004: sys_chdir returned negative errno |
+| 0xFFFFECE3 | BI_ERR_EXIT_BAD_CODE      | Builtins.ENH-004: `exit` argv[1] does not start with a digit |
+| 0xFFFFECE4 | BI_ERR_EXPORT_MALFORMED   | Builtins.ENH-004: `export` argv[1] has no '=' or empty name |
+| 0xFFFFECE5 | BI_ERR_EXPORT_TABLE_FULL  | Builtins.ENH-004: shell-local env table at BI_ENV_TABLE_MAX (32) |
+| 0xFFFFECE6 | BI_ERR_EXPORT_POOL_FULL   | Builtins.ENH-004: name+value would exceed 4096-byte env pool |
+| 0xFFFFECE7 | BI_ERR_PWD_TOO_LONG       | Builtins.ENH-004: sys_getcwd returned negative errno |
 
 ## Milestone rollup
 

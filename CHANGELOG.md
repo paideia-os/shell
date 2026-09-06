@@ -4,6 +4,94 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-004: builtin dispatch (#31)
+
+The v1.0.0 audit and ENH-002/003 landed lex + parse; ENH-004 lands the
+in-process command layer. Introduces the `builtin` concept the repo
+did not previously carry (no `builtin` symbol in `src/`, `caps.decl`,
+or `design/architecture.md` before this change) and the runtime-loaded
+triple table (`_bi_names` / `_bi_name_lens` / `_bi_handlers`) that
+dispatches argv[0] to one of four handlers.
+
+Design tension resolved: README states shell reads **no environment
+variables** and treats env as an ambient-authority channel D5 avoids;
+`export` chooses **Option A** per issue (shell-local variable table,
+NOT inherited by children). D5 stands; no amendment to
+`design/architecture.md` D5; no envp change to sys_execve. The
+exported table serves the shell's own subsequent line evaluations
+(variable expansion at ENH-006 REPL) -- children see nothing new.
+
+### Added
+
+- `src/builtins.pdx` -- `Builtins` module. Four handlers each with
+  signature `(argv_ptr: u64, argc: u64) -> u64`:
+  - `bi_cd` -- calls REAL `sys_chdir` (SC+ 85), walker cap 255;
+    `argc==1` distinct error `BI_ERR_CD_NO_ARG`.
+  - `bi_exit` -- calls REAL `sys_exit` (SC+ 60); parses `argv[1]`
+    as decimal (leniency for trailing garbage, matches monorepo
+    dec_parse); rejects non-digit first byte with
+    `BI_ERR_EXIT_BAD_CODE`; default code 0 when `argc==1`.
+  - `bi_export` -- shell-local env table (Option A). Storage:
+    `_bi_env` (32 records * 4 qwords: name_ptr, name_len, value_ptr,
+    value_len), `_bi_env_pool` (4096 bytes NUL-separated), plus
+    `_bi_env_count` / `_bi_env_pool_used` counts. Rejects malformed
+    (no '=' or empty name), table full, pool full.
+  - `bi_pwd` -- calls REAL `sys_getcwd` (SC+ 86) into `_bi_pwd_buf`
+    (256 bytes), then `sys_write(1, buf, strlen) + sys_write(1, '\n', 1)`.
+  Fresh return-code sub-band `0xFFFFECEx`: `BI_ERR_CD_NO_ARG`,
+  `BI_ERR_CD_FAIL`, `BI_ERR_EXIT_BAD_CODE`, `BI_ERR_EXPORT_MALFORMED`,
+  `BI_ERR_EXPORT_TABLE_FULL`, `BI_ERR_EXPORT_POOL_FULL`,
+  `BI_ERR_PWD_TOO_LONG`.
+- `src/dispatch.pdx` -- `Dispatch` module. Runtime-loaded triple
+  table `_bi_names[16]` / `_bi_name_lens[16]` / `_bi_handlers[16]`
+  populated at startup by `dispatch_init`. `dispatch_line(argv_ptr,
+  argc) -> u64` walks the table with a fast length gate
+  (precomputed `_bi_name_lens` avoids per-lookup strlen) and returns
+  the handler's result on hit or `BI_MISS = 0xFFFFECE0` on no
+  match. Table cap 16 (12 slots headroom above the four initial
+  builtins for ENH-005+ additions).
+- `tests/test_builtins.pdx` -- `TestBuiltins` module. Six cases in
+  the `0xFFFFED7x` band: `dispatch_miss_ls`, `dispatch_hit_export`
+  (load-bearing: dispatch -> handler -> record write end-to-end),
+  `cd_no_arg`, `export_shell_local` (verifies record layout AND pool
+  bytes byte-for-byte), `export_malformed`, `dispatch_hit_pwd`
+  (disjunctive: any non-BI_MISS return proves dispatch reached
+  bi_pwd; the sys_getcwd round-trip is a live-kernel concern).
+  Umbrella `tbi_run_all`. `bi_exit` and `bi_cd`'s live-syscall path
+  are intentionally NOT unit-tested (sys_exit would kill the driver;
+  sys_chdir needs a live kernel); deferred to the paideia-os boot
+  smoke.
+- `design/architecture.md` §2d -- Builtins + Dispatch module
+  documentation (contract, storage, D5 resolution note, error codes,
+  fingerprint) matching the §2b / §2c shape.
+- `design/architecture.md` §5 and §7.4 -- return-code table extended
+  with the `0xFFFFECEx` Builtins/Dispatch rows and the `0xFFFFED7x`
+  TestBuiltins row.
+- `README.md` -- new "Built-in commands" section listing cd / exit /
+  export / pwd with the D5 note on export scoping.
+
+### Changed
+
+- `src/shell.pdx` -- mirrored `SH_BI_*` constants in the
+  `0xFFFFECEx` band alongside the existing `SH_LX_*` / `SH_PR_*`
+  mirrors, so a Shell-level caller can spell every builtin/dispatch
+  sentinel without explicit Dispatch/Builtins imports.
+- `manifest.pdxproj` -- `src/builtins.pdx` + `src/dispatch.pdx`
+  registered after `src/parser.pdx` and before `src/line_reader.pdx`
+  (logical order: dispatch consumes parser output, feeds the
+  ENH-006 REPL); `tests/test_builtins.pdx` appended to the test
+  list.
+- `STATUS.md` -- return-code table extended with the eight
+  `0xFFFFECEx` Builtins/Dispatch rows.
+
+### Unblocks
+
+`#32` real exec (dispatch_line returning `BI_MISS` is the trigger
+for the external command path), `#33` `Shell::shell_main` REPL
+(the `lex -> parse -> dispatch (builtin) or exec (non-builtin) ->
+history -> loop` shape now has dispatch). The critical path from
+ENH-001 through ENH-006 is now open at the builtin boundary.
+
 ## Unreleased — ENH-003: parser (#30)
 
 The v1.0.0 audit found that `Pipeline::pipeline_plan` took a

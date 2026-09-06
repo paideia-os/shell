@@ -437,6 +437,195 @@ contract:
 The umbrella driver `tpr_run_all` matches the family shape so a
 boot-time smoke harness invokes all seven drivers uniformly.
 
+## 2d. `Builtins` + `Dispatch` modules — ENH-004 (#31)
+
+### 2d.1 Purpose
+
+The missing in-process command layer. At `v1.0.0` (and through
+ENH-003) NO `builtin` symbol existed in `src/`, `caps.decl`, or
+`design/architecture.md`. ENH-004 introduces the concept and lands
+the four minimum-viable handlers the enhancement plan enumerates:
+`cd`, `exit`, `export`, `pwd`. The dispatch surface
+(`dispatch_line` + the runtime-loaded triple table) lives in
+`src/dispatch.pdx`; the handler bodies + the shell-local env storage
+live in `src/builtins.pdx`.
+
+### 2d.2 Contract
+
+```
+Builtins:
+  bi_cd     : (u64 argv_ptr, u64 argc) -> u64
+  bi_exit   : (u64 argv_ptr, u64 argc) -> u64
+  bi_export : (u64 argv_ptr, u64 argc) -> u64
+  bi_pwd    : (u64 argv_ptr, u64 argc) -> u64
+  bi_env_reset : () -> ()
+
+Dispatch:
+  dispatch_init : () -> ()
+  dispatch_line : (u64 argv_ptr, u64 argc) -> u64
+```
+
+`argv_ptr` points at a stage's NUL-separated argv byte slice
+(typically `_pr_argv_pool + stage.argv_offset` from ENH-003, but
+dispatch is decoupled from Parser's `_pr_stages` shape -- any
+NUL-separated argv layout works). Each `argv[i]` is resolved by
+scanning `i` NULs forward from the base pointer.
+
+### 2d.3 Design tension: `export` vs D5 ambient authority
+
+`design/enhancement-plan.md` §Stage 2 flagged the tension: README /
+this doc D5 state the shell reads NO environment variables and
+treats env as an ambient-authority channel the project avoids. An
+`export` builtin appears in direct conflict.
+
+**ENH-004 chooses Option A per the issue's recommendation:** scope
+`export` to a **shell-local variable table that is NOT inherited by
+children**. D5 stands. No amendment to D5. No change to `caps.decl`.
+No envp change to the `sys_execve` path. The exported table serves
+the shell's own subsequent line evaluations (variable expansion at
+ENH-006's REPL) -- children see nothing new.
+
+This matches the D2/D5 stance the project has held since the v1.0.0
+encoder body: capabilities are the ONLY inheritable authority. A
+future need for "genuine" env inheritance would land as a distinct
+KIND (e.g., `KIND_ENV_SLOT`) with explicit narrowing, not by
+widening ambient env.
+
+### 2d.4 Shell-local env storage
+
+```
+_bi_env           : [u64; 128] uninit @align(16)  -- 32 records * 4 qw each
+_bi_env_count     : u64                           -- populated records
+_bi_env_pool      : [u8; 4096] uninit @align(16)  -- NUL-separated backing
+_bi_env_pool_used : u64                           -- bytes consumed (write ptr)
+```
+
+Record layout per issue directive (record `i` at byte offset `i*32`):
+
+```
+[i*32 +  0]  name_ptr   (into _bi_env_pool)
+[i*32 +  8]  name_len
+[i*32 + 16]  value_ptr  (into _bi_env_pool)
+[i*32 + 24]  value_len
+```
+
+Written only on the `BI_OK` path; on any error the record slot is
+left untouched (return code is the authoritative signal).
+`bi_env_reset` (called from `dispatch_init` at startup) clears
+`_bi_env_count` and `_bi_env_pool_used` -- record bytes past those
+counts are unobservable.
+
+### 2d.5 Dispatch table
+
+The runtime-loaded triple table lives in `Dispatch`:
+
+```
+_bi_names      : [u64; 16] uninit @align(8)  -- pointer to NUL-terminated name
+_bi_name_lens  : [u64; 16] uninit @align(8)  -- precomputed name length (excl NUL)
+_bi_handlers   : [u64; 16] uninit @align(8)  -- function pointer (u64, u64) -> u64
+_bi_count      : u64                          -- populated slots (== 4 at ENH-004)
+```
+
+Same three-parallel-arrays shape the monorepo's canonical dispatch
+uses at `src/user/dispatch.pdx:71-74`. Adds a `_bi_name_lens` variant
+so `dispatch_line` avoids a per-lookup `strlen` scan (the argv[0]
+length is computed once via the byte walker, then compared against
+each candidate's precomputed length). `BI_TABLE_MAX = 16` leaves 12
+slots of headroom above the four ENH-004 builtins for ENH-005+
+additions (help/env/echo/history/type/which/alias/jobs/read/wait/
+unalias/clear) without a re-layout.
+
+Names are short byte-array constants (`bi_name_cd` = `"cd\0"`,
+etc.) in `Dispatch` module-scope. Populated at startup by
+`dispatch_init` (LEA loads into the runtime table) because
+paideia-as does not support address-of-symbol in static array
+initializers -- same reason monorepo's `dispatch_init` at
+`src/user/dispatch.pdx:104` uses this idiom.
+
+### 2d.6 `dispatch_line` algorithm
+
+```
+if argc == 0: return BI_MISS
+argv0_len = walker_strlen(argv_ptr)
+for i in 0.._bi_count:
+  if _bi_name_lens[i] != argv0_len: continue        (fast length gate)
+  if bytes(argv_ptr, _bi_names[i], argv0_len) match:
+    return _bi_handlers[i](argv_ptr, argc)
+return BI_MISS
+```
+
+Byte compare is inline (no `memcmp` dependency). The four ENH-004
+names have four distinct lengths (2/4/6/3), so length alone
+disambiguates all four candidates -- byte compare is only reached
+for the matching candidate.
+
+### 2d.7 Error codes
+
+Fresh sub-band `0xFFFFECEx`:
+
+- `BI_MISS = 0xFFFFECE0` -- dispatch found no matching builtin.
+  This is the REPL's signal to try the external command path
+  (ENH-005), not an error.
+- `BI_ERR_CD_NO_ARG = 0xFFFFECE1` -- `cd` invoked without a path.
+  Distinct from `BI_ERR_CD_FAIL` per issue -- the user's fix is
+  different (type a path vs fix the path).
+- `BI_ERR_CD_FAIL = 0xFFFFECE2` -- `sys_chdir` returned negative
+  errno.
+- `BI_ERR_EXIT_BAD_CODE = 0xFFFFECE3` -- `exit` argv[1] does not
+  start with a decimal digit.
+- `BI_ERR_EXPORT_MALFORMED = 0xFFFFECE4` -- `export` argv[1] has
+  no `=` or the name (bytes before `=`) is empty.
+- `BI_ERR_EXPORT_TABLE_FULL = 0xFFFFECE5` -- `_bi_env_count ==
+  BI_ENV_TABLE_MAX`.
+- `BI_ERR_EXPORT_POOL_FULL = 0xFFFFECE6` -- name + value bytes
+  would exceed `BI_ENV_POOL_SIZE` (4096).
+- `BI_ERR_PWD_TOO_LONG = 0xFFFFECE7` -- `sys_getcwd` returned
+  negative errno.
+
+The Shell module mirrors these as `SH_BI_*` alongside the existing
+`SH_LX_*` / `SH_PR_*` mirrors.
+
+### 2d.8 Substrate deferral
+
+`bi_cd`, `bi_exit`, `bi_pwd` call the real kernel syscall wrappers
+from `Syscall` (`sys_chdir` SC+ 85, `sys_exit` SC+ 60, `sys_getcwd`
+SC+ 86, `sys_write` SC+ 1). These wrappers were landed at ENH-001;
+the paideia-os kernel bodies for `sys_chdir` / `sys_getcwd` landed
+at R86.M1-006/007 (paideia-os #1959/#1960). No substrate deferral
+for the syscall floor.
+
+The `sys_chdir` + `sys_getcwd` round-trip (`cd /tmp` followed by
+`pwd` prints `/tmp`) is a live-kernel property verified by the
+paideia-os side's boot-time smoke harness (parallel to the
+substrate-half smoke for `tsm_run_all` / `tsf_run_all`). The
+pure-function properties of the dispatch + argv-parse layer are
+tested here in `tests/test_builtins.pdx` and covered under the
+0xFFFFED7x fail-code band.
+
+### 2d.9 Fingerprint (`tests/test_builtins.pdx`)
+
+Six cases in the `0xFFFFED7x` fail-code band cover the pure-function
+surface:
+
+- `tbi_case_dispatch_miss_ls` -- argv `ls\0` -> `BI_MISS`.
+- `tbi_case_dispatch_hit_export` -- argv `export\0FOO=bar\0` ->
+  `BI_OK`, `_bi_env_count == 1`, record `[0]` has `name_len=3`,
+  `value_len=3`. Load-bearing end-to-end case.
+- `tbi_case_cd_no_arg` -- `bi_cd(argc=1)` -> `BI_ERR_CD_NO_ARG`
+  (rejects before touching `sys_chdir`).
+- `tbi_case_export_shell_local` -- `bi_export("X=y")` -> `BI_OK`,
+  verifies record layout AND pool bytes (`X\0y\0`) byte-for-byte.
+- `tbi_case_export_malformed` -- `bi_export("FOO")` ->
+  `BI_ERR_EXPORT_MALFORMED`, verifies `_bi_env_count` still 0
+  (reject leaves state untouched).
+- `tbi_case_dispatch_hit_pwd` -- `dispatch_line("pwd", 1)` ->
+  any non-`BI_MISS` (either `BI_OK` on live kernel or
+  `BI_ERR_PWD_TOO_LONG` offline). Verifies dispatch reached
+  `bi_pwd`; the sys_getcwd round-trip is deferred to live boot.
+
+The umbrella driver `tbi_run_all` matches the family shape so a
+boot-time smoke harness invokes all eight drivers uniformly.
+
 ## 3. `LineReader` module (src/line_reader.pdx)
 
 ### 3.1 Contract
@@ -987,6 +1176,14 @@ the smoke matrix pulls both sides into one build.
 0xFFFFECD2  PR_ERR_TRAILING_PIPE      Parser.ENH-003: line ends with `|`
 0xFFFFECD3  PR_ERR_EMPTY_STAGE        Parser.ENH-003: `|| ` -- empty stage
 0xFFFFECD4  PR_ERR_ARGV_POOL_OVERFLOW Parser.ENH-003: words > _pr_argv_pool (4096)
+0xFFFFECE0  BI_MISS                   Dispatch.ENH-004: no builtin matched argv[0] (try external)
+0xFFFFECE1  BI_ERR_CD_NO_ARG          Builtins.ENH-004: `cd` invoked with no path
+0xFFFFECE2  BI_ERR_CD_FAIL            Builtins.ENH-004: sys_chdir returned negative errno
+0xFFFFECE3  BI_ERR_EXIT_BAD_CODE      Builtins.ENH-004: `exit` argv[1] not decimal
+0xFFFFECE4  BI_ERR_EXPORT_MALFORMED   Builtins.ENH-004: `export` argv[1] no '=' or empty name
+0xFFFFECE5  BI_ERR_EXPORT_TABLE_FULL  Builtins.ENH-004: env table at BI_ENV_TABLE_MAX (32)
+0xFFFFECE6  BI_ERR_EXPORT_POOL_FULL   Builtins.ENH-004: env name+value > 4096-byte pool
+0xFFFFECE7  BI_ERR_PWD_TOO_LONG       Builtins.ENH-004: sys_getcwd returned negative errno
 ```
 
 (Sub-bands `0xFFFFECAx` (ReleaseManifest) and `0xFFFFECBx` (BrokerBind)
@@ -1102,6 +1299,7 @@ golden bytes don't match, there's no point booting the guest.
 - `0xFFFFED4x` — TestSyscallFloor (ENH-001, #28).
 - `0xFFFFED5x` — TestLexer (ENH-002, #29).
 - `0xFFFFED6x` — TestParser (ENH-003, #30).
+- `0xFFFFED7x` — TestBuiltins (ENH-004, #31).
 
 These are disjoint from the shell's own `0xFFFFECxx` band so an
 operator reading a test-run log can tell "SUT rejected input" from

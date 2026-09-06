@@ -140,6 +140,29 @@ module Shell = structure {
   pub let SH_PR_ERR_EMPTY_STAGE          : u64 = 0xFFFFECD3
   pub let SH_PR_ERR_ARGV_POOL_OVERFLOW   : u64 = 0xFFFFECD4
 
+  // Builtins + Dispatch return codes (0xFFFFECEx) -- ENH-004 (#31).
+  // Authoritative definitions in src/dispatch.pdx (BI_MISS/BI_HIT_OK)
+  // and src/builtins.pdx (BI_OK, BI_ERR_*); mirrored here in the
+  // SH_BI_* namespace so a Shell-level caller can spell every builtin
+  // sentinel without explicit Dispatch / Builtins imports. Same
+  // pattern the SH_LX_* / SH_PR_* mirrors above use.
+  //
+  // Note: SH_BI_MISS is NOT an error -- it is the dispatcher's signal
+  // to the REPL (ENH-006) that the external command path should be
+  // tried next. Sits at the TOP of the 0xFFFFECEx band with the actual
+  // handler errors below so a return-code reader can distinguish
+  // "dispatch never found the name" from "dispatch found the name but
+  // the handler refused" at a glance.
+  pub let SH_BI_OK                       : u64 = 0            // == BI_OK / BI_HIT_OK
+  pub let SH_BI_MISS                     : u64 = 0xFFFFECE0
+  pub let SH_BI_ERR_CD_NO_ARG            : u64 = 0xFFFFECE1
+  pub let SH_BI_ERR_CD_FAIL              : u64 = 0xFFFFECE2
+  pub let SH_BI_ERR_EXIT_BAD_CODE        : u64 = 0xFFFFECE3
+  pub let SH_BI_ERR_EXPORT_MALFORMED     : u64 = 0xFFFFECE4
+  pub let SH_BI_ERR_EXPORT_TABLE_FULL    : u64 = 0xFFFFECE5
+  pub let SH_BI_ERR_EXPORT_POOL_FULL     : u64 = 0xFFFFECE6
+  pub let SH_BI_ERR_PWD_TOO_LONG         : u64 = 0xFFFFECE7
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //

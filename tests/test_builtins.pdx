@@ -1,0 +1,650 @@
+// tests/test_builtins.pdx -- shell.ENH-004 (paideia-os/shell#31)
+//
+// TestBuiltins module: fingerprint driver for Dispatch.dispatch_line +
+// the four Builtins handlers.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Six cases cover the builtin dispatch surface:
+//
+//   tbi_case_dispatch_miss_ls       argv "ls\0"           -> BI_MISS
+//   tbi_case_dispatch_hit_export    argv "export\0FOO=bar\0" argc=2
+//                                     -> BI_OK, _bi_env[0] populated
+//   tbi_case_cd_no_arg              bi_cd(argv "cd\0", argc=1)
+//                                     -> BI_ERR_CD_NO_ARG
+//   tbi_case_export_shell_local     bi_export("export\0X=y\0", argc=2)
+//                                     -> BI_OK + verify _bi_env[0]
+//   tbi_case_export_malformed       bi_export("export\0FOO\0", argc=2)
+//                                     -> BI_ERR_EXPORT_MALFORMED
+//   tbi_case_dispatch_hit_pwd       dispatch(argv "pwd\0", argc=1)
+//                                     -> BI_OK OR BI_ERR_PWD_TOO_LONG
+//                                        (either proves dispatch reached
+//                                        bi_pwd; the specific outcome
+//                                        depends on live sys_getcwd)
+//
+// The `hit_pwd` case's disjunctive expectation is DELIBERATE runtime-
+// verification scoping: the pure-function surface is dispatch_line's
+// lookup + argv-parse behavior. The bi_pwd handler DOES fire sys_getcwd
+// + sys_write when reached, but those calls' outcome is a live-kernel
+// concern -- what the test checks here is that the dispatch machinery
+// found bi_pwd (not BI_MISS) and called it (a handler-owned return code
+// came back). Same runtime-verification asymmetry as tsf_case_getcwd's
+// negative-errno branch documents.
+//
+// =============================================================================
+// RUNTIME VERIFICATION DEFERRAL
+// =============================================================================
+//
+// The full sys_chdir + sys_getcwd round-trip (`cd /tmp` followed by
+// `pwd` prints `/tmp`) requires a live kernel and belongs to the
+// paideia-os side's boot-time smoke harness (parallel to the
+// substrate-half smoke for tsm_run_all / tsf_run_all). This module's
+// scope stops at:
+//
+//   (a) argv-parsing correctness across the byte pool -- the byte
+//       walker for argv[1] discovery, the malformed-export detection,
+//       the no-arg cd distinction.
+//   (b) dispatch table populated correctly and lookup hits the right
+//       handler by length + byte compare.
+//   (c) shell-local env table storage layout (Option A per issue) --
+//       records land at the right offsets with the right pointers +
+//       lengths.
+//
+// The `bi_exit` handler is NOT unit-tested in this module: sys_exit
+// terminates the task, which would kill the driver mid-run. It is
+// implicitly exercised by ENH-006's shell_main EOF branch when it
+// lands.
+//
+// The `bi_cd` handler's sys_chdir path is NOT unit-tested for the
+// same reason as pwd -- a live kernel is needed to observe cwd change.
+// The `bi_cd(argc==1)` reject path IS tested (it never touches
+// sys_chdir).
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFED7x
+// =============================================================================
+//
+//   0            TBI_PASS                        all cases passed
+//   0xFFFFED70   TBI_FAIL_DISPATCH_MISS          miss case returned wrong code
+//   0xFFFFED71   TBI_FAIL_DISPATCH_HIT_EXPORT    dispatch->export return wrong code
+//   0xFFFFED72   TBI_FAIL_CD_NO_ARG              bi_cd(argc=1) returned wrong code
+//   0xFFFFED73   TBI_FAIL_EXPORT_SHELL_LOCAL     export state or return wrong
+//   0xFFFFED74   TBI_FAIL_EXPORT_MALFORMED       export malformed return wrong
+//   0xFFFFED75   TBI_FAIL_DISPATCH_HIT_PWD       pwd dispatch returned BI_MISS
+//
+// The band extends the family:
+//   0xFFFFED0x  TestCapsNarrow
+//   0xFFFFED1x  TestAuditFirst
+//   0xFFFFED2x  TestSmokeMatrix
+//   0xFFFFED3x  TestReleaseManifest
+//   0xFFFFED4x  TestSyscallFloor
+//   0xFFFFED5x  TestLexer
+//   0xFFFFED6x  TestParser
+//   0xFFFFED7x  TestBuiltins            <-- this module
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestBuiltins`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF; error sentinel
+//     compares stage via r11 (mov r11, imm64; cmp rax, r11).
+//   - r11 scratch for .bss reach + large-imm compare temporaries.
+//   - Byte writes to fixtures use mov_b.
+//   - Case entries push 2 callee-saves (rbx, r12) + `sub rsp, 8` =
+//     24 bytes prologue; matched pop sequence at every return. This
+//     yields rsp%16==0 for the nested `call dispatch_line` /
+//     `call bi_cd` / etc. (Entry rsp%16==8; 2 pushes -> 8-16=-8=8;
+//     sub 8 -> 0.)
+
+module TestBuiltins = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED7x band)
+  // ==========================================================================
+  pub let TBI_PASS                     : u64 = 0
+  pub let TBI_FAIL_DISPATCH_MISS       : u64 = 0xFFFFED70
+  pub let TBI_FAIL_DISPATCH_HIT_EXPORT : u64 = 0xFFFFED71
+  pub let TBI_FAIL_CD_NO_ARG           : u64 = 0xFFFFED72
+  pub let TBI_FAIL_EXPORT_SHELL_LOCAL  : u64 = 0xFFFFED73
+  pub let TBI_FAIL_EXPORT_MALFORMED    : u64 = 0xFFFFED74
+  pub let TBI_FAIL_DISPATCH_HIT_PWD    : u64 = 0xFFFFED75
+
+  // ==========================================================================
+  // Fixture buffers (.bss).
+  //
+  // Each fixture holds a NUL-separated argv slice matching the shape
+  // dispatch_line and the handlers expect (as if produced by
+  // Parser::parser_parse into _pr_argv_pool + stage.argv_offset). N in
+  // `[u8; N]` sized to hold the argv text with headroom; the population
+  // sequence in tbi_reset fills the significant bytes and leaves the
+  // rest zero-initialised (@align(8) zero-inits at loader time).
+  //
+  //   _tbi_argv_ls        "ls\0"                 3  bytes  (argc=1)
+  //   _tbi_argv_export_a  "export\0FOO=bar\0"    15 bytes  (argc=2)
+  //   _tbi_argv_export_b  "export\0X=y\0"        11 bytes  (argc=2)
+  //   _tbi_argv_export_m  "export\0FOO\0"        11 bytes  (argc=2)
+  //   _tbi_argv_cd_no_arg "cd\0"                 3  bytes  (argc=1)
+  //   _tbi_argv_pwd       "pwd\0"                4  bytes  (argc=1)
+  // ==========================================================================
+  pub let mut _tbi_argv_ls        : [u8; 8]  = uninit @align(8)
+  pub let mut _tbi_argv_export_a  : [u8; 24] = uninit @align(8)
+  pub let mut _tbi_argv_export_b  : [u8; 16] = uninit @align(8)
+  pub let mut _tbi_argv_export_m  : [u8; 16] = uninit @align(8)
+  pub let mut _tbi_argv_cd_no_arg : [u8; 8]  = uninit @align(8)
+  pub let mut _tbi_argv_pwd       : [u8; 8]  = uninit @align(8)
+
+  // ==========================================================================
+  // tbi_reset() -> ()
+  //
+  // Populate all six fixture buffers with their argv bytes via mov_b,
+  // and call dispatch_init to ensure the builtin table is populated
+  // and bi_env_reset has cleared the shell-local env table. Following
+  // test_parser.pdx / test_lexer.pdx pattern (populate + reset in one
+  // sequence at the top of each case).
+  //
+  // Leaf-ish: one nested call to dispatch_init. Uses `sub rsp, 8` for
+  // alignment of that call; matched `add rsp, 8` before ret.
+  // ==========================================================================
+  pub let tbi_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-004 (#31): populate all argv fixtures then dispatch_init. Fixture population uses the mov_b idiom test_parser.pdx / test_lexer.pdx / test_smoke_matrix.pdx established (literal byte in rax, mov_b to fixture). Every literal byte is ASCII (0x30..0x7c range) except NUL (0x00). dispatch_init call populates the runtime-loaded builtin table AND clears the shell-local env table (bi_env_reset invoked at the tail of dispatch_init), so a subsequent bi_export lands at slot 0 with the fresh pool_used=0. `sub rsp, 8` prologue aligns rsp%16==0 for the nested dispatch_init call; matched `add rsp, 8` before ret. Labels prefixed tbi_rs_ (none needed -- linear body).",
+      block: {
+        sub rsp, 8;                          // align for dispatch_init call
+
+        // Populate _tbi_argv_ls: "ls\0" (3 bytes).
+        lea r10, [rip + _tbi_argv_ls];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+        xor rax, rax;  mov_b [r10 + 2], rax;    // NUL
+
+        // Populate _tbi_argv_export_a: "export\0FOO=bar\0" (15 bytes).
+        lea r10, [rip + _tbi_argv_export_a];
+        mov rax, 0x65; mov_b [r10 +  0], rax;   // 'e'
+        mov rax, 0x78; mov_b [r10 +  1], rax;   // 'x'
+        mov rax, 0x70; mov_b [r10 +  2], rax;   // 'p'
+        mov rax, 0x6f; mov_b [r10 +  3], rax;   // 'o'
+        mov rax, 0x72; mov_b [r10 +  4], rax;   // 'r'
+        mov rax, 0x74; mov_b [r10 +  5], rax;   // 't'
+        xor rax, rax;  mov_b [r10 +  6], rax;   // NUL
+        mov rax, 0x46; mov_b [r10 +  7], rax;   // 'F'
+        mov rax, 0x4f; mov_b [r10 +  8], rax;   // 'O'
+        mov rax, 0x4f; mov_b [r10 +  9], rax;   // 'O'
+        mov rax, 0x3d; mov_b [r10 + 10], rax;   // '='
+        mov rax, 0x62; mov_b [r10 + 11], rax;   // 'b'
+        mov rax, 0x61; mov_b [r10 + 12], rax;   // 'a'
+        mov rax, 0x72; mov_b [r10 + 13], rax;   // 'r'
+        xor rax, rax;  mov_b [r10 + 14], rax;   // NUL
+
+        // Populate _tbi_argv_export_b: "export\0X=y\0" (11 bytes).
+        lea r10, [rip + _tbi_argv_export_b];
+        mov rax, 0x65; mov_b [r10 +  0], rax;   // 'e'
+        mov rax, 0x78; mov_b [r10 +  1], rax;   // 'x'
+        mov rax, 0x70; mov_b [r10 +  2], rax;   // 'p'
+        mov rax, 0x6f; mov_b [r10 +  3], rax;   // 'o'
+        mov rax, 0x72; mov_b [r10 +  4], rax;   // 'r'
+        mov rax, 0x74; mov_b [r10 +  5], rax;   // 't'
+        xor rax, rax;  mov_b [r10 +  6], rax;   // NUL
+        mov rax, 0x58; mov_b [r10 +  7], rax;   // 'X'
+        mov rax, 0x3d; mov_b [r10 +  8], rax;   // '='
+        mov rax, 0x79; mov_b [r10 +  9], rax;   // 'y'
+        xor rax, rax;  mov_b [r10 + 10], rax;   // NUL
+
+        // Populate _tbi_argv_export_m: "export\0FOO\0" (11 bytes).
+        lea r10, [rip + _tbi_argv_export_m];
+        mov rax, 0x65; mov_b [r10 +  0], rax;   // 'e'
+        mov rax, 0x78; mov_b [r10 +  1], rax;   // 'x'
+        mov rax, 0x70; mov_b [r10 +  2], rax;   // 'p'
+        mov rax, 0x6f; mov_b [r10 +  3], rax;   // 'o'
+        mov rax, 0x72; mov_b [r10 +  4], rax;   // 'r'
+        mov rax, 0x74; mov_b [r10 +  5], rax;   // 't'
+        xor rax, rax;  mov_b [r10 +  6], rax;   // NUL
+        mov rax, 0x46; mov_b [r10 +  7], rax;   // 'F'
+        mov rax, 0x4f; mov_b [r10 +  8], rax;   // 'O'
+        mov rax, 0x4f; mov_b [r10 +  9], rax;   // 'O'
+        xor rax, rax;  mov_b [r10 + 10], rax;   // NUL
+
+        // Populate _tbi_argv_cd_no_arg: "cd\0" (3 bytes).
+        lea r10, [rip + _tbi_argv_cd_no_arg];
+        mov rax, 0x63; mov_b [r10 + 0], rax;    // 'c'
+        mov rax, 0x64; mov_b [r10 + 1], rax;    // 'd'
+        xor rax, rax;  mov_b [r10 + 2], rax;    // NUL
+
+        // Populate _tbi_argv_pwd: "pwd\0" (4 bytes).
+        lea r10, [rip + _tbi_argv_pwd];
+        mov rax, 0x70; mov_b [r10 + 0], rax;    // 'p'
+        mov rax, 0x77; mov_b [r10 + 1], rax;    // 'w'
+        mov rax, 0x64; mov_b [r10 + 2], rax;    // 'd'
+        xor rax, rax;  mov_b [r10 + 3], rax;    // NUL
+
+        call dispatch_init;
+
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbi_case_dispatch_miss_ls() -> u64
+  //
+  // Input: argv "ls\0" (argc=1). Expected: dispatch_line returns
+  // BI_MISS (0xFFFFECE0) -- "ls" is not in the four-entry builtin
+  // table, so the length gate (2 == 2 for cd, 4 for exit, 6 for
+  // export, 3 for pwd) matches ONLY cd (both length 2), then the byte
+  // compare 'l' vs 'c' rejects, and the walk falls through to BI_MISS.
+  // ==========================================================================
+  pub let tbi_case_dispatch_miss_ls : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): the miss case. `ls` is NOT a builtin, so dispatch_line's length gate matches cd (length 2 == 2) and then the byte compare `'l' vs 'c'` rejects; every subsequent candidate (exit=4, export=6, pwd=3) fails the length gate outright, and the loop terminates at BI_MISS. If dispatch_line returned BI_OK or a BI_ERR_*, the miss path is broken (a false-hit on ls would call an unrelated handler). 2 callee-save pushes (rbx, r12) + sub rsp 8 prologue for the nested dispatch_line call; matched pop sequence. Labels prefixed tbi_dm_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbi_reset;
+
+        // dispatch_line(_tbi_argv_ls, 1).
+        lea rdi, [rip + _tbi_argv_ls];
+        mov rsi, 1;
+        call dispatch_line;
+
+        // Expect BI_MISS = 0xFFFFECE0.
+        mov r11, 0xFFFFECE0;
+        cmp rax, r11;
+        jne tbi_dm_fail;
+
+        xor rax, rax;                        // TBI_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbi_dm_fail:
+        mov rax, 0xFFFFED70;                 // TBI_FAIL_DISPATCH_MISS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbi_case_dispatch_hit_export() -> u64
+  //
+  // Input: argv "export\0FOO=bar\0" (argc=2). Expected: dispatch_line
+  // returns BI_OK (bi_export succeeded) AND _bi_env_count == 1 AND
+  // _bi_env[0] has (name_len=3, value_len=3) matching "FOO"/"bar".
+  //
+  // This is the LOAD-BEARING pure-function integration case: it drives
+  // the entire flow (dispatch table lookup by length+bytes -> handler
+  // pointer -> handler run -> record write) end-to-end without any
+  // syscall dependency.
+  // ==========================================================================
+  pub let tbi_case_dispatch_hit_export : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): the load-bearing pure-function hit case. Drives dispatch_line lookup (length gate rejects cd/exit/pwd; matches export at index 2; byte compare all 6 chars match) -> bi_export handler run (parses `FOO=bar`, allocates one record in _bi_env, copies name+value into _bi_env_pool). Verifies the return code AND the resulting env state (count==1, first record's lengths). If dispatch_line returned BI_MISS, the length or byte compare in the export slot is broken. If it returned BI_ERR_EXPORT_*, bi_export's own logic is broken. If _bi_env_count != 1, the record write did not fire. 2 pushes + sub rsp 8 prologue. Labels prefixed tbi_de_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbi_reset;
+
+        // dispatch_line(_tbi_argv_export_a, 2).
+        lea rdi, [rip + _tbi_argv_export_a];
+        mov rsi, 2;
+        call dispatch_line;
+
+        // Expect BI_OK (0).
+        cmp rax, 0;
+        jne tbi_de_fail;
+
+        // Verify _bi_env_count == 1.
+        lea r12, [rip + _bi_env_count];
+        mov rax, [r12];
+        cmp rax, 1;
+        jne tbi_de_fail;
+
+        // Verify _bi_env[0].name_len == 3 (strlen("FOO")).
+        lea r12, [rip + _bi_env];
+        mov rax, [r12 + 8];                  // record[0].name_len
+        cmp rax, 3;
+        jne tbi_de_fail;
+
+        // Verify _bi_env[0].value_len == 3 (strlen("bar")).
+        mov rax, [r12 + 24];                 // record[0].value_len
+        cmp rax, 3;
+        jne tbi_de_fail;
+
+        xor rax, rax;                        // TBI_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbi_de_fail:
+        mov rax, 0xFFFFED71;                 // TBI_FAIL_DISPATCH_HIT_EXPORT
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbi_case_cd_no_arg() -> u64
+  //
+  // Input: bi_cd(argv "cd\0", argc=1). Expected: BI_ERR_CD_NO_ARG
+  // (0xFFFFECE1). The handler must reject BEFORE reaching sys_chdir --
+  // the argc-gate is the only pure-function-safe path in bi_cd, and
+  // the distinct sentinel matters because the shell REPL needs to
+  // print "cd: missing argument" (from the NO_ARG code) vs the
+  // FAIL code (from an actual sys_chdir refusal).
+  // ==========================================================================
+  pub let tbi_case_cd_no_arg : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): the argc-gate case for bi_cd. Called directly (not via dispatch) with argc=1 -- bi_cd must reject at the `cmp rsi, 2; jb bi_cd_no_arg` gate before reaching the byte walker or sys_chdir. If bi_cd returned BI_OK, the gate is missing (would then crash-fault sys_chdir on garbage argv[1]). If it returned BI_ERR_CD_FAIL, the code reached sys_chdir despite argc=1 (also broken). Only BI_ERR_CD_NO_ARG proves the argc discrimination is in place. 2 pushes + sub rsp 8 prologue for the nested bi_cd call. Labels prefixed tbi_cn_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbi_reset;
+
+        lea rdi, [rip + _tbi_argv_cd_no_arg];
+        mov rsi, 1;
+        call bi_cd;
+
+        // Expect BI_ERR_CD_NO_ARG = 0xFFFFECE1.
+        mov r11, 0xFFFFECE1;
+        cmp rax, r11;
+        jne tbi_cn_fail;
+
+        xor rax, rax;                        // TBI_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbi_cn_fail:
+        mov rax, 0xFFFFED72;                 // TBI_FAIL_CD_NO_ARG
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbi_case_export_shell_local() -> u64
+  //
+  // Input: bi_export(argv "export\0X=y\0", argc=2). Expected: BI_OK
+  // AND the record at _bi_env[0] correctly encodes name="X" (len=1)
+  // and value="y" (len=1), AND the name/value pointers land in
+  // _bi_env_pool at consecutive offsets separated by one NUL, AND
+  // _bi_env_pool_used == 4 (name 1 + NUL 1 + value 1 + NUL 1).
+  //
+  // The load-bearing storage-shape check for Option A: an operator
+  // reading _bi_env directly must see the record laid out per issue
+  // spec (name_ptr, name_len, value_ptr, value_len). If the record
+  // fields are in a different order or the pool bytes are wrong, the
+  // whole shell-local env story breaks silently.
+  //
+  // Also verifies the byte contents in the pool via mov_b reads --
+  // 'X' at name_ptr[0], NUL at name_ptr[1], 'y' at value_ptr[0],
+  // NUL at value_ptr[1].
+  // ==========================================================================
+  pub let tbi_case_export_shell_local : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-004 (#31): the shell-local storage-shape check. bi_export('X=y') must land exactly one record at _bi_env[0] with the four qwords (name_ptr, name_len=1, value_ptr, value_len=1), the pool must hold `X\\0y\\0` at offset 0, name_ptr must equal _bi_env_pool + 0 and value_ptr must equal _bi_env_pool + 2 (past 'X\\0'), and _bi_env_pool_used must be 4. If ANY of these check items drift, an ENH-006 REPL variable-expansion pass reads the wrong bytes. Byte reads via `xor rax, rax; mov_b rax, [ptr]` (#1248 mitigation). 2 pushes + sub rsp 8 prologue for the nested bi_export call. Labels prefixed tbi_es_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbi_reset;
+
+        lea rdi, [rip + _tbi_argv_export_b];
+        mov rsi, 2;
+        call bi_export;
+
+        // Expect BI_OK.
+        cmp rax, 0;
+        jne tbi_es_fail;
+
+        // _bi_env_count == 1.
+        lea r12, [rip + _bi_env_count];
+        mov rax, [r12];
+        cmp rax, 1;
+        jne tbi_es_fail;
+
+        // _bi_env_pool_used == 4 ("X\0y\0" = 4 bytes).
+        lea r12, [rip + _bi_env_pool_used];
+        mov rax, [r12];
+        cmp rax, 4;
+        jne tbi_es_fail;
+
+        // _bi_env[0].name_len == 1.
+        lea r12, [rip + _bi_env];
+        mov rax, [r12 + 8];
+        cmp rax, 1;
+        jne tbi_es_fail;
+
+        // _bi_env[0].value_len == 1.
+        mov rax, [r12 + 24];
+        cmp rax, 1;
+        jne tbi_es_fail;
+
+        // _bi_env[0].name_ptr == &_bi_env_pool + 0.
+        lea rbx, [rip + _bi_env_pool];
+        mov rax, [r12 + 0];
+        cmp rax, rbx;
+        jne tbi_es_fail;
+
+        // _bi_env[0].value_ptr == &_bi_env_pool + 2.
+        mov rax, [r12 + 16];
+        mov rcx, rbx;
+        add rcx, 2;
+        cmp rax, rcx;
+        jne tbi_es_fail;
+
+        // Pool bytes: 'X' NUL 'y' NUL.
+        xor rax, rax;
+        mov_b rax, [rbx + 0];
+        cmp rax, 0x58;                       // 'X'
+        jne tbi_es_fail;
+        xor rax, rax;
+        mov_b rax, [rbx + 1];
+        cmp rax, 0;
+        jne tbi_es_fail;
+        xor rax, rax;
+        mov_b rax, [rbx + 2];
+        cmp rax, 0x79;                       // 'y'
+        jne tbi_es_fail;
+        xor rax, rax;
+        mov_b rax, [rbx + 3];
+        cmp rax, 0;
+        jne tbi_es_fail;
+
+        xor rax, rax;                        // TBI_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbi_es_fail:
+        mov rax, 0xFFFFED73;                 // TBI_FAIL_EXPORT_SHELL_LOCAL
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbi_case_export_malformed() -> u64
+  //
+  // Input: bi_export(argv "export\0FOO\0", argc=2). Expected:
+  // BI_ERR_EXPORT_MALFORMED (0xFFFFECE4). argv[1] has no '=' so the
+  // find-equals walker hits NUL and returns malformed without touching
+  // _bi_env or _bi_env_pool.
+  //
+  // The state-preservation-on-reject property is important: if
+  // bi_export incremented _bi_env_count despite the reject, a
+  // subsequent lookup by the REPL would read a garbage record. Verify
+  // _bi_env_count is still 0 after the reject.
+  // ==========================================================================
+  pub let tbi_case_export_malformed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-004 (#31): the malformed-export reject case. `export FOO` (no '=') must be refused with BI_ERR_EXPORT_MALFORMED, and CRUCIALLY the reject path must NOT increment _bi_env_count (a corrupted count would cause the REPL to read garbage on the next lookup). The reject path is taken at the `cmp rax, 0; je bi_exp_malformed` gate inside the find-eq walker when the byte walker hits NUL before finding '='. 2 pushes + sub rsp 8 prologue. Labels prefixed tbi_em_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbi_reset;
+
+        lea rdi, [rip + _tbi_argv_export_m];
+        mov rsi, 2;
+        call bi_export;
+
+        // Expect BI_ERR_EXPORT_MALFORMED = 0xFFFFECE4.
+        mov r11, 0xFFFFECE4;
+        cmp rax, r11;
+        jne tbi_em_fail;
+
+        // _bi_env_count must still be 0 -- reject leaves state alone.
+        lea r12, [rip + _bi_env_count];
+        mov rax, [r12];
+        cmp rax, 0;
+        jne tbi_em_fail;
+
+        xor rax, rax;                        // TBI_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbi_em_fail:
+        mov rax, 0xFFFFED74;                 // TBI_FAIL_EXPORT_MALFORMED
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbi_case_dispatch_hit_pwd() -> u64
+  //
+  // Input: dispatch_line(argv "pwd\0", argc=1). Expected: BI_OK OR
+  // BI_ERR_PWD_TOO_LONG -- either result proves dispatch_line found
+  // bi_pwd and called it. The specific outcome depends on live
+  // sys_getcwd:
+  //
+  //   - Live kernel with a valid task cwd: bi_pwd returns BI_OK,
+  //     stdout received the path + newline.
+  //   - Offline / no live kernel: sys_getcwd traps or returns a
+  //     negative errno -> bi_pwd returns BI_ERR_PWD_TOO_LONG.
+  //
+  // If dispatch_line returned BI_MISS, the dispatch table did NOT
+  // include pwd correctly (broken dispatch_init or wrong length gate).
+  //
+  // This test's disjunctive expectation is documented in the module
+  // header §"RUNTIME VERIFICATION DEFERRAL" -- the pure-function
+  // property this case tests is "dispatch reached the pwd handler";
+  // the syscall round-trip belongs to the live boot smoke.
+  // ==========================================================================
+  pub let tbi_case_dispatch_hit_pwd : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): the dispatch-reaches-pwd case with disjunctive expectation. `pwd` must resolve to bi_pwd via the dispatch triple; the handler then fires sys_getcwd + sys_write whose outcome is a live-kernel concern. This test only checks that BI_MISS did NOT come back (which would mean the dispatch table is missing pwd). BI_OK (live success) or BI_ERR_PWD_TOO_LONG (sys_getcwd negative errno / offline) are BOTH acceptable -- both prove the handler was reached. The syscall round-trip `cd /tmp; pwd -> /tmp` is deferred to the paideia-os side's live boot smoke harness (documented in module header). 2 pushes + sub rsp 8 prologue for the nested dispatch_line call. Labels prefixed tbi_dp_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbi_reset;
+
+        lea rdi, [rip + _tbi_argv_pwd];
+        mov rsi, 1;
+        call dispatch_line;
+
+        // Reject BI_MISS specifically -- any other return code proves
+        // dispatch found bi_pwd. BI_MISS = 0xFFFFECE0.
+        mov r11, 0xFFFFECE0;
+        cmp rax, r11;
+        je tbi_dp_fail;
+
+        xor rax, rax;                        // TBI_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbi_dp_fail:
+        mov rax, 0xFFFFED75;                 // TBI_FAIL_DISPATCH_HIT_PWD
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbi_run_all() -> u64
+  //
+  // Umbrella: drive all 6 cases in issue order. Short-circuit on first
+  // non-zero. Matches the tsf_run_all / tlx_run_all / tpr_run_all
+  // family shape so the future boot-time smoke harness invokes all
+  // eight test umbrellas uniformly.
+  //
+  // Prologue: 1 push (rbx) + `sub rsp, 8` = 16 bytes; rsp % 16 == 0
+  // for the six nested `call tbi_case_*` invocations.
+  // ==========================================================================
+  pub let tbi_run_all : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): drive all 6 TestBuiltins cases in fingerprint order (dispatch_miss_ls, dispatch_hit_export, cd_no_arg, export_shell_local, export_malformed, dispatch_hit_pwd). Short-circuit on first non-zero return. Effect/cap set is the union of every case's effects; the widest is {mem, sysreg} @{fs} (dispatch_hit_export / _pwd, cd_no_arg all inherit through dispatch_line's declared set). 1 push + sub rsp 8 prologue -- rsp%16==0 for the nested case calls. Labels prefixed tbi_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call tbi_case_dispatch_miss_ls;
+        cmp rax, 0;
+        jne tbi_ra_out;
+
+        call tbi_case_dispatch_hit_export;
+        cmp rax, 0;
+        jne tbi_ra_out;
+
+        call tbi_case_cd_no_arg;
+        cmp rax, 0;
+        jne tbi_ra_out;
+
+        call tbi_case_export_shell_local;
+        cmp rax, 0;
+        jne tbi_ra_out;
+
+        call tbi_case_export_malformed;
+        cmp rax, 0;
+        jne tbi_ra_out;
+
+        call tbi_case_dispatch_hit_pwd;
+
+      tbi_ra_out:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}

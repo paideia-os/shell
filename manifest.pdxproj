@@ -36,6 +36,8 @@ sources:
   - src/shell.pdx                 # M1-001: top-level scaffold + stats
   - src/lexer.pdx                 # ENH-002 (#29): command-line tokenizer
   - src/parser.pdx                # ENH-003 (#30): pipeline/argv parser over Lexer's token stream
+  - src/builtins.pdx              # ENH-004 (#31): cd/exit/export/pwd handlers + shell-local env table
+  - src/dispatch.pdx              # ENH-004 (#31): builtin lookup table + dispatch_line
   - src/line_reader.pdx           # M1-002: LineReader skeleton
   - src/exec.pdx                  # M1-003 + M2-003: Exec skeleton + narrow-caps
   - src/session.pdx               # M2-001: KIND_SHELL_SESSION mint + derive
@@ -79,6 +81,7 @@ tests:
   - tests/test_syscall_floor.pdx   # ENH-001 (#28): SC+ shim runtime fingerprint
   - tests/test_lexer.pdx           # ENH-002 (#29): lexer golden-fingerprint matrix
   - tests/test_parser.pdx          # ENH-003 (#30): parser fingerprint + parser->pipeline_plan golden feed
+  - tests/test_builtins.pdx        # ENH-004 (#31): dispatch + builtin handlers fingerprint matrix
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

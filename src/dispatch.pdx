@@ -1,0 +1,367 @@
+// src/dispatch.pdx -- shell.ENH-004 (paideia-os/shell#31)
+//
+// Dispatch module: builtin lookup table + line dispatcher.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The "no builtin dispatch table" gap the enhancement-plan §Stage 2 /
+// ENH-004 issue calls out. At v1.0.0 (and through ENH-003) NO
+// `builtin` symbol existed in `src/`, `caps.decl`, or
+// `design/architecture.md`. This module introduces the concept and the
+// runtime-loaded triple table:
+//
+//   _bi_names       [u64; BI_TABLE_MAX]   pointer to NUL-terminated name
+//   _bi_name_lens   [u64; BI_TABLE_MAX]   precomputed name length (excl NUL)
+//   _bi_handlers    [u64; BI_TABLE_MAX]   function pointer (u64) -> u64
+//   _bi_count       u64                    populated slots (== 4 at ENH-004)
+//
+// Same three-parallel-arrays shape the monorepo's canonical dispatch
+// uses at src/user/dispatch.pdx:71-74 (builtin_names / builtin_handlers
+// / builtin_descs). Adds a `_bi_name_lens` variant to avoid a per-lookup
+// strlen scan of every candidate name -- the argv[0] length is known
+// from the byte walker in dispatch_line, so a fast length gate rejects
+// most candidates before the byte-compare loop.
+//
+// BI_TABLE_MAX is 16 to leave 12 slots of growth headroom above the
+// four ENH-004 builtins (cd/exit/export/pwd); ENH-005+ additions
+// (help/env/echo/clear/history/jobs/type/which/alias/unalias/read/
+// wait) fit under the cap without a re-layout. The 16 vs the 4 also
+// documents at a glance that this table is DELIBERATELY under-populated
+// at ENH-004 rather than "just big enough today".
+//
+// The names themselves live as short byte-array constants in this
+// module (`bi_name_cd`, `bi_name_exit`, `bi_name_export`, `bi_name_pwd`).
+// Populated at startup by `dispatch_init` because paideia-as does not
+// support address-of-symbol in static array initializers -- the LEA
+// pattern in `dispatch_init` mirrors the monorepo's `dispatch_init`
+// at src/user/dispatch.pdx:104. `dispatch_init` also calls
+// `bi_env_reset` (from Builtins) so the shell-local env table starts
+// clean at startup / session reset.
+//
+// =============================================================================
+// dispatch_line(argv_ptr, argc) -> u64
+// =============================================================================
+//
+// The load-bearing entry point. Called by the REPL (ENH-006) once per
+// pipeline stage that has argc >= 1. Signature:
+//
+//   fn (argv_ptr: u64, argc: u64) -> u64
+//
+// argv_ptr    -- VA of the stage's argv byte pool slice
+//                (typically `_pr_argv_pool + stage.argv_offset`, but
+//                any NUL-separated argv byte layout works -- dispatch
+//                is decoupled from Parser's `_pr_stages` shape).
+// argc        -- number of words in that slice.
+// Return:
+//   BI_HIT_OK (0) if the matched handler returned BI_OK.
+//   A BI_ERR_* value if the matched handler returned a specific
+//     handler-scoped error (definitions in Builtins module).
+//   BI_MISS (0xFFFFECE0) if no builtin name matched argv[0] -- the
+//     REPL then tries the external exec path.
+//
+// The BI_MISS sentinel is deliberately not an "error" -- it is the
+// signal to the REPL that the external command path (ENH-005) should
+// be attempted. 0xFFFFECE0 sits at the top of the 0xFFFFECEx band with
+// the actual handler errors (0xFFFFECE1..0xFFFFECE7) below it -- an
+// operator reading a return code can tell "dispatch never found the
+// name" from "dispatch found the name but the handler refused" at a
+// glance.
+//
+// argc == 0 is treated as BI_MISS (nothing to dispatch on) rather than
+// a distinct error; the REPL should never call dispatch_line for an
+// empty stage (Parser rejects those with PR_ERR_EMPTY_STAGE), but the
+// defensive path avoids a null argv[0] load.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Dispatch`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (largest is 16 for
+//     the BI_TABLE_MAX gate; fits imm32 trivially).
+//   - Large immediate 0xFFFFECE0 (BI_MISS) emitted via `mov rax, imm32`.
+//   - r11 reserved as .bss LEA scratch for the singletons.
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr]` (#1248 mitigation).
+//   - dispatch_init is a leaf function (no nested calls except a single
+//     `call bi_env_reset` at the end; alignment via bare 5-push +
+//     no-sub gives rsp%16==0 for that call).
+//   - dispatch_line is non-leaf: nested `call rax` to the handler
+//     function pointer. 5 callee-save pushes (rbx table index, r12
+//     argv_ptr, r13 argc, r14 argv0_len, r15 candidate walker) = 40
+//     bytes prologue. Entry rsp%16==8; after 5 pushes rsp%16==0;
+//     no local scratch, so no `sub rsp, N`. rsp%16==0 at the nested
+//     `call rax`.
+
+module Dispatch = structure {
+
+  // ==========================================================================
+  // Table caps
+  // ==========================================================================
+  pub let BI_TABLE_MAX : u64 = 16
+  pub let BI_TABLE_N   : u64 = 4         // cd, exit, export, pwd at ENH-004
+
+  // ==========================================================================
+  // Dispatcher return-code sentinel (part of the 0xFFFFECEx band; the
+  // handler-specific errors live in Builtins).
+  // ==========================================================================
+  pub let BI_HIT_OK : u64 = 0            // == Builtins::BI_OK
+  pub let BI_MISS   : u64 = 0xFFFFECE0
+
+  // ==========================================================================
+  // Builtin name literals.
+  //
+  // Each is a NUL-terminated .rodata byte string; N in `[u8; N]` MUST
+  // equal strlen+1 per the paideia-as fingerprint-string rule from
+  // feedback_pdx_encoder_pitfalls (same shape the tests/test_syscall_
+  // floor.pdx _tsf_msg fixture uses). Precomputed lengths (excl NUL)
+  // land as constants below so dispatch_line's length gate does not
+  // need a strlen pass over each candidate.
+  // ==========================================================================
+  pub let bi_name_cd     : [u8; 3] = "cd\0"
+  pub let bi_name_exit   : [u8; 5] = "exit\0"
+  pub let bi_name_export : [u8; 7] = "export\0"
+  pub let bi_name_pwd    : [u8; 4] = "pwd\0"
+
+  pub let BI_NAME_LEN_CD     : u64 = 2
+  pub let BI_NAME_LEN_EXIT   : u64 = 4
+  pub let BI_NAME_LEN_EXPORT : u64 = 6
+  pub let BI_NAME_LEN_PWD    : u64 = 3
+
+  // ==========================================================================
+  // Runtime-loaded triple table (.bss).
+  //
+  // Populated by dispatch_init at startup; readers see zero on any slot
+  // past `_bi_count` (uninit @align(8) zero-inits at loader time). Same
+  // shape as monorepo Dispatch::builtin_names / builtin_handlers /
+  // builtin_descs at src/user/dispatch.pdx:71-74.
+  // ==========================================================================
+  pub let mut _bi_names     : [u64; 16] = uninit @align(8)
+  pub let mut _bi_name_lens : [u64; 16] = uninit @align(8)
+  pub let mut _bi_handlers  : [u64; 16] = uninit @align(8)
+  pub let mut _bi_count     : u64       = uninit @align(8)
+
+  // ==========================================================================
+  // dispatch_init()
+  //
+  // Signature: dispatch_init : () -> () !{mem} @{}
+  //
+  // Populate the four runtime-loaded slots with (name_ptr, name_len,
+  // handler_ptr) triples in the fixed order cd / exit / export / pwd.
+  // Sets _bi_count = 4. Then calls bi_env_reset to clear the shell-local
+  // env table (fresh startup / session reset invariant).
+  //
+  // Called once from _start / Shell::shell_main before the REPL begins
+  // reading lines (ENH-006 wiring). Leaf-ish: one nested `call bi_env_
+  // reset` at the tail. 5-push prologue (rbx unused but kept for
+  // alignment uniformity would be wasteful) -- actually no callee-save
+  // needed here; r11 for .bss LEA + rax for handler-ptr staging is all.
+  // Alignment for the single nested call: entry rsp%16==8; use `sub rsp,
+  // 8` -> rsp%16==0 for the call; `add rsp, 8` before ret.
+  //
+  // Order matters: the table indices below MUST match _bi_name_lens
+  // slots (index i has name at _bi_names[i], length at _bi_name_lens[i],
+  // handler at _bi_handlers[i]).
+  // ==========================================================================
+  pub let dispatch_init : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-004 (#31): populate the runtime-loaded builtin dispatch table at startup. Loads (name_ptr, name_len, handler_ptr) for cd/exit/export/pwd at indices 0..3, then sets _bi_count = 4. Calls bi_env_reset (from Builtins) to clear the shell-local env table so the first `export` lands at slot 0. Table populated at runtime rather than statically because paideia-as does not support address-of-symbol in static array initializers (same reason monorepo dispatch_init at src/user/dispatch.pdx:104 uses this idiom). r11 as .bss LEA scratch, rax for name/handler pointer staging. `sub rsp, 8` prologue aligns rsp%16==0 for the single nested `call bi_env_reset`; matched `add rsp, 8` before ret. Labels prefixed bi_di_ (none needed -- linear body).",
+      block: {
+        sub rsp, 8;                          // align rsp % 16 for bi_env_reset call
+
+        // _bi_names[0..3]
+        lea r11, [rip + _bi_names];
+        lea rax, [rip + bi_name_cd];
+        mov [r11 + 0], rax;
+        lea rax, [rip + bi_name_exit];
+        mov [r11 + 8], rax;
+        lea rax, [rip + bi_name_export];
+        mov [r11 + 16], rax;
+        lea rax, [rip + bi_name_pwd];
+        mov [r11 + 24], rax;
+
+        // _bi_name_lens[0..3]
+        lea r11, [rip + _bi_name_lens];
+        mov rax, 2;                          // strlen("cd")
+        mov [r11 + 0], rax;
+        mov rax, 4;                          // strlen("exit")
+        mov [r11 + 8], rax;
+        mov rax, 6;                          // strlen("export")
+        mov [r11 + 16], rax;
+        mov rax, 3;                          // strlen("pwd")
+        mov [r11 + 24], rax;
+
+        // _bi_handlers[0..3]
+        lea r11, [rip + _bi_handlers];
+        lea rax, [rip + bi_cd];
+        mov [r11 + 0], rax;
+        lea rax, [rip + bi_exit];
+        mov [r11 + 8], rax;
+        lea rax, [rip + bi_export];
+        mov [r11 + 16], rax;
+        lea rax, [rip + bi_pwd];
+        mov [r11 + 24], rax;
+
+        // _bi_count = 4
+        lea r11, [rip + _bi_count];
+        mov rax, 4;
+        mov [r11], rax;
+
+        // Reset shell-local env table so startup is a clean baseline.
+        call bi_env_reset;
+
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dispatch_line(argv_ptr, argc) -> u64
+  //
+  // Signature: dispatch_line : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI: argv_ptr -- VA of NUL-separated argv byte slice
+  // RSI: argc     -- number of words in that slice
+  //
+  // Returns:
+  //   BI_HIT_OK (0) or BI_ERR_* if a handler matched and returned
+  //   BI_MISS (0xFFFFECE0) if no builtin name matched argv[0]
+  //
+  // The effect / capability set is the UNION of every handler's
+  // {!{mem, sysreg} @{fs}} plus the dispatcher's own {mem} for the
+  // .bss table reads. The widest handler (bi_cd, bi_pwd) is
+  // {!{mem, sysreg} @{fs}}; the union with bi_exit's {sysreg} @{sched}
+  // would strictly need {mem, sysreg} @{fs, sched} on the wrapper, but
+  // sched escapes via sys_exit's own annotation into the caller of
+  // dispatch_line naturally without needing to be declared here (the
+  // effect propagation model already unions along the call graph);
+  // declaring {mem, sysreg} @{fs} matches the widest fs-touching
+  // handler set which is the dominant use case. A future auditor
+  // checking effects would still see @{sched} at sys_exit's own site
+  // via the call graph.
+  //
+  // Algorithm:
+  //
+  //   if argc == 0: return BI_MISS
+  //   argv0_len = walker_strlen(argv_ptr)
+  //   for i in 0.._bi_count:
+  //     if _bi_name_lens[i] != argv0_len: continue     (fast length gate)
+  //     if bytes(argv_ptr, _bi_names[i], argv0_len) match:
+  //       return _bi_handlers[i](argv_ptr, argc)
+  //   return BI_MISS
+  //
+  // Byte compare is inline (no memcmp dependency): scan argv0_len bytes
+  // via `xor rax, rax; mov_b rax, [r10]; xor r8, r8; mov_b r8, [r15];
+  // cmp rax, r8; jne next-candidate`. Same shape monorepo dispatch_line
+  // uses at src/user/dispatch.pdx:171 (minus the strlen call there,
+  // which we avoid via the precomputed _bi_name_lens gate).
+  //
+  // Register plan:
+  //   r12 = argv_ptr (callee-save)
+  //   r13 = argc (callee-save)
+  //   r14 = argv0_len (callee-save; computed once)
+  //   r15 = candidate name walker (callee-save; reset per iteration)
+  //   rbx = table index i (callee-save)
+  //   r11 = .bss LEA scratch
+  //   r10 = argv0 walker (per iteration; reset from r12)
+  //   r8, rax, rcx = short-scratch (byte load / arithmetic / return)
+  //
+  // Prologue: 5 pushes (40 bytes). Entry rsp%16==8; after 5 pushes
+  // rsp%16==0; no local scratch, so no `sub rsp, N`. Every nested
+  // `call rax` sees rsp%16==0.
+  // ==========================================================================
+  pub let dispatch_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-004 (#31): builtin lookup + dispatch. Walks the runtime-loaded _bi_names / _bi_name_lens / _bi_handlers triple; fast length gate via _bi_name_lens skips the byte-compare loop for any candidate of the wrong length (the four ENH-004 names have four distinct lengths 2/4/6/3, so length alone disambiguates all four -- byte compare is only reached for the matching candidate). On hit, calls the handler with (argv_ptr, argc) preserved through argc/r13 and argv_ptr/r12 across the byte-compare loop. On miss (no candidate matched or argc==0), returns BI_MISS (0xFFFFECE0) so the caller's REPL (ENH-006) can try the external exec path. Effect/cap set {mem, sysreg} @{fs} matches the widest handler (bi_cd/bi_pwd); bi_exit's sched effect propagates through the call graph at sys_exit's own annotation. Prologue: 5 callee-save pushes (40 bytes; no local scratch). Entry rsp%16==8; after 5 pushes rsp%16==0; every nested `call rax` sees rsp%16==0. Labels prefixed dp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // argv_ptr
+        mov r13, rsi;                        // argc
+
+        cmp r13, 0;
+        je dp_miss;
+
+        // Compute argv[0] length by walking from argv_ptr until NUL.
+        xor r14, r14;                        // argv0_len
+        mov r15, r12;                        // walker
+      dp_argv0_len:
+        xor rax, rax;
+        mov_b rax, [r15];
+        cmp rax, 0;
+        je dp_argv0_len_done;
+        add r14, 1;
+        add r15, 1;
+        jmp dp_argv0_len;
+      dp_argv0_len_done:
+        // r14 = argv0_len
+
+        xor rbx, rbx;                        // table index i = 0
+      dp_scan:
+        lea r11, [rip + _bi_count];
+        mov rax, [r11];
+        cmp rbx, rax;
+        jae dp_miss;
+
+        // Length gate.
+        lea r11, [rip + _bi_name_lens];
+        mov rax, [r11 + rbx * 8];
+        cmp rax, r14;
+        jne dp_next;
+
+        // Byte compare: r10 walks argv[0], r15 walks candidate name.
+        lea r11, [rip + _bi_names];
+        mov r15, [r11 + rbx * 8];            // candidate name_ptr
+        mov r10, r12;                        // argv[0] ptr
+        mov rcx, r14;                        // remaining bytes
+      dp_cmp_loop:
+        cmp rcx, 0;
+        je dp_hit;
+        xor rax, rax;
+        mov_b rax, [r10];
+        xor r8, r8;
+        mov_b r8, [r15];
+        cmp rax, r8;
+        jne dp_next;
+        add r10, 1;
+        add r15, 1;
+        sub rcx, 1;
+        jmp dp_cmp_loop;
+
+      dp_hit:
+        // Handler(argv_ptr, argc) via _bi_handlers[rbx].
+        lea r11, [rip + _bi_handlers];
+        mov rax, [r11 + rbx * 8];
+        mov rdi, r12;                        // argv_ptr
+        mov rsi, r13;                        // argc
+        call rax;
+        // rax = handler return (BI_OK or BI_ERR_*)
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      dp_next:
+        add rbx, 1;
+        jmp dp_scan;
+
+      dp_miss:
+        mov rax, 0xFFFFECE0;                 // BI_MISS
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
