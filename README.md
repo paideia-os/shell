@@ -2,6 +2,14 @@
 
 Interactive shell for PaideiaOS — tokenizer + dispatcher + builtins.
 
+> **v1.0.0 is a wire-format encoder suite. `shell` cannot execute a
+> command.** Zero syscall instructions in `src/`, and its declared
+> entry symbol (`Shell::shell_main`) is not defined anywhere in the
+> repository. See
+> [`design/enhancement-plan.md`](design/enhancement-plan.md) §1 for
+> the grep-verified audit and §6 for why the release that first
+> executes a command is `v2.0`, not `v0.2` (shell#37 / ENH-010).
+
 ## Status
 
 R106 wave scaffold. `src/` and `tests/` continue to carry the R49
@@ -76,13 +84,20 @@ The R49 wave shipped the encoder half of a full shell (session
 mint, pipeline plan, cap narrowing, `.pds` header parser, history
 persistence encoder, semantic-pipe passthrough, tab-completion
 encoder, ShellCommandRecord audit encoder, ReleaseManifest encoder,
-`svc.login-shell` broker-bind encoder). See
-[`design/architecture.md`](design/architecture.md),
+`svc.login-shell` broker-bind encoder) — never an executable shell.
+See [`design/architecture.md`](design/architecture.md),
 [`doc/shell.pdxdoc`](doc/shell.pdxdoc), and the pre-R106 CHANGELOG
-entries for the full v1.0.0 surface. Substrate wiring (KIND_TTY,
-`sys_execve`, `sys_ipc_send` to `svc.audit-journal`, PdxFS write)
-stayed deferred to a paideia-os round adjacent to R49 and is being
-picked up as part of the R106+ persistent-home wave.
+entries for the full v1.0.0 surface.
+
+The substrate this encoder half was waiting on (KIND_TTY, `sys_execve`
+with real argv/envp at R62, `sys_wait4`, `sys_chdir`/`sys_getcwd` at
+R86, PdxFS write) has since landed upstream in paideia-os. What has
+not landed is the code in *this* repo that calls any of it: no lexer,
+no parser, no builtin dispatch table, and no `Shell::shell_main` entry
+frame (declared in `manifest.pdxproj` since M1, never written). Wiring
+that up is the `v2.0 — real exec substrate` milestone
+([`design/enhancement-plan.md`](design/enhancement-plan.md)), separate
+from the R106 tokenizer/scaffold wave above.
 
 ## License
 

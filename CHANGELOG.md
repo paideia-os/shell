@@ -36,6 +36,16 @@ pre-landing chores so R106.SHELL-002 (tokenizer) and R106.SHELL-003
 
 ## 1.0.0 — 2026-08-22
 
+> **Retroactive correction (2026-09-05, shell#37 / ENH-010):** "First
+> stable release" below overclaims. `v1.0.0` is a wire-format encoder
+> suite — twelve wire encoders and pure bitmask narrowers — not an
+> executable shell: zero syscall instructions in `src/`, and its
+> declared entry symbol (`Shell::shell_main`) was never written. See
+> `design/enhancement-plan.md` §1 for the grep-verified audit and §6
+> for why the release that first executes a command is `v2.0`, not
+> `v0.2`. The tag and signed release stand as published; only the
+> "stable release" / "full shell" characterization below is withdrawn.
+
 **First stable release.** Shell binds itself to the `svc.login-shell`
 broker name at session start (M5-001); the login supervisor's path
 now has a discoverable endpoint. Dual-signed `manifest.pdxsig` per

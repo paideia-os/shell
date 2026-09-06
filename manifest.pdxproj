@@ -16,10 +16,16 @@
 # release time) a signed build-out/shell.manifest.pdxsig for the
 # pkgs.paideia-os mirror push (see design/mirror-push.md).
 
+# --- ENH-010 (#37): kind + entry note -----------------------------------
+# `kind` was `tool` through v1.0.0; changed to `library` here because no
+# entry point exists — `entry` below names a symbol nothing in `src/`
+# defines. `kind` reverts to `tool` the day ENH-006 (#33) writes
+# `Shell::shell_main`. See design/enhancement-plan.md §6.
+
 name        = shell
 version     = 0.1.0
-kind        = tool
-entry       = Shell::shell_main
+kind        = library
+entry       = Shell::shell_main         # aspirational: undefined until ENH-006 (#33)
 output      = build-out/shell
 caps_decl   = caps.decl
 

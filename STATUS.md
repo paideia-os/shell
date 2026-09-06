@@ -1,5 +1,13 @@
 # shell — status
 
+> **v1.0.0 is a wire-format encoder suite. `shell` cannot execute a
+> command.** Zero syscall instructions in `src/`; its only executed
+> call is a `.bss` counter bump; its declared entry symbol
+> (`Shell::shell_main`) is not defined anywhere in the repository. See
+> `design/enhancement-plan.md` §1 for the grep-verified audit and §6
+> for why the release that first executes a command is numbered
+> `v2.0`, not `v0.2` (shell#37 / ENH-010).
+
 **Current milestone:** R106 — shell scaffolding + tokenizer novel semantics
 **Version:** 0.1.0 (see `CHANGELOG.md`)
 **Wave plan:** paideia-os `design/roadmap/persistent-home-wave.md` §R106
@@ -304,9 +312,17 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFED36 | TRM_FAIL_KV_RC          | M5-001: KV record return code mismatch             |
 | 0xFFFFED37 | TRM_FAIL_BROKER_BIND_RC | M5-001: broker-bind return code mismatch           |
 
-## Upstream substrate (paideia-os, at HEAD 2026-08-21)
+## Upstream substrate (paideia-os, corrected shell#37 / ENH-010)
+
+The section below was four days stale as of its original writing and
+is the reason the encoder-vs-shell gap went unexamined for as long as
+it did: it listed KIND_TTY, real `sys_execve`, `sys_wait4`, and
+PdxFS-write as still-open substrate gaps after they had already
+landed upstream.
 
 - `KIND_USER = 0x190` — landed at R48.M1-001 (`kind_user.pdx`).
+- `KIND_TTY` — landed. No longer a provisional ordinal; the collision
+  with `KIND_PDXFS_TXN` this section used to flag is resolved.
 - `KIND_IPC_ENDPOINT = 5` — landed at R20b (`kind.pdx:72`).
 - `KIND_ELEVATE_CHANNEL = 0x191` — landed at R48b (`kind_elevate_channel.pdx`).
 - `KIND_PDXFS_FILE = 0x195` — landed at R42 scaffold (`kind_pdxfs_file.pdx`,
@@ -317,6 +333,11 @@ reading a test-run log distinguishes "SUT rejected input" from
   `251cd7c`).
 - `InitCap sidecar` — landed at R20b.M4-001
   (`src/kernel/core/loader/init_caps.pdx`).
+- Userspace `sys_execve` — landed at R62, with real argv/envp (no
+  longer the R17-era stub this section used to wait on).
+- Userspace `sys_wait4` — landed.
+- Userspace `sys_chdir` / `sys_getcwd` (sysno 85/86) — landed at R86.
+- Userspace PdxFS-write path — landed.
 
 ## Sibling libraries (all landed today)
 
@@ -325,55 +346,60 @@ reading a test-run log distinguishes "SUT rejected input" from
 - libpdx-argv.M2 — typed flags + std vocab
 - libpdx-audit.M2 — audit sender path
 - libpdx-elevate.M2 — auto-approve + human-approve + Cap<> with lifetime
+  (declared as a shell build dependency but never linked — see
+  `design/enhancement-plan.md` §5 / ENH-009, #36).
 
-**Substrate gaps M3 continues to defer to M4/M5:**
+**What landing that substrate did *not* do: make `shell` a shell.**
+Every item above is now available for `shell` to call; nothing in
+`src/` calls any of it yet. The real gaps, per the grep-verified audit
+in `design/enhancement-plan.md` §1, are all still open in *this*
+repo:
 
-- `KIND_TTY` — not landed at HEAD; `kind_tty.pdx` does not exist in
-  `src/kernel/core/cap/`. shell caps.decl names it symbolically; the
-  provisional ordinal 0x196 in `SH_KIND_TTY` collides with
-  `KIND_PDXFS_TXN` at the ordinal level — the smoke matrix at M4 will
-  catch this drift and softarch pins the real KIND_TTY ordinal at
-  substrate PR time (outside the 0x190–0x196 R42/R48 range).
-- Userspace `sys_execve` / `sys_wait4` wrapper — the kernel side lands
-  at R17; the shell keeps `exec_spawn_and_wait` at the EX_STUB
-  skeleton and pairs it with the standalone
-  `exec_narrow_child_caps` helper. M4 wires them together against
-  the M3-003 CommandRecord begin/close pair.
-- Userspace `sys_ipc_recv` / endpoint-mint wrapper — needed to turn
-  M2's placeholder pipe ids in `pipeline_plan` into real endpoint
-  ids. M4 substrate wiring; the M3-001 PipePassthrough encoder is
-  ready to consume real endpoints once they exist.
-- Userspace PdxFS-write path — needed to persist the bytes
-  `history_encode_record` produces. M4 substrate wiring against
-  `svc.pdxfs-journal`.
-- Userspace `sys_ipc_send` to `svc.audit-journal` — needed to
-  actually append the bytes M3-003 CommandRecord produces to
-  `/system/audit/user-events/`. M4 substrate wiring against
-  libpdx-audit's M2 sender path.
-- Schema registry for M3-002 tab-completion driver — the encoder
-  ships at M3, but the registry walk + score compute + candidate
-  ranking lives at M4 alongside the tab-key binding in
-  line_reader.
+- No syscall instruction anywhere in `src/` (ENH-001, #28) — every
+  item below is blocked on this one absence.
+- No lexer / tokenizer (ENH-002, #29) and no parser (ENH-003, #30) —
+  nothing derives `pipeline_plan`'s `stages_count` from text.
+- No builtin dispatch table — no `cd`, `pwd`, `export`, or `exit`
+  handler exists (ENH-004, #31).
+- `exec_spawn_and_wait` still returns `EX_STUB` — the real
+  execve/wait4 sequence is unwritten (ENH-005, #32).
+- `Shell::shell_main` — the entry symbol `manifest.pdxproj` has
+  declared since M1 — is not defined anywhere in the repository
+  (ENH-006, #33).
+- `line_reader_read_line` still returns `LR_STUB` (ENH-007, #34);
+  `history_encode_record`'s bytes are never written to disk
+  (ENH-008, #35); the M3-002 tab-completion encoder has no registry
+  walk or tab-key binding behind it.
 - Cross-repo linkage (shell → libpdx-cap / libpdx-semantic-pipe /
-  libpdx-audit symbols) — M4 pulls all sides into one build for
-  the smoke matrix.
+  libpdx-audit symbols) — no build pulls all sides together yet.
 
 ## Next
 
-The R49 wave of `shell` is complete at v1.0.0. The next
-shell-repo work opens at R56+ (multi-session mux + remote
-shell); that wave will re-open a new M1..M5 sequence against a
-fresh set of issues.
+The R49 wave closed with the encoder half described above, not with a
+working shell, and did not open at R56+ — no pause followed it. Two
+milestones are open concurrently today:
 
-The M5-001 encoder half + M5-002 doc source + design contracts
-are what the release-time lint (once paideia-as reaches
-v0.33-crypto-kdf and the broker `sys_ipc_send` wrapper lands)
-signs and pushes to `pkgs.paideia-os/main/shell/1.0.0/`. The
-M4 encoder-half tests (`tcn_run_all`, `taf_run_all`,
-`tsm_run_all`) plus the M5 addition (`trm_run_all`) are what the
-release-time lint re-runs to confirm no regression against the
-golden fingerprints; the M4 substrate-half smoke (booted QEMU
-with scripted interactive
-`login → prompt → ls | cat → reboot → history`) lives on the
-paideia-os side and depends on the substrate gaps above landing
-in a paideia-os round adjacent to R49.
+- **R106 — shell scaffolding + tokenizer novel semantics**
+  (paideia-os `design/roadmap/persistent-home-wave.md` §R106).
+  R106.SHELL-001 (scaffold consolidation) is landed; R106.SHELL-002
+  (tokenizer, #41) and R106.SHELL-003 (test infra, #42) are open. See
+  the R106 progress table above.
+- **`v2.0 — real exec substrate`** (milestone #8,
+  `design/enhancement-plan.md`) — the plan that makes `shell` able to
+  execute a command for the first time. Critical path: ENH-001
+  syscall floor (#28) → ENH-002 lexer (#29) → ENH-003 parser (#30) →
+  ENH-004/ENH-005 builtins + real exec (#31/#32) → ENH-006
+  `Shell::shell_main` + REPL (#33). ENH-007..009 (#34-#36) de-stub
+  the line reader, history, and libpdx-elevate behind that path.
+  ENH-010 (#37, this walk-back) and ENH-011 (#38, correcting the
+  R66/R73 issue bodies) carry no dependencies and land independently.
+
+The M5-001 encoder half + M5-002 doc source + design contracts remain
+what the release-time lint (once paideia-as reaches v0.33-crypto-kdf
+and ENH-005/ENH-009 land a real broker `sys_ipc_send`) signs and
+re-pushes to `pkgs.paideia-os/main/shell/1.0.0/`. The M4 encoder-half
+tests (`tcn_run_all`, `taf_run_all`, `tsm_run_all`) plus the M5
+addition (`trm_run_all`) are what that lint re-runs to confirm no
+regression against the golden fingerprints; the interactive QEMU
+smoke (`login → prompt → ls | cat → reboot → history`) has no
+`shell_main` to boot until ENH-006 lands.
