@@ -108,10 +108,21 @@ module Shell = structure {
   pub let LR_ERR_EOF             : u64 = 0xFFFFEC13   // M2+: sys_read returned 0 unexpectedly
 
   // Exec stubs and errors (0xFFFFEC2x)
-  pub let EX_STUB                : u64 = 0xFFFFEC20   // M1: validated, no live spawn
-  pub let EX_ERR_BAD_ARGV        : u64 = 0xFFFFEC21   // argv == 0 or argv_count == 0
-  pub let EX_ERR_EXECVE_FAIL     : u64 = 0xFFFFEC22   // M2+: sys_execve refused
-  pub let EX_ERR_WAIT_FAIL       : u64 = 0xFFFFEC23   // M2+: sys_wait4 refused
+  //
+  // EX_STUB retired at ENH-005 (#32) -- exec_spawn_and_wait now calls
+  // sys_execve for real. The constant is retained here (unchanged
+  // value) so any external tool that carried the sentinel in a
+  // decoder table keeps decoding correctly; new code paths in the
+  // shell no longer return it.
+  pub let EX_STUB                  : u64 = 0xFFFFEC20   // (retired at ENH-005)
+  pub let EX_ERR_BAD_ARGV          : u64 = 0xFFFFEC21   // argv == 0, argv_bytes == 0, or argc == 0
+  pub let EX_ERR_EXECVE_FAIL       : u64 = 0xFFFFEC22   // sys_execve refused (or returned on failure)
+  pub let EX_ERR_WAIT_FAIL         : u64 = 0xFFFFEC23   // sys_wait4 returned negative errno
+  pub let EX_ERR_MISSING_CAP       : u64 = 0xFFFFEC24   // narrow_child_caps: child needs KIND parent lacks
+  pub let EX_ERR_WIDENING          : u64 = 0xFFFFEC25   // narrow_child_caps: child asks for rights parent lacks
+  pub let EX_ERR_SIDECAR_FULL      : u64 = 0xFFFFEC26   // narrow_child_caps: dst < child_decl_count
+  pub let EX_ERR_ARGV_OVERFLOW     : u64 = 0xFFFFEC27   // ENH-005: build_argv_ptrs argc >= EX_ARGV_PTRS_MAX
+  pub let EX_ERR_AUDIT_BEGIN_FAIL  : u64 = 0xFFFFEC28   // ENH-005: command_record_begin returned non-zero (D3 gate)
 
   // Lexer errors (0xFFFFECCx) -- ENH-002 (#29). Authoritative
   // definitions in src/lexer.pdx; mirrored here for the same reason

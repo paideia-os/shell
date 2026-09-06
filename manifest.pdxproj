@@ -82,6 +82,7 @@ tests:
   - tests/test_lexer.pdx           # ENH-002 (#29): lexer golden-fingerprint matrix
   - tests/test_parser.pdx          # ENH-003 (#30): parser fingerprint + parser->pipeline_plan golden feed
   - tests/test_builtins.pdx        # ENH-004 (#31): dispatch + builtin handlers fingerprint matrix
+  - tests/test_exec.pdx            # ENH-005 (#32): exec-path argv marshalling + D3 audit-first ordering fingerprint
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

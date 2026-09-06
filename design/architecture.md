@@ -762,22 +762,37 @@ All three are fail-fast — `dst` is not touched on any reject path.
 ### 4.1 Contract
 
 ```
-exec_spawn_and_wait(argv: u64, argv_count: u64) -> u64
+exec_spawn_and_wait(argv_pool_ptr: u64,      // NUL-separated argv text (parser output slice)
+                    argv_bytes: u64,          // total bytes in the slice
+                    argc: u64) -> u64         // word count in the slice
 ```
 
-- Spawn a child from `argv[0]` with the caller-owned `argv[]` array.
-- Block on the child's exit, return its exit code (0..255).
-- Returns an `EX_ERR_*` code (0xFFFFECxx band) on error.
+- Marshal the parser's per-stage NUL-separated argv pool into the
+  child's `char**` argv array.
+- Open a `ShellCommandRecord` (audit-first, durable BEFORE the child
+  runs; D3 invariant).
+- Spawn a child from `argv[0]` via `sys_execve`.
+- Block on `sys_wait4`, extract exit code from `wstatus` low byte.
+- Close the audit record with the exit code (or 127 on
+  execve/wait failure so the record never leaks OPEN).
+- Returns the child's exit code (0..255) on the substrate-live path,
+  or an `EX_ERR_*` code (0xFFFFEC2x band) on error.
 
-### 4.2 M1 skeleton
+**ENH-005 signature note:** the v1.0.0 M1 contract took `(argv,
+argv_count)` where `argv` was already a `char**` array; ENH-005 makes
+the marshalling a step of the body (taking the parser's pool slice
+directly) since no caller ever consumed the M1 shape (verified via
+grep at ENH-005 landing time).
 
-M1 gates `argv != 0 && argv_count != 0` and returns `EX_STUB`
+### 4.2 M1 skeleton (superseded by ENH-005 M2 body)
+
+M1 gated `argv != 0 && argv_count != 0` and returned `EX_STUB`
 (0xFFFFEC20) on the happy path — the "we validated the args, we would
 call sys_execve if we had a userspace sys_execve wrapper linked, but
-we don't yet" signal.
-
-Same skeleton discipline as `LineReader`: `SH_ST_SPAWNS` bumps on
-entry, `SH_ST_ERRORS` bumps on reject.
+we don't yet" signal. **Retired at ENH-005** (see §4.3). The
+`EX_STUB` constant is retained in `src/shell.pdx` at its original
+value for external decoder compatibility; the shell body no longer
+returns it.
 
 ### 4.2b `exec_narrow_child_caps` — M2-003
 
@@ -816,22 +831,82 @@ helper is invoked separately by the shell's exec dispatcher once the
 substrate lands; every path that reaches `sys_execve` in M3+ will
 first pass through `exec_narrow_child_caps`.
 
-### 4.3 M2 evolution
+### 4.3 M2 evolution (LIVE after ENH-005)
 
-At M2, `exec_spawn_and_wait`:
+`exec_spawn_and_wait` executes this ordered 7-step sequence — the
+ordering itself is the load-bearing property. A reader walking the
+body top-to-bottom sees each step in the same order as this doc.
 
-1. Assembles an InitCap sidecar for the child (16-byte records per
-   paideia-os `src/kernel/core/loader/init_caps.pdx`; layout matches
-   libpdx-cap's wire format at `src/cap.pdx`).
-2. Narrows each parent-held cap per the callee's caps.decl using
-   `libpdx-cap::cap_manifest_verify`.
-3. Calls `sys_execve(path, argv, envp, initcap_sidecar)`.
-4. On success, blocks on `sys_wait4(pid, wstatus, 0, 0)`.
-5. Returns `wstatus & 0xFF` as the exit code.
+0. **Build child argv[]** via `exec_build_argv_ptrs` from the
+   parser's NUL-separated pool slice into `_ex_argv_ptrs`. The
+   NULL sentinel at `_ex_argv_ptrs[argc]` matches the frozen
+   ABI at `design/user/execve-abi.md` (`argv[argc] == NULL`).
+1. **Resolve path** = `_ex_argv_ptrs[0]`. Full PATH search over
+   the InitCap-seeded PATH cap set is deferred to ENH-006 (REPL);
+   ENH-005 lands the exact-argv[0] path.
+2. **Narrow the child's caps** via `exec_narrow_child_caps`
+   (unchanged since M2-003). ENH-005 uses a placeholder parent
+   cap (`SH_KIND_SHELL_SESSION` with `RIGHTS_ALL`, `target_ptr=0`)
+   and `child_decl_count=0` (trivially succeeds). Replace with the
+   real ambient cap set + parsed `caps.decl` once runtime cap-table
+   introspection and libpdx-cap's `caps_decl` parser land.
+3. **cap_manifest_verify** — DEFERRED at ENH-005 (libpdx-cap not
+   linked in the shell repo). Step 2 carries the load-bearing
+   widening/narrowing invariants today.
+4. **`command_record_begin`** into `_ex_audit_rec` BEFORE
+   `sys_execve`. This is where D3's audit-first invariant becomes
+   a call-graph property of the shell, not just an encoder property
+   (`test_audit_first.pdx` covers the encoder half;
+   `test_exec.pdx`'s `tex_case_sw_audit_first` extends it to the
+   live path). Failure at this gate returns
+   `EX_ERR_AUDIT_BEGIN_FAIL` **without proceeding to exec** — the
+   child never runs if the audit record cannot be opened.
+   `audit_id` is a placeholder (`1`); `ts_begin_ns` is `0`. Both
+   wire to libpdx-audit / `sys_clock_monotonic` when those
+   substrates land.
+5. **`sys_execve(path, _ex_argv_ptrs, envp=NULL)`**. `envp=NULL`
+   per D5 (no env-var leak to children). On success, `sys_execve`
+   never returns (kernel replaces the shell image). On failure,
+   returns a negative errno; the audit record is closed with
+   exit=127 before `EX_ERR_EXECVE_FAIL` is returned.
+6. **`sys_wait4(pid=-1, &_ex_wstatus, 0, 0)`**. Reaps the child;
+   `wstatus` low byte is the exit code per the M2 doc. Under the
+   current syscall floor (no `sys_fork`; see §4.3.FORK GAP below)
+   this call is structurally reachable only if `sys_execve`
+   returned failure, at which point `sys_wait4` will typically also
+   fail (`-ECHILD`); kept per the M2 CALL GRAPH ordering so a
+   future `sys_fork` insertion is a one-line change.
+7. **`command_record_close(exit_code)`**. CLOSED flag set;
+   HAS_ERROR set iff `exit_code != 0`. On any failure above, close
+   with `exit=127` so the audit journal never carries an orphaned
+   OPEN record.
 
-M2 also lands the pipeline shape (`a | b | c`), minting one
-`KIND_IPC_ENDPOINT` per `|` and splicing it into the paired children's
-stdin/stdout via a second InitCap sidecar entry.
+#### 4.3.FORK GAP
+
+A correct fork+execve+wait pattern requires `sys_fork` (SC+ 56),
+which the ENH-001 Syscall floor deliberately did not expose (the
+enhancement-plan §4 Stage 0 enumeration lists only the 9 sysnos the
+shell v2.0 plan consumes; fork was not enumerated). ENH-005 lands
+the ordered sequence as the doc specifies; runtime semantics under
+the current syscall floor: `sys_execve` either succeeds (never
+returns; shell becomes child) or fails (returns errno; audit close +
+`EX_ERR_EXECVE_FAIL`). `sys_wait4` is only reached if `sys_execve`
+returned failure. A future ENH that adds `sys_fork` makes `sys_wait4`
+meaningful without touching the ordered sequence in the body.
+
+The D3 property (audit-first, durable-before-child) is fully
+enforced today: `command_record_begin` runs BEFORE `sys_execve`, and
+no reject path skips it. That is the invariant the test suite
+falsifies.
+
+#### 4.3 pipeline
+
+The pipeline shape (`a | b | c`), minting one `KIND_IPC_ENDPOINT`
+per `|` and splicing it into the paired children's stdin/stdout via
+a second InitCap sidecar entry, is scaffolded at M2-002
+(`pipeline_plan`) and lands as a live shape when the REPL (ENH-006)
+drives per-stage `exec_spawn_and_wait` calls with the parser's
+`_pr_stages[i]` records in sequence.
 
 ## 4a. `Pds` module (src/pds.pdx) — M2-004
 

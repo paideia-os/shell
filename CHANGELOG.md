@@ -4,6 +4,109 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-005: real exec path (#32)
+
+The `EX_STUB = 0xFFFFEC20` tail of `exec_spawn_and_wait` is retired.
+The shell now calls `sys_execve` for real, opens a `ShellCommandRecord`
+BEFORE the call (D3 audit-first as a running-system property, not just
+an encoder property), and closes the record on exit/error. The v1.0.0
+walk-back ("shell has never spawned a process") is no longer true.
+
+The M2 CALL GRAPH the module has documented since M1 (`src/exec.pdx`
+lines 36-68) is now the LIVE call graph. Two substrate gaps are
+retained as documented deferrals (see `src/exec.pdx` §DEFERRALS):
+`cap_manifest_verify` (needs libpdx-cap linked) and the real InitCap
+sidecar materialiser (needs runtime cap-table introspection). Neither
+blocks the ordered sequence; both slot in without touching the body.
+
+The FORK GAP (sys_fork not exposed) is documented as a known
+limitation. `sys_execve` under the current syscall floor either
+succeeds (never returns; shell becomes child) or fails (returns
+errno; audit close with exit=127). The ordered sequence includes
+`sys_wait4` for the doc-literal path so a future `sys_fork` insertion
+is a one-line addition.
+
+### Added
+
+- `src/exec.pdx` `exec_build_argv_ptrs(pool_ptr, argv_bytes, argc,
+  dst_ptrs, dst_max) -> u64` -- marshalling helper that turns the
+  Parser's NUL-separated argv pool slice into the child's `char**`
+  argv array with NULL terminator at `dst_ptrs[argc]`. Leaf function.
+  Refuses `argc + 1 > dst_max` with `EX_ERR_ARGV_OVERFLOW`.
+- `src/exec.pdx` `_ex_argv_ptrs[16]` -- built argv array (15 real
+  args + 1 NULL terminator per frozen ABI at
+  `design/user/execve-abi.md`).
+- `src/exec.pdx` `_ex_parent_caps[2]` / `_ex_child_decl[2]` /
+  `_ex_sidecar_buf[32]` -- placeholder cap-narrowing fixtures for
+  `exec_narrow_child_caps`. Empty child_decl_count=0 makes the
+  narrowing trivially succeed; real inputs land when libpdx-cap and
+  the runtime cap table wire up.
+- `src/exec.pdx` `_ex_audit_rec[32]` (256 bytes) -- ShellCommandRecord
+  buffer for the begin/close pair around every spawn.
+- `src/exec.pdx` `_ex_wstatus` -- sys_wait4 output slot; low byte
+  extracted as exit code on the happy path.
+- `src/exec.pdx` `EX_ERR_ARGV_OVERFLOW = 0xFFFFEC27` (build_argv_ptrs
+  overflow) and `EX_ERR_AUDIT_BEGIN_FAIL = 0xFFFFEC28`
+  (`command_record_begin` returned non-zero; D3 forbids proceeding to
+  exec). Extends the existing 0xFFFFEC2x Exec sub-band per the issue's
+  "reuse existing band" directive.
+- `tests/test_exec.pdx` `TestExec` module. Eight cases in the
+  `0xFFFFED8x` fail band: `tex_case_argv_marshal` (verifies pointer
+  array construction from `"ls\0-la\0/tmp\0"`), `tex_case_argv_overflow`
+  (argc=16 vs dst_max=16 -> overflow), `tex_case_argv_gate_pool`
+  (null pool -> BAD_ARGV), `tex_case_argv_gate_dstmax` (dst_max ==
+  argc -> overflow), three `tex_case_sw_gate_*` cases for
+  `exec_spawn_and_wait`'s own input gates, and the load-bearing
+  `tex_case_sw_audit_first` case that drives argv_bytes=9000 > 8192
+  to trigger `CMDR_ERR_TOO_LONG` inside `command_record_begin` --
+  proving `sys_execve` was NOT reached before the audit gate. Runtime
+  spawn fingerprints (`/bin/true` -> 0, `/bin/false` -> 1) are
+  deferred to the paideia-os boot smoke post-#33 (shell wired into
+  bin_seeds.pdx). Umbrella `tex_run_all`.
+- `src/shell.pdx` `EX_ERR_MISSING_CAP` / `EX_ERR_WIDENING` /
+  `EX_ERR_SIDECAR_FULL` mirrors (already in exec.pdx from M2-003 but
+  not previously exposed at the Shell layer), plus the new
+  `EX_ERR_ARGV_OVERFLOW` and `EX_ERR_AUDIT_BEGIN_FAIL` mirrors.
+
+### Changed
+
+- `src/exec.pdx` `exec_spawn_and_wait` -- signature changed from
+  `(argv, argv_count)` to `(argv_pool_ptr, argv_bytes, argc)`. The
+  new shape takes the parser's per-stage output directly (Parser's
+  `_pr_stages[i]` records give `argv_offset` + `argv_bytes` + `argc`;
+  the caller passes `_pr_argv_pool + argv_offset`, `argv_bytes`, and
+  `argc` verbatim). The M1 signature was fictional -- no caller in
+  the shell tree ever consumed it (verified via
+  `grep -rn 'exec_spawn_and_wait('` at ENH-005 landing time -- returns
+  only design docs and `.plans` notes).
+- `src/exec.pdx` body -- the seven-step ordered sequence (build argv
+  -> narrow caps -> command_record_begin -> sys_execve -> sys_wait4
+  -> command_record_close). The ordering is the load-bearing property;
+  a reader reviewing the body top-to-bottom sees each step in the
+  same order as the §M2 CALL GRAPH doc.
+- `src/exec.pdx` module effect / capability set -- widens from
+  `!{mem} @{}` to `!{mem, sysreg} @{sched, mem, fs}` covering the
+  union of every downstream call (sys_execve, sys_wait4,
+  command_record_*).
+- `src/shell.pdx` `EX_STUB` -- retained at value `0xFFFFEC20` with a
+  "retired at ENH-005" note so external decoder tables keep parsing;
+  the shell body no longer returns it.
+- `manifest.pdxproj` -- registered `tests/test_exec.pdx`.
+
+### Deferred (documented in `src/exec.pdx` §DEFERRALS)
+
+- `cap_manifest_verify` (step 3). Requires libpdx-cap linked;
+  narrowing at step 2 carries the load-bearing invariant today.
+- Real InitCap sidecar materialiser (step 2 inputs). Requires runtime
+  cap-table introspection.
+- Sidecar handoff at `sys_execve` (step 5). Kernel ABI does not yet
+  accept a sidecar arg.
+- audit_id + timestamps (steps 4, 7). Placeholders `1` and `0` until
+  libpdx-audit + `sys_clock_monotonic` land.
+- `sys_fork` wrapper. Absent from #28's Syscall floor by design;
+  ENH-005's ordered sequence works today without it and gains
+  semantic correctness with a future one-line insertion.
+
 ## Unreleased — ENH-004: builtin dispatch (#31)
 
 The v1.0.0 audit and ENH-002/003 landed lex + parse; ENH-004 lands the

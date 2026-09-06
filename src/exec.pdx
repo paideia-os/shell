@@ -1,87 +1,177 @@
-// src/exec.pdx -- shell.M1-003 (paideia-os/shell#3)
+// src/exec.pdx -- shell.M1-003 + M2-003 + ENH-005 (paideia-os/shell#3, #6, #32)
 //
-// Exec module: minimal exec + wait + exit-code print (skeleton).
+// Exec module: real sys_execve + sys_wait4 exec path (ENH-005 landing).
 //
 // =============================================================================
 // SCOPE
 // =============================================================================
 //
-// The shell's exec path. At full ripeness (M2) this is the sequence
-// that binds a child's InitCap sidecar, calls sys_execve, blocks on
-// sys_wait4, and returns the child's exit code. At M1 it ships the
-// entry-point signature, the argv gating (argv non-null, argv_count
-// non-zero), and the counter dispatch so the Shell stats table
-// records every spawn attempt / error the way the M2 body will. On
-// the happy path it returns EX_STUB (0xFFFFEC20) -- the "we
-// validated the args, we would call sys_execve if we had a userspace
-// syscall wrapper linked, but we don't yet" signal.
+// The shell's exec path. Through v1.0.0 exec_spawn_and_wait was a
+// gate-and-stub (returned EX_STUB after argv validation). ENH-005
+// (paideia-os/shell#32) replaces that tail with the real 7-step
+// sequence the module's own §"M2 CALL GRAPH" (below) has documented
+// since M1. The shell now calls sys_execve, blocks on sys_wait4, and
+// returns the child's exit code with a ShellCommandRecord opened
+// BEFORE exec and closed AFTER wait -- D3 audit-first as a running-
+// system property, not just an encoder property (see test_audit_first.pdx
+// for the encoder half).
 //
-// This mirrors libpdx-elevate's ELVC_STUB idiom for the same reason
-// LineReader does (see line_reader.pdx §SCOPE): manufacturing a
-// spawn we did not actually perform would lie to the shell's own
-// audit journal at M3, so M1 stops one step short of the substrate
-// boundary rather than fabricating an outcome. The design accepts
-// this at M1 -- see design/tooling/r49-r50-plan.md §5.2:
-//
-//   M1 -- Design + skeleton. [...] the smallest exec path
-//   (`sh -c '/bin/echo hi'` finds /bin/echo in the InitCap-seeded
-//   path, calls sys_execve, waits, prints exit code). No pipeline
-//   support yet.
-//
-// -- but the sys_execve call itself lands at M2 alongside the
-// pipeline mint (M2-002), because M2 is where libpdx-cap.M2 lands
-// (cap narrowing at exec) and libpdx-argv.M2 lands (children's
-// argv). M1 owns the signature + gates; M2 owns the syscall body.
+// Post-ENH-005 the shell has spawned a process. The v1.0.0 walk-back
+// ("shell has never spawned a process") is retired. STATUS.md carries
+// the historical note; the exec path is now live-substrate-ready --
+// the only remaining substrate gap is a fork wrapper (SC+ 56) which
+// the ENH-005 code does not depend on structurally (see §FORK GAP
+// below).
 //
 // =============================================================================
-// M2 CALL GRAPH (documented, not yet built)
+// M2 CALL GRAPH (LIVE after ENH-005; see §DEFERRALS below for the two
+// remaining substrate gaps)
 // =============================================================================
 //
-// At M2, exec_spawn_and_wait will:
+// exec_spawn_and_wait executes this ordered sequence -- the ordering
+// itself is the load-bearing property, so a reader reviewing the body
+// can walk it top-to-bottom and see each step land in the same order
+// as the doc:
 //
-//   (1) Parse argv into (path, argv_ptrs, argv_len) using
-//       libpdx-argv's own parser (its M2 lands the child-side argv
-//       walker; the shell-side call is symmetric).
-//   (2) Resolve `path` against the InitCap-seeded PATH cap set
-//       (the loader's InitCap sidecar carries the caller's PATH cap
-//       for each directory; the shell searches them in order).
-//   (3) Build an InitCap sidecar for the child (16-byte records per
-//       paideia-os src/kernel/core/loader/init_caps.pdx; the wire
-//       layout matches libpdx-cap's Cap wire format at src/cap.pdx
-//       -- one on-wire vocabulary for loader-seeded caps and for
-//       sys_cap_transfer alike). Each entry is:
-//         [+0]  u16 slot        target cap_table slot in the child
-//         [+2]  u16 kind        KIND_* the caller narrows to
-//         [+4]  u32 rights      RIGHTS_* mask narrowed per callee
-//         [+8]  u64 target_ptr  kind-specific tail
-//   (4) Call libpdx-cap::cap_manifest_verify(child_decl, sidecar,
-//       sidecar_count) so a child that would receive a cap not
-//       named in its caps.decl is refused BEFORE sys_execve.
-//   (5) Call sys_execve(path, argv_ptrs, envp, sidecar). Refusal
-//       maps to EX_ERR_EXECVE_FAIL.
-//   (6) Call sys_wait4(pid, wstatus, 0, 0). Refusal maps to
-//       EX_ERR_WAIT_FAIL. wstatus low byte is the exit code.
-//   (7) Print `"[<exit>]"` to KIND_TTY(write) at the shell's
-//       verbose level (M2 emits plain text; M3 emits a
-//       ShellCommandRecord semantic-pipe record via libpdx-audit's
-//       close-of-audit hook).
-//   (8) Return the exit code (0..255) in rax.
+//   (0) Build the child's argv[] pointer array from the parser's
+//       NUL-separated argv pool (exec_build_argv_ptrs); the pool
+//       carries "ls\0-la\0/tmp\0" and the built array carries three
+//       pointers plus a NULL sentinel that sys_execve consumes as
+//       the child's char** argv. This step lives INSIDE
+//       exec_spawn_and_wait because the pool -> ptr-array shape
+//       change is called-once per spawn and does not warrant a
+//       separate public API today. When the REPL (ENH-006) or a
+//       future pipeline wiring needs to reuse the marshalling from
+//       another caller, exec_build_argv_ptrs is already exported
+//       for direct use.
+//   (1) Resolve `path` = argv[0] (the first pointer in the built
+//       argv array). PATH-search over the InitCap-seeded PATH cap
+//       set is deferred to ENH-006 (REPL) -- shell#32 lands the
+//       exact-argv[0] path (matches the monorepo's
+//       resolve_path fall-through-to-/bin/ semantics's INPUT
+//       shape).
+//   (2) Populate a minimal parent-cap set + empty child-decl set
+//       and call exec_narrow_child_caps (unchanged since M2-003 at
+//       src/exec.pdx:205). The narrowing enforces the widen check
+//       (child & ~parent) == 0 + rights intersection; on the ENH-005
+//       placeholder inputs (1 parent placeholder session cap +
+//       child_decl_count=0) the narrowing trivially succeeds and
+//       produces an empty sidecar. When libpdx-cap's caps_decl
+//       parser is linked and runtime cap-table introspection lands,
+//       replace the placeholder parent-cap materialiser with the
+//       real ambient cap set + parsed child_decl -- everything else
+//       here stays untouched. See §DEFERRALS.
+//   (3) cap_manifest_verify: DEFERRED. libpdx-cap is not linked in
+//       the shell repo today (see manifest.pdxproj `deps:` -- the
+//       library is named but not fetched), and the verifier lives
+//       in that library. The narrowing at (2) already carries the
+//       load-bearing invariant (a widening child is refused BEFORE
+//       exec); cap_manifest_verify would layer a defence-in-depth
+//       check on the ALREADY-narrowed sidecar. When libpdx-cap
+//       lands, insert the call here between (2) and (4). See
+//       §DEFERRALS.
+//   (4) command_record_begin -- audit-first, durable BEFORE the
+//       child image is loaded. This is where D3's "every user-facing
+//       operation emits an audit record BEFORE it emits any user-
+//       visible output" becomes a property of a running system, not
+//       just of the encoder. Failure at this gate (dst too small,
+//       argv_bytes > CMDR_ARGV_MAX, audit_id 0) returns
+//       EX_ERR_AUDIT_BEGIN_FAIL and DOES NOT PROCEED TO EXEC --
+//       the child never runs if the audit trail cannot record the
+//       attempt. audit_id is a placeholder (1) at ENH-005; when
+//       libpdx-audit is linked it will be the id returned by
+//       audit_begin.
+//   (5) sys_execve(path, argv_ptrs, envp=NULL). Frozen ABI at
+//       design/user/execve-abi.md (R62): argc in rdi, argv in rsi,
+//       envp in rdx at the child's _start. envp is NULL per D5
+//       (shell does not leak env vars to children). Refusal (a
+//       returned value; sys_execve never returns on success)
+//       routes to EX_ERR_EXECVE_FAIL with an exit=127 command_
+//       record_close before returning.
+//   (6) sys_wait4(pid=-1, wstatus, 0, 0). Reaps the child; extract
+//       exit code from wstatus low byte per §M2 (line 63 of the
+//       original doc). Refusal (negative errno) maps to
+//       EX_ERR_WAIT_FAIL. See §FORK GAP -- in the current wiring
+//       (no sys_fork available) this call is only structurally
+//       reached because sys_execve returned failure, so wait4 will
+//       typically return -ECHILD; the code path exists in the
+//       ordered sequence so a future sys_fork insertion becomes a
+//       one-line addition rather than a re-architecting of the
+//       body.
+//   (7) command_record_close(exit_code). Pairs with (4). CLOSED
+//       flag set; HAS_ERROR set iff exit_code != 0. On any failure
+//       above (execve fail, wait fail) close is called with
+//       exit=127 so the audit journal never carries an
+//       orphaned OPEN record.
+//
+// =============================================================================
+// FORK GAP (documented; not blocking ENH-005)
+// =============================================================================
+//
+// A correct fork+execve+wait pattern requires sys_fork (SC+ 56), which
+// #28's Syscall floor DELIBERATELY did not expose (the enhancement-plan
+// §4 Stage 0 enumeration lists only the 9 sysnos the shell v2.0 plan
+// consumes; fork was not enumerated). Without sys_fork, the shell
+// process IS the parent AND the would-be child -- sys_execve replaces
+// the whole shell with the target image on success, and no wait4 is
+// reachable in the parent's timeline because the parent no longer
+// exists.
+//
+// ENH-005 lands the ORDERED SEQUENCE as the doc specifies. Runtime
+// semantics under the current syscall floor: sys_execve either succeeds
+// (never returns; shell becomes child) or fails (returns errno; audit-
+// close + EX_ERR_EXECVE_FAIL). sys_wait4 is only reached if sys_execve
+// returned failure, at which point it will typically also fail (no
+// child to wait for) -- both paths are audited via command_record_close
+// with exit=127.
+//
+// A future ENH adding sys_fork (or making sys_execve fork-and-exec
+// atomically) makes wait4 meaningful without touching the ordered
+// sequence in this body. The D3 property (audit-first, durable-before-
+// child) is fully enforced today: command_record_begin runs BEFORE
+// sys_execve, and no reject path skips it.
+//
+// =============================================================================
+// DEFERRALS (with follow-up hooks)
+// =============================================================================
+//
+//   - InitCap sidecar materialiser (step 2 real inputs). Replace the
+//     placeholder parent-cap MOV with the shell's ambient cap set once
+//     runtime cap-table introspection lands. exec_narrow_child_caps
+//     already handles the general shape.
+//   - cap_manifest_verify (step 3). Link libpdx-cap; call its verifier
+//     on the narrowed sidecar between steps 2 and 4.
+//   - Sidecar handoff to sys_execve (step 5). Kernel sys_execve_shim
+//     does not currently accept an InitCap sidecar argument (see
+//     design/user/execve-abi.md -- argc/argv/envp only). When the
+//     kernel ABI grows a sidecar slot, pass _ex_sidecar_buf +
+//     _ex_sidecar_count as the fourth arg.
+//   - audit_id + timestamps (steps 4, 7). Wire to libpdx-audit's
+//     audit_begin / audit_commit and to sys_clock_monotonic once
+//     those substrates land.
+//   - PATH search (step 1 richer form). Deferred to ENH-006 REPL.
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
 // =============================================================================
 //
 //   - Module name PascalCase basename (`Exec`), no directory prefix.
-//   - No `test` mnemonic.
-//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares
-//     are `cmp r12, 0` (argv non-null) and `cmp r13, 0` (argv_count
-//     non-zero).
-//   - r11 is scratch; not used in M1 (no .bss reach from this module).
-//   - No byte reads in M1.
-//   - Two callee-save pushes (r12, r13) + one `sub rsp, 8` for
-//     alignment across the nested shell_note calls; matched
-//     `add rsp, 8` before pop. Same idiom as LineReader and as
-//     elevate_client_lookup_broker in libpdx-elevate.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Large immediates
+//     (0xFFFFEC21..0xFFFFEC28 error sentinels, the placeholder
+//     parent-cap fused qword, negative-errno gate values) via
+//     mov r10, imm64.
+//   - r11 is scratch for .bss LEA reach on the M2 body; never touched
+//     by narrow_caps / command_record_* / sys_* wrappers (all
+//     documented to preserve r11 or, in the case of syscall wrappers,
+//     to clobber only rcx/r11 which we do not carry across the call).
+//   - Byte reads in exec_build_argv_ptrs use the #1248 pattern
+//     (`xor rax, rax; mov_b rax, [ptr]`) with explicit `* 1` scale
+//     to dodge the U1606 index-scale gotcha.
+//   - exec_spawn_and_wait: 5 callee-save pushes (rbx, r12, r13, r14,
+//     r15) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 at
+//     every nested SysV call.
+//   - exec_build_argv_ptrs: leaf function, no push/pop parity.
 
 module Exec = structure {
 
@@ -405,61 +495,524 @@ module Exec = structure {
     }
 
   // ==========================================================================
-  // exec_spawn_and_wait(argv, argv_count) -> u64
+  // ENH-005 (#32): storage + constants for the real spawn body
+  // ==========================================================================
+
+  // Max entries in the child's char** argv array (including the trailing
+  // NULL sentinel). 16 gives 15 real args + 1 NULL; comfortably above
+  // the Lexer's per-stage word count in practice (a typical interactive
+  // command is 2..5 words) and matches the kernel-side sys_execve_shim
+  // cap of 16 argv entries (design/user/execve-abi.md §"Layout: where
+  // argv/envp actually live"). Fits imm <= 0x7FFFFFFF trivially.
+  pub let EX_ARGV_PTRS_MAX  : u64 = 16
+
+  // Audit-record buffer size. CMDR_HEADER_SIZE is 48; the largest
+  // per-stage argv the shell will encounter is bounded by the
+  // parser's PR_ARGV_POOL_SIZE (4096 bytes; the whole pool spans all
+  // stages, but a per-stage slice can consume the entire pool if
+  // there is only one stage). Sizing at 4160 (= 4096 + 48 header +
+  // 16 pad headroom) leaves 8 bytes of slack past the CMDR encoder's
+  // internal (argv_bytes + 7) & ~7 rounding for the worst-case
+  // single-stage line. Fits imm <= 0x7FFFFFFF trivially.
   //
-  // Signature: exec_spawn_and_wait : (u64, u64) -> u64 !{mem} @{}
-  // RDI (input): argv        -- VA of the argv[] array (caller-owned)
-  // RSI (input): argv_count  -- number of pointers in argv[]
-  // RAX (output): child exit code (0..255) at M2+, or EX_STUB (M1),
-  //               or EX_ERR_* on error.
+  // A caller passing argv_bytes larger than CMDR_ARGV_MAX (8192) is
+  // rejected by command_record_begin itself with CMDR_ERR_TOO_LONG
+  // before touching this buffer, which routes to
+  // EX_ERR_AUDIT_BEGIN_FAIL below. The buffer is sized for the
+  // PARSER-BOUNDED case; the CMDR-cap case cannot reach it.
+  pub let EX_AUDIT_BUF_SIZE : u64 = 4160
+
+  // Fresh 0xFFFFEC2x sub-band extensions (existing: EX_STUB=..20,
+  // EX_ERR_BAD_ARGV=..21, EX_ERR_EXECVE_FAIL=..22, EX_ERR_WAIT_FAIL=..23,
+  // EX_ERR_MISSING_CAP=..24, EX_ERR_WIDENING=..25, EX_ERR_SIDECAR_FULL=..26).
   //
-  // M1 semantics (skeleton):
-  //   argv == 0 || argv_count == 0 -> EX_ERR_BAD_ARGV
-  //   else                         -> EX_STUB
+  // EX_ERR_ARGV_OVERFLOW: exec_build_argv_ptrs was asked to marshal
+  // an argc that would not fit in the destination pointer array
+  // (argc + 1 > dst_max). At EX_ARGV_PTRS_MAX = 16 that means an
+  // input argc > 15 -- refused before any walk of the pool.
   //
-  // Bumps SH_ST_SPAWNS on every entry. Bumps SH_ST_ERRORS on any
-  // reject path.
+  // EX_ERR_AUDIT_BEGIN_FAIL: command_record_begin returned non-zero
+  // (dst too small, argv_bytes > CMDR_ARGV_MAX, or audit_id 0). The
+  // D3 audit-first invariant forbids proceeding to sys_execve when
+  // the audit record cannot be opened.
+  pub let EX_ERR_ARGV_OVERFLOW    : u64 = 0xFFFFEC27
+  pub let EX_ERR_AUDIT_BEGIN_FAIL : u64 = 0xFFFFEC28
+
+  // ==========================================================================
+  // Singleton buffers (.bss)
+  //
+  //   _ex_argv_ptrs   [u64; 16]   built char** array for the child; slot
+  //                                argc holds the NULL sentinel per the
+  //                                execve ABI (argv[argc] == NULL).
+  //   _ex_parent_caps [u64; 2]    ENH-005 placeholder for the shell's
+  //                                ambient cap set. 1 wire record
+  //                                (16 bytes): (slot=1, kind=SH_KIND_
+  //                                SHELL_SESSION=0x194, rights=0xFFFFFFFF,
+  //                                target_ptr=0). Replaced with the
+  //                                real cap-table snapshot when runtime
+  //                                introspection lands (see §DEFERRALS).
+  //   _ex_child_decl  [u64; 2]    ENH-005 placeholder for the child's
+  //                                caps.decl-derived wire array. Used
+  //                                only as a non-NULL base pointer;
+  //                                child_decl_count=0 is passed so the
+  //                                narrowing trivially succeeds. Real
+  //                                data lands when libpdx-cap's caps_decl
+  //                                parser is linked.
+  //   _ex_sidecar_buf [u64; 32]   Room for 16 narrowed 16-byte Cap
+  //                                wire records. Currently unused (kernel
+  //                                sys_execve does not accept a sidecar
+  //                                arg at the frozen ABI); reserved so
+  //                                the M2 CALL GRAPH step (5) can grow
+  //                                a real handoff without another
+  //                                re-layout.
+  //   _ex_audit_rec   [u64; 520]  4160 bytes for one ShellCommandRecord
+  //                                (48-byte header + up to 4096 argv
+  //                                bytes + 16 bytes pad headroom;
+  //                                matches PR_ARGV_POOL_SIZE ceiling
+  //                                from parser.pdx).
+  //   _ex_wstatus     u64         sys_wait4 output slot. Only the low
+  //                                8 bits (exit code) are extracted in
+  //                                the happy path per the M2 doc.
+  // ==========================================================================
+  pub let mut _ex_argv_ptrs   : [u64; 16] = uninit @align(16)
+  pub let mut _ex_parent_caps : [u64; 2]  = uninit @align(16)
+  pub let mut _ex_child_decl  : [u64; 2]  = uninit @align(16)
+  pub let mut _ex_sidecar_buf : [u64; 32] = uninit @align(16)
+  pub let mut _ex_audit_rec   : [u64; 520] = uninit @align(16)
+  pub let mut _ex_wstatus     : u64       = uninit @align(8)
+
+  // ==========================================================================
+  // exec_build_argv_ptrs(pool_ptr, argv_bytes, argc, dst_ptrs, dst_max)
+  //                                                            -> u64
+  //
+  // Signature: exec_build_argv_ptrs : (u64, u64, u64, u64, u64)
+  //                                   -> u64 !{mem} @{}
+  // RDI (input): pool_ptr     -- VA of the parser's NUL-separated argv
+  //                              pool slice for one stage (e.g.
+  //                              "ls\0-la\0/tmp\0"; the trailing NUL
+  //                              after the last word is part of the
+  //                              slice per parser.pdx).
+  // RSI (input): argv_bytes   -- total bytes in the slice (includes
+  //                              all separator NULs and the trailing
+  //                              NUL after the last word).
+  // RDX (input): argc         -- number of words in the slice (1..15).
+  // RCX (input): dst_ptrs     -- VA of the destination u64[] pointer
+  //                              array (typically _ex_argv_ptrs, but
+  //                              exported so a future pipeline layer
+  //                              can build a per-stage argv without
+  //                              sharing the singleton).
+  // R8  (input): dst_max      -- entries dst_ptrs can hold (must be
+  //                              >= argc + 1 for the NULL sentinel).
+  // RAX (output): 0 on success (dst_ptrs[0..argc] carry pointers into
+  //               pool_ptr, dst_ptrs[argc] carries NULL), else
+  //               EX_ERR_ARGV_OVERFLOW (argc + 1 > dst_max) or
+  //               EX_ERR_BAD_ARGV (any of the four required non-NULL
+  //               inputs was NULL / zero).
+  //
+  // Algorithm:
+  //   Gates: pool_ptr != 0, argv_bytes > 0, argc > 0, dst_ptrs != 0,
+  //          argc + 1 <= dst_max.
+  //   dst_ptrs[0] = pool_ptr                (first word starts at pool)
+  //   found = 1
+  //   for i in 0..argv_bytes:
+  //     if found >= argc: break
+  //     if pool_ptr[i] == 0:
+  //       dst_ptrs[found] = pool_ptr + i + 1
+  //       found += 1
+  //   dst_ptrs[argc] = 0                    (NULL terminator)
+  //   return 0
+  //
+  // The break on found >= argc means the trailing NUL after the last
+  // word never triggers a spurious pointer write past dst_ptrs[argc-1].
+  //
+  // Register plan (LEAF function; no callee-save):
+  //   r9  = i (loop counter; free after inputs land)
+  //   r10 = found counter
+  //   r11 = per-iteration compute scratch (pool_ptr + i + 1 stash;
+  //         also byte-load target -- clobbered on every iteration)
+  //   rax = byte-load scratch / return value
+  //   rdi, rsi, rdx, rcx, r8 = inputs (all SysV caller-save;
+  //                                    consumed in the body)
+  //
+  // No shell_note bumps here -- the caller (exec_spawn_and_wait) bumps
+  // SH_ST_ERRORS on any propagated non-zero return.
+  // ==========================================================================
+  pub let exec_build_argv_ptrs : (u64, u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (pool_ptr: u64) (argv_bytes: u64) (argc: u64) (dst_ptrs: u64) (dst_max: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-005 (#32): marshal the parser's NUL-separated argv pool slice into the child's char** argv array. The parser's per-stage output at _pr_argv_pool + argv_offset holds argc words with a NUL byte after every word (including the last), e.g. 'ls\\0-la\\0/tmp\\0' for argc=3 argv_bytes=12; sys_execve expects a char** array whose entries point at each word's first byte with a NULL sentinel at argv[argc] (frozen ABI at design/user/execve-abi.md -- argv[argc] == NULL). This helper walks the pool once, records dst_ptrs[0] = pool_ptr (the first word starts at pool base) and appends a new pointer at dst_ptrs[found] whenever a NUL is seen and found < argc; the break on found >= argc prevents the trailing NUL from writing past dst_ptrs[argc-1]. Written as a leaf helper (no push/pop parity, no shell_note bumps) because the marshalling is a byte-level walk with no branch back into the shell subsystem; the caller bumps SH_ST_ERRORS on any propagated non-zero return so per-call attribution stays intact. Byte load via `xor rax, rax; mov_b rax, [pool_ptr + i * 1]` per the #1248 pattern with explicit `* 1` scale (the U1606 index-scale gotcha from feedback_pdx_encoder_pitfalls). All compares use `cmp reg, 0` or `cmp reg, reg` (no `test rN, rN`). The overflow gate uses `cmp r8, r11` where r11 stages argc + 1 (avoiding a `cmp r8, argc+1` compound). Labels prefixed ex_ba_.",
+      block: {
+        // Gate: pool_ptr non-null.
+        cmp rdi, 0;
+        je  ex_ba_bad_argv;
+        // Gate: argv_bytes non-zero.
+        cmp rsi, 0;
+        je  ex_ba_bad_argv;
+        // Gate: argc non-zero.
+        cmp rdx, 0;
+        je  ex_ba_bad_argv;
+        // Gate: dst_ptrs non-null.
+        cmp rcx, 0;
+        je  ex_ba_bad_argv;
+        // Gate: dst_max >= argc + 1.
+        mov r11, rdx;
+        add r11, 1;                          // r11 = argc + 1
+        cmp r8, r11;
+        jb  ex_ba_overflow;
+
+        // dst_ptrs[0] = pool_ptr.
+        mov [rcx + 0], rdi;
+
+        // Walk the pool.
+        mov r10, 1;                          // found = 1
+        xor r9, r9;                          // i = 0
+
+      ex_ba_walk_head:
+        cmp r10, rdx;                        // found >= argc ?
+        jae ex_ba_walk_done;
+        cmp r9, rsi;                         // i >= argv_bytes ?
+        jae ex_ba_walk_done;
+
+        // Byte load pool_ptr[i].
+        xor rax, rax;
+        mov_b rax, [rdi + r9 * 1];
+        cmp rax, 0;
+        jne ex_ba_step;
+
+        // Found a NUL. dst_ptrs[found * 8] = pool_ptr + i + 1.
+        mov r11, rdi;
+        add r11, r9;
+        add r11, 1;                          // r11 = pool_ptr + i + 1
+        mov [rcx + r10 * 8], r11;
+        add r10, 1;                          // found++
+
+      ex_ba_step:
+        add r9, 1;
+        jmp ex_ba_walk_head;
+
+      ex_ba_walk_done:
+        // Write NULL terminator at dst_ptrs[argc].
+        xor rax, rax;
+        mov [rcx + rdx * 8], rax;
+        xor rax, rax;                        // return 0
+        ret;
+
+      ex_ba_bad_argv:
+        mov rax, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        ret;
+
+      ex_ba_overflow:
+        mov rax, 0xFFFFEC27;                 // EX_ERR_ARGV_OVERFLOW
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // exec_spawn_and_wait(argv_pool_ptr, argv_bytes, argc) -> u64
+  //
+  // Signature: exec_spawn_and_wait : (u64, u64, u64)
+  //                                  -> u64 !{mem, sysreg} @{sched, mem, fs}
+  // RDI (input): argv_pool_ptr -- VA of one Parser stage's NUL-separated
+  //                                argv text pool slice (typically
+  //                                _pr_argv_pool + _pr_stages[i].argv_offset).
+  // RSI (input): argv_bytes    -- byte length of that slice (parser's
+  //                                _pr_stages[i].argv_bytes; includes
+  //                                separator NULs and trailing NUL).
+  // RDX (input): argc          -- word count in that slice
+  //                                (_pr_stages[i].argc; 1..15).
+  // RAX (output): child exit code (0..255) on the substrate-live path
+  //                (never taken today without sys_fork; see §FORK GAP);
+  //                otherwise one of the 0xFFFFEC2x sentinels
+  //                (EX_ERR_BAD_ARGV, EX_ERR_ARGV_OVERFLOW,
+  //                EX_ERR_AUDIT_BEGIN_FAIL, EX_ERR_EXECVE_FAIL,
+  //                EX_ERR_WAIT_FAIL) or a propagated
+  //                exec_narrow_child_caps sentinel
+  //                (EX_ERR_MISSING_CAP, EX_ERR_WIDENING,
+  //                EX_ERR_SIDECAR_FULL).
+  //
+  // Signature note: ENH-005 changes the arg shape from (argv, argv_count)
+  // to (argv_pool_ptr, argv_bytes, argc). The v1.0.0 M1 skeleton
+  // accepted a pre-built char** array + count on the assumption that
+  // a caller (never written) would materialise both; ENH-005 makes the
+  // materialisation a step in this body, taking the parser's pool slice
+  // directly (the only real caller today would be dispatch_line / the
+  // future REPL, both of which already own the pool slice). No caller
+  // in the shell tree consumes the M1 signature (verified via
+  // `grep -rn 'exec_spawn_and_wait('` -- returns only design docs and
+  // .plans notes at ENH-005 landing time).
+  //
+  // Ordered sequence (numbered per the §M2 CALL GRAPH doc above):
+  //   0. Gate inputs, bump SH_ST_SPAWNS.
+  //   1. Build _ex_argv_ptrs via exec_build_argv_ptrs; on overflow
+  //      propagate EX_ERR_ARGV_OVERFLOW.
+  //   2. Materialise placeholder parent-cap set + zero-count child
+  //      decl; call exec_narrow_child_caps into _ex_sidecar_buf. Any
+  //      non-zero return propagates verbatim (the helper already
+  //      bumped SH_ST_ERRORS).
+  //   3. cap_manifest_verify: DEFERRED (libpdx-cap not linked). See
+  //      the §DEFERRALS block at the top of this file.
+  //   4. command_record_begin into _ex_audit_rec with the pool slice
+  //      as argv text, audit_id=1 placeholder, ts_begin_ns=0. On
+  //      failure return EX_ERR_AUDIT_BEGIN_FAIL WITHOUT calling
+  //      sys_execve -- the D3 audit-first invariant forbids exec
+  //      without a durable audit record.
+  //   5. sys_execve(path=_ex_argv_ptrs[0], argv=_ex_argv_ptrs, envp=0).
+  //      envp=0 per D5 (no env-var leak to children). On success,
+  //      never returns. On failure, close audit with exit=127 and
+  //      return EX_ERR_EXECVE_FAIL.
+  //   6. sys_wait4(pid=-1, &_ex_wstatus, 0, 0). Structurally reachable
+  //      only if sys_execve returned failure in the current syscall
+  //      floor (no sys_fork); kept per the M2 CALL GRAPH ordering so
+  //      a future sys_fork insertion becomes a one-line change. On
+  //      negative errno, close audit with exit=127 and return
+  //      EX_ERR_WAIT_FAIL.
+  //   7. command_record_close with (wstatus & 0xFF) as exit_code.
+  //      Bump SH_ST_EXITS (slot 3). Return exit_code in rax.
+  //
+  // Bumps SH_ST_SPAWNS on entry, SH_ST_EXITS on the happy tail, and
+  // SH_ST_ERRORS on every reject path (either directly or via a
+  // downstream helper's own bump).
   //
   // Register plan:
-  //   r12 = argv         (callee-save; preserved through shell_note)
-  //   r13 = argv_count   (callee-save; preserved through shell_note)
-  //   rdi = which        (bumped between calls)
-  //   rax = return value
+  //   r12 = argv_pool_ptr (callee-save; carried into command_record_begin
+  //         as argv text ptr)
+  //   r13 = argv_bytes    (callee-save; carried into command_record_begin
+  //         as argv_bytes)
+  //   r14 = argc          (callee-save; carried into build_argv_ptrs)
+  //   r15 = exit code / temp; carries wstatus low byte on the happy
+  //         tail so command_record_close and the return see the same
+  //         value across the shell_note SH_ST_EXITS bump
+  //   rbx = reserved for the audit-close path (holds the "reason
+  //         exit code" 127 constant when routing execve/wait fail
+  //         through the close call)
+  //   r11 = .bss LEA scratch (per paideia-as convention)
   //
-  // Two pushes + `sub rsp, 8` = 24 bytes of prologue; the sub aligns
-  // rsp % 16 == 0 for the shell_note call.
+  // Prologue: 5 callee-save pushes (rbx, r12, r13, r14, r15) + `sub
+  // rsp, 8` = 48 bytes. Entry rsp % 16 == 8; after 5 pushes rsp %
+  // 16 == 0; `sub rsp, 8` preserves that. rsp % 16 == 0 at every
+  // nested SysV call. Matched epilogue at every return.
+  //
+  // Effect / capability set: {mem, sysreg} + @{sched, mem, fs} covers
+  // the union of every downstream call. sys_execve contributes
+  // @{sched, mem}; command_record_begin contributes !{mem}; the
+  // pool byte reads contribute !{mem}. fs is included for kernel-
+  // side filesystem walk during sys_execve's ELF load.
   // ==========================================================================
-  pub let exec_spawn_and_wait : (u64, u64) -> u64 !{mem} @{} =
-    fn (argv: u64) (argv_count: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "shell.M1-003 (#3): the exec-path skeleton. Two callee-save pushes (r12=argv, r13=argv_count) preserve the args across the nested shell_note calls at SPAWNS / ERRORS so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the SysV call, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx). The argv == 0 / argv_count == 0 gates use `cmp reg, 0` (paideia-as no-test-mnemonic discipline). EX_STUB (0xFFFFEC20) is the M1 happy-path sentinel -- there is no userspace sys_execve wrapper in the tree yet (the InitCap sidecar builder lands with libpdx-cap.M2 cap-narrowing + libpdx-argv.M2 argv-walker at M2); manufacturing a spawn we did not actually perform would defeat the D3 audit-first invariant M3 formalises (see design/architecture.md §4.2). M2 replaces the EX_STUB tail with the real sys_execve + sys_wait4 dispatch. Labels prefixed ex_sw_.",
+  pub let exec_spawn_and_wait : (u64, u64, u64) -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn (argv_pool_ptr: u64) (argv_bytes: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-005 (#32): the exec-path REAL body. Replaces the v1.0.0 M1-003 EX_STUB tail with the ordered 7-step sequence the module's own §M2 CALL GRAPH has specified since M1. Sequence: (0) gate + SH_ST_SPAWNS bump; (1) exec_build_argv_ptrs into _ex_argv_ptrs from the parser's NUL-separated pool slice; (2) exec_narrow_child_caps into _ex_sidecar_buf with a placeholder parent cap (SH_KIND_SHELL_SESSION with RIGHTS_ALL, target_ptr=0) and child_decl_count=0 -- the narrowing trivially succeeds today and grows into real inputs when libpdx-cap and runtime cap-table introspection land; (3) cap_manifest_verify DEFERRED (libpdx-cap not linked in the shell repo); (4) command_record_begin into _ex_audit_rec BEFORE sys_execve -- the D3 audit-first invariant made into a running-system property (test_audit_first.pdx already covers the encoder half; this landing extends it to the live path). A non-zero begin routes to EX_ERR_AUDIT_BEGIN_FAIL WITHOUT proceeding to exec -- the child never runs if the audit record cannot be opened. (5) sys_execve with argv[0] as path, _ex_argv_ptrs as argv, envp=0 (D5: no env-var leak). sys_execve never returns on success (kernel replaces the shell image with the child's image); a returned value is failure. (6) sys_wait4(pid=-1) is structurally reachable only if sys_execve returned failure under the current sys_fork-less syscall floor; kept per doc ordering so a future sys_fork insertion becomes a one-line change (see §FORK GAP). (7) command_record_close with (wstatus & 0xFF) as exit_code; on execve/wait failure the close uses exit=127 so the audit journal never carries an orphaned OPEN record. Reject-path close discipline: every path that reached command_record_begin AND then failed calls command_record_close with an appropriate exit sentinel before returning the EX_ERR_* code -- otherwise the audit trail would show OPEN records with no matching CLOSE, defeating replay. The paideia-as no-`test`-mnemonic + `cmp reg, 0` discipline is followed at every branch; large immediates (placeholder parent-cap fused qword 0xFFFFFFFF01940001; sys_wait4 pid=-1 encoded as 0xFFFFFFFFFFFFFFFF) via mov r64, imm64 (paideia-as supports MOV imm64 in general; the pitfall is specifically `and r11, imm64` which we do not use here). Byte loads (in the helper) via `xor rax, rax; mov_b rax, [ptr]` with explicit `* 1` scale per #1248 + U1606. The `wstatus & 0xFF` extraction uses `and rax, 0xFF` (imm32, fits <= 0x7FFFFFFF). 5 callee-save pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 at every nested SysV call. Labels prefixed ex_sw_.",
       block: {
+        push rbx;
         push r12;
         push r13;
-        sub rsp, 8;                          // align rsp % 16 for shell_note
+        push r14;
+        push r15;
+        sub rsp, 8;                          // 48-byte prologue; rsp%16==0
 
-        mov r12, rdi;                        // argv
-        mov r13, rsi;                        // argv_count
+        mov r12, rdi;                        // argv_pool_ptr
+        mov r13, rsi;                        // argv_bytes
+        mov r14, rdx;                        // argc
 
-        // Bump SH_ST_SPAWNS unconditionally -- see line_reader.pdx
-        // for the "attempt not success" rationale.
+        // (0) Bump SH_ST_SPAWNS unconditionally.
         mov rdi, 2;                          // SH_ST_SPAWNS
         call shell_note;
 
-        // Gate: argv non-null.
+        // (0) Gate: pool != 0.
         cmp r12, 0;
         je  ex_sw_bad_argv;
-
-        // Gate: argv_count non-zero.
+        // (0) Gate: argv_bytes > 0.
         cmp r13, 0;
         je  ex_sw_bad_argv;
+        // (0) Gate: argc > 0.
+        cmp r14, 0;
+        je  ex_sw_bad_argv;
 
-        // M1 happy path: EX_STUB. M2 replaces this tail with the
-        // real sys_execve + sys_wait4 dispatch.
-        mov rax, 0xFFFFEC20;                 // EX_STUB
+        // (1) Build argv[] ptr array into _ex_argv_ptrs.
+        mov rdi, r12;                        // pool_ptr
+        mov rsi, r13;                        // argv_bytes
+        mov rdx, r14;                        // argc
+        lea rcx, [rip + _ex_argv_ptrs];
+        mov r8, 16;                          // EX_ARGV_PTRS_MAX
+        call exec_build_argv_ptrs;
+        cmp rax, 0;
+        jne ex_sw_argv_propagate;
+
+        // (1) Sanity: argv[0] must be non-null (build never writes a
+        // null there for argc >= 1, but guard against a corrupted
+        // helper contract).
+        lea r11, [rip + _ex_argv_ptrs];
+        mov rax, [r11 + 0];
+        cmp rax, 0;
+        je  ex_sw_bad_argv;
+
+        // (2) Materialise the placeholder parent-cap set into
+        // _ex_parent_caps. One Cap wire record (16 bytes):
+        //   qword0 = slot | (kind << 16) | (rights << 32)
+        //          = 1    | (0x194 << 16) | (0xFFFFFFFF << 32)
+        //          = 0xFFFFFFFF_01940001
+        //   qword1 = target_ptr = 0 (kernel resolves the real session
+        //                            endpoint at sidecar-materialiser
+        //                            time; see §DEFERRALS)
+        lea r11, [rip + _ex_parent_caps];
+        mov rax, 0xFFFFFFFF01940001;
+        mov [r11 + 0], rax;
+        xor rax, rax;
+        mov [r11 + 8], rax;
+
+        // (2) Call exec_narrow_child_caps.
+        //   parent           = _ex_parent_caps
+        //   parent_count     = 1
+        //   child_decl       = _ex_child_decl (non-NULL base; content
+        //                       unused because child_decl_count=0)
+        //   child_decl_count = 0
+        //   dst              = _ex_sidecar_buf
+        //   dst_max_entries  = 16
+        lea rdi, [rip + _ex_parent_caps];
+        mov rsi, 1;
+        lea rdx, [rip + _ex_child_decl];
+        mov rcx, 0;
+        lea r8,  [rip + _ex_sidecar_buf];
+        mov r9,  16;                         // EX_NARROW_MAX_ENTRIES
+        call exec_narrow_child_caps;
+        cmp rax, 0;
+        jne ex_sw_narrow_propagate;
+
+        // (3) cap_manifest_verify -- DEFERRED (libpdx-cap not linked).
+
+        // (4) command_record_begin -- audit-first, durable BEFORE exec.
+        //   dst          = _ex_audit_rec
+        //   dst_len      = EX_AUDIT_BUF_SIZE (4160)
+        //   argv_ptr     = argv_pool_ptr (r12, the parser's pool slice)
+        //   argv_bytes   = r13
+        //   audit_id     = 1 (placeholder; libpdx-audit issues real ids)
+        //   ts_begin_ns  = 0 (placeholder; sys_clock_monotonic wires here)
+        lea rdi, [rip + _ex_audit_rec];
+        mov rsi, 4160;                       // EX_AUDIT_BUF_SIZE
+        mov rdx, r12;
+        mov rcx, r13;
+        mov r8,  1;                          // audit_id placeholder
+        xor r9,  r9;                         // ts_begin_ns placeholder
+        call command_record_begin;
+        cmp rax, 0;
+        jne ex_sw_audit_begin_fail;
+
+        // (5) sys_execve(path=argv[0], argv=_ex_argv_ptrs, envp=NULL).
+        // On success never returns (kernel replaces the shell image
+        // with the child's image). On failure returns a negative
+        // errno.
+        //
+        // See §FORK GAP for why sys_wait4 (step 6) is structurally
+        // reached only via a sys_execve failure in the current
+        // syscall floor. When sys_fork lands, insert `call sys_fork;
+        // cmp rax, 0; jne ex_sw_parent_wait;` BEFORE this block and
+        // the sys_execve call becomes the child branch; the parent
+        // branch falls into ex_sw_wait_head labelled below.
+        lea r11, [rip + _ex_argv_ptrs];
+        mov rdi, [r11 + 0];                  // path = argv[0]
+        lea rsi, [rip + _ex_argv_ptrs];      // argv
+        xor rdx, rdx;                        // envp = NULL (D5)
+        call sys_execve;
+        // Any return is failure. Route to execve-fail close + return.
+        jmp ex_sw_execve_fail_close;
+
+        // (6) sys_wait4(pid=-1, &_ex_wstatus, 0, 0). UNREACHABLE in
+        // the current syscall floor (sys_execve either succeeds and
+        // never returns, or fails and we route through
+        // ex_sw_execve_fail_close above). Kept for the ordered §M2
+        // CALL GRAPH sequence so a future sys_fork insertion makes
+        // the wait4 path live without touching the body's structure.
+      ex_sw_wait_head:
+        mov rdi, 0xFFFFFFFFFFFFFFFF;         // pid = -1 (any child)
+        lea rsi, [rip + _ex_wstatus];
+        xor rdx, rdx;                        // options = 0
+        xor rcx, rcx;                        // rusage = NULL
+        call sys_wait4;
+        cmp rax, 0;
+        jl  ex_sw_wait_fail;
+
+        // (7) Extract exit code from wstatus low byte.
+        lea r11, [rip + _ex_wstatus];
+        mov rax, [r11];
+        and rax, 0xFF;
+        mov r15, rax;                        // r15 = exit_code
+
+        // (7) command_record_close(exit_code).
+        lea rdi, [rip + _ex_audit_rec];
+        mov rsi, 4160;
+        xor rdx, rdx;                        // ts_end_ns placeholder
+        mov rcx, r15;
+        call command_record_close;
+
+        // Bump SH_ST_EXITS.
+        mov rdi, 3;                          // SH_ST_EXITS
+        call shell_note;
+
+        // Return exit code.
+        mov rax, r15;
         add rsp, 8;
-        pop r13;
-        pop r12;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret;
+
+      ex_sw_execve_fail_close:
+        // (7) Close audit with exit=127 (POSIX-style "exec failed").
+        lea rdi, [rip + _ex_audit_rec];
+        mov rsi, 4160;
+        xor rdx, rdx;
+        mov rcx, 127;
+        call command_record_close;
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC22;                 // EX_ERR_EXECVE_FAIL
+        add rsp, 8;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret;
+
+      ex_sw_wait_fail:
+        // Close audit with exit=127 so the OPEN record does not leak.
+        lea rdi, [rip + _ex_audit_rec];
+        mov rsi, 4160;
+        xor rdx, rdx;
+        mov rcx, 127;
+        call command_record_close;
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC23;                 // EX_ERR_WAIT_FAIL
+        add rsp, 8;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret;
+
+      ex_sw_audit_begin_fail:
+        // audit begin failed BEFORE exec -- D3 says do not proceed.
+        // No close (the record was never opened durably).
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFEC28;                 // EX_ERR_AUDIT_BEGIN_FAIL
+        add rsp, 8;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret;
+
+      ex_sw_narrow_propagate:
+        // exec_narrow_child_caps already bumped SH_ST_ERRORS.
+        // Return its sentinel verbatim (EX_ERR_MISSING_CAP /
+        // EX_ERR_WIDENING / EX_ERR_SIDECAR_FULL / EX_ERR_BAD_ARGV).
+        add rsp, 8;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
+        ret;
+
+      ex_sw_argv_propagate:
+        // exec_build_argv_ptrs did NOT bump SH_ST_ERRORS (leaf helper).
+        // rax holds the helper's sentinel (0xFFFFEC21 EX_ERR_BAD_ARGV
+        // or 0xFFFFEC27 EX_ERR_ARGV_OVERFLOW) which shell_note would
+        // clobber (SysV caller-save), so stash it in r15 (a
+        // callee-save the shell_note call preserves) before the bump
+        // and restore it into rax immediately after.
+        mov r15, rax;
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, r15;
+        add rsp, 8;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
       ex_sw_bad_argv:
@@ -467,8 +1020,7 @@ module Exec = structure {
         call shell_note;
         mov rax, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
         add rsp, 8;
-        pop r13;
-        pop r12;
+        pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret
       }
     }

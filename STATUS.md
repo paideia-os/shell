@@ -1,12 +1,19 @@
 # shell — status
 
-> **v1.0.0 is a wire-format encoder suite. `shell` cannot execute a
+> **v1.0.0 was a wire-format encoder suite. `shell` COULD not execute a
 > command.** Zero syscall instructions in `src/`; its only executed
-> call is a `.bss` counter bump; its declared entry symbol
-> (`Shell::shell_main`) is not defined anywhere in the repository. See
+> call was a `.bss` counter bump; its declared entry symbol
+> (`Shell::shell_main`) was not defined anywhere in the repository. See
 > `design/enhancement-plan.md` §1 for the grep-verified audit and §6
 > for why the release that first executes a command is numbered
 > `v2.0`, not `v0.2` (shell#37 / ENH-010).
+>
+> **ENH-001 (#28) and ENH-005 (#32) invalidate the walk-back.** The
+> shell now has `syscall` instructions in `src/syscall.pdx` and
+> `exec_spawn_and_wait` calls `sys_execve` for real (with a
+> `ShellCommandRecord` opened before the call per D3). The remaining
+> gap is ENH-006 (#33), which defines `Shell::shell_main` and wires
+> the shell into `bin_seeds.pdx` for boot-time smoke exercise.
 
 **Current milestone:** R106 — shell scaffolding + tokenizer novel semantics
 **Version:** 0.1.0 (see `CHANGELOG.md`)
@@ -191,13 +198,15 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFEC11 | LR_ERR_BAD_BUF    | buf == 0 or buf_len == 0                                   |
 | 0xFFFFEC12 | LR_ERR_TTY_UNBOUND| M2+: KIND_TTY(read) missing from caller                    |
 | 0xFFFFEC13 | LR_ERR_EOF        | M2+: sys_read on TTY returned 0 unexpectedly               |
-| 0xFFFFEC20 | EX_STUB           | Exec.M1: validated, no live spawn yet                      |
-| 0xFFFFEC21 | EX_ERR_BAD_ARGV   | argv == 0 or argv_count == 0                               |
-| 0xFFFFEC22 | EX_ERR_EXECVE_FAIL| M2+: sys_execve refused                                    |
-| 0xFFFFEC23 | EX_ERR_WAIT_FAIL  | M2+: sys_wait4 refused                                     |
-| 0xFFFFEC24 | EX_ERR_MISSING_CAP| M2: child requires a KIND not in parent's cap set          |
-| 0xFFFFEC25 | EX_ERR_WIDENING   | M2: child asks for rights parent does not hold             |
-| 0xFFFFEC26 | EX_ERR_SIDECAR_FULL| M2: dst buffer too small for narrowed sidecar             |
+| 0xFFFFEC20 | EX_STUB           | Exec.M1 (retired at ENH-005): validated, no live spawn     |
+| 0xFFFFEC21 | EX_ERR_BAD_ARGV   | Exec: pool == 0, argv_bytes == 0, or argc == 0 (ENH-005)   |
+| 0xFFFFEC22 | EX_ERR_EXECVE_FAIL| Exec.ENH-005: sys_execve returned (never returns on success) |
+| 0xFFFFEC23 | EX_ERR_WAIT_FAIL  | Exec.ENH-005: sys_wait4 returned negative errno            |
+| 0xFFFFEC24 | EX_ERR_MISSING_CAP| Exec.M2: child requires a KIND not in parent's cap set     |
+| 0xFFFFEC25 | EX_ERR_WIDENING   | Exec.M2: child asks for rights parent does not hold        |
+| 0xFFFFEC26 | EX_ERR_SIDECAR_FULL| Exec.M2: dst buffer too small for narrowed sidecar        |
+| 0xFFFFEC27 | EX_ERR_ARGV_OVERFLOW    | Exec.ENH-005: build_argv_ptrs argc + 1 > dst_max (>= 16)    |
+| 0xFFFFEC28 | EX_ERR_AUDIT_BEGIN_FAIL | Exec.ENH-005: command_record_begin refused (D3 audit-first gate) |
 | 0xFFFFEC30 | SS_ERR_BAD_DST    | Session.M2: dst == 0                                       |
 | 0xFFFFEC31 | SS_ERR_BAD_ID     | Session.M2: session_id == 0                                |
 | 0xFFFFEC32 | SS_ERR_BAD_SLOT   | Session.M2: slot >= 256                                    |

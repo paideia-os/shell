@@ -1,0 +1,643 @@
+// tests/test_exec.pdx -- shell.ENH-005 (paideia-os/shell#32)
+//
+// TestExec module: unit fingerprints for the ENH-005 exec-path
+// landing.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// ENH-005 replaces exec_spawn_and_wait's EX_STUB tail with the real
+// 7-step sequence: build argv[] -> narrow caps -> command_record_begin
+// -> sys_execve -> sys_wait4 -> command_record_close. The FULL round-
+// trip is testable only against a live kernel (sys_execve replaces the
+// running image, so the test fixture cannot ITSELF drive it). The unit
+// half of the fingerprint -- what a caller can prove BEFORE the
+// substrate boundary -- lives in this module.
+//
+// What this module verifies:
+//
+//   1. exec_build_argv_ptrs marshals a canonical NUL-separated pool
+//      into the expected char** array shape (dst[0..argc] point at
+//      each word; dst[argc] == NULL).
+//   2. exec_build_argv_ptrs refuses argc >= EX_ARGV_PTRS_MAX with
+//      EX_ERR_ARGV_OVERFLOW without walking the pool.
+//   3. exec_build_argv_ptrs gates dst_max, pool_ptr, argv_bytes, and
+//      argc via EX_ERR_BAD_ARGV.
+//   4. exec_spawn_and_wait's own input gates (pool != 0, argv_bytes > 0,
+//      argc > 0) return EX_ERR_BAD_ARGV without ever reaching a
+//      substrate call.
+//   5. The audit-first ordering is testable in this module by driving
+//      exec_spawn_and_wait with argv_bytes > CMDR_ARGV_MAX (8192);
+//      command_record_begin rejects with CMDR_ERR_TOO_LONG and
+//      exec_spawn_and_wait routes that to EX_ERR_AUDIT_BEGIN_FAIL --
+//      proving sys_execve was not reached. (We construct a pool large
+//      enough to satisfy build_argv_ptrs on the way through; the
+//      command_record_begin gate reads argv_bytes as a number, so a
+//      too-large argv_bytes value against a small argc-1 pool still
+//      triggers the gate.)
+//
+// What is DEFERRED to paideia-os boot smoke (post-#33):
+//
+//   * spawn /bin/true -> exit 0, matching audit pair (CMDR_EXIT_PENDING
+//     transitions to CLOSED).
+//   * spawn /bin/false -> exit 1, matching audit pair.
+//   * shell wired into bin_seeds.pdx so the QEMU smoke can drive
+//     `sh -c '/bin/true'` end-to-end.
+//
+// Neither of the two spawn fingerprints can run without a live kernel
+// (sys_execve is a real syscall that either replaces the image or
+// returns an errno the kernel invented; both outcomes require a real
+// task manager). The encoder half of the D3 invariant is already
+// covered by tests/test_audit_first.pdx (taf_run_all); ENH-005 makes
+// the encoder pair a call-graph property of exec_spawn_and_wait, which
+// this module fingerprints via the audit-fail-before-exec case (5).
+//
+// =============================================================================
+// TEST MATRIX
+// =============================================================================
+//
+//   1  tex_case_argv_marshal      canonical "ls\0-la\0/tmp\0" (argv_bytes=12,
+//                                  argc=3) -> _ex_argv_ptrs[0..2] point at
+//                                  offsets 0/3/7; _ex_argv_ptrs[3] == 0.
+//   2  tex_case_argv_overflow     argc=16 -> EX_ERR_ARGV_OVERFLOW (>= EX_
+//                                  ARGV_PTRS_MAX = 16; the +1 NULL slot
+//                                  makes the ceiling 15 real args).
+//   3  tex_case_argv_gate_pool    exec_build_argv_ptrs(pool=0, ...) ->
+//                                  EX_ERR_BAD_ARGV.
+//   4  tex_case_argv_gate_dstmax  exec_build_argv_ptrs(..., dst_max=argc) ->
+//                                  EX_ERR_ARGV_OVERFLOW (not enough room
+//                                  for the NULL sentinel).
+//   5  tex_case_sw_gate_pool      exec_spawn_and_wait(argv_pool_ptr=0, ...) ->
+//                                  EX_ERR_BAD_ARGV (no substrate reached).
+//   6  tex_case_sw_gate_bytes     exec_spawn_and_wait(..., argv_bytes=0, ...) ->
+//                                  EX_ERR_BAD_ARGV.
+//   7  tex_case_sw_gate_argc      exec_spawn_and_wait(..., argc=0) ->
+//                                  EX_ERR_BAD_ARGV.
+//   8  tex_case_sw_audit_first    exec_spawn_and_wait with argv_bytes > 8192
+//                                  (CMDR_ARGV_MAX) but small pool ->
+//                                  EX_ERR_AUDIT_BEGIN_FAIL (proves sys_execve
+//                                  never reached). This is the D3-audit-
+//                                  first-as-call-graph-property fingerprint.
+//
+// =============================================================================
+// RETURN CODES
+// =============================================================================
+//
+//   0            TEX_PASS               all cases passed
+//   0xFFFFED81   TEX_FAIL_ARGV_MARSHAL  case 1: wrong pointer in _ex_argv_ptrs
+//   0xFFFFED82   TEX_FAIL_ARGV_OVER     case 2 result != EX_ERR_ARGV_OVERFLOW
+//   0xFFFFED83   TEX_FAIL_ARGV_POOL     case 3 result != EX_ERR_BAD_ARGV
+//   0xFFFFED84   TEX_FAIL_ARGV_DSTMAX   case 4 result != EX_ERR_ARGV_OVERFLOW
+//   0xFFFFED85   TEX_FAIL_SW_POOL       case 5 result != EX_ERR_BAD_ARGV
+//   0xFFFFED86   TEX_FAIL_SW_BYTES      case 6 result != EX_ERR_BAD_ARGV
+//   0xFFFFED87   TEX_FAIL_SW_ARGC       case 7 result != EX_ERR_BAD_ARGV
+//   0xFFFFED88   TEX_FAIL_SW_AUDIT      case 8 result != EX_ERR_AUDIT_BEGIN_FAIL
+//                                        (would indicate sys_execve was reached
+//                                        despite the audit-begin failure --
+//                                        a D3 invariant violation)
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestExec`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Large immediates
+//     (return-code sentinels 0xFFFFEC2x, TEX fail codes 0xFFFFED8x)
+//     emitted via mov r10 / rax, imm32.
+//   - r11 as .bss LEA scratch.
+//   - Byte writes into the fixture pool via `mov_b [ptr], rax` after
+//     `mov rax, <byte>` (#1248 pattern; the destination xor-clear is
+//     not required for writes, but the pool's *reader* uses the
+//     xor-clear form).
+//   - Non-leaf test entries wrap the SUT calls with 1-push + `sub rsp,
+//     8` = 16-byte prologue; rsp % 16 == 0 for the SysV call.
+
+module TestExec = structure {
+
+  // ==========================================================================
+  // Expected return codes from Exec (mirror shell.pdx / exec.pdx)
+  // ==========================================================================
+  pub let TEX_EX_OK                    : u64 = 0
+  pub let TEX_EX_ERR_BAD_ARGV          : u64 = 0xFFFFEC21
+  pub let TEX_EX_ERR_ARGV_OVERFLOW     : u64 = 0xFFFFEC27
+  pub let TEX_EX_ERR_AUDIT_BEGIN_FAIL  : u64 = 0xFFFFEC28
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED8x band; disjoint from all existing 0xFFFFEDxx
+  // test bands per grep -o '0xFFFFED[0-9A-Fa-f][0-9A-Fa-f]' tests/*.pdx
+  // at ENH-005 landing time)
+  // ==========================================================================
+  pub let TEX_PASS               : u64 = 0
+  pub let TEX_FAIL_ARGV_MARSHAL  : u64 = 0xFFFFED81
+  pub let TEX_FAIL_ARGV_OVER     : u64 = 0xFFFFED82
+  pub let TEX_FAIL_ARGV_POOL     : u64 = 0xFFFFED83
+  pub let TEX_FAIL_ARGV_DSTMAX   : u64 = 0xFFFFED84
+  pub let TEX_FAIL_SW_POOL       : u64 = 0xFFFFED85
+  pub let TEX_FAIL_SW_BYTES      : u64 = 0xFFFFED86
+  pub let TEX_FAIL_SW_ARGC       : u64 = 0xFFFFED87
+  pub let TEX_FAIL_SW_AUDIT      : u64 = 0xFFFFED88
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  //   _tex_pool_small    16 bytes; painted with "ls\0-la\0/tmp\0" (12 real
+  //                      bytes, 4 zero-pad) via byte writes in tex_reset.
+  //   _tex_dst_ptrs      16 slots; separate destination for case 1 so the
+  //                      SUT's own _ex_argv_ptrs stays untouched by the
+  //                      overflow / gate cases below.
+  //   _tex_dst_ptrs_tiny 4 slots; used by case 4 (dst_max intentionally
+  //                      set equal to argc so the +1 for NULL overflows).
+  // ==========================================================================
+  pub let mut _tex_pool_small    : [u64; 2]  = uninit @align(8)
+  pub let mut _tex_dst_ptrs      : [u64; 16] = uninit @align(16)
+  pub let mut _tex_dst_ptrs_tiny : [u64; 4]  = uninit @align(8)
+
+  // ==========================================================================
+  // tex_reset()
+  //
+  // Zero the dst arrays and paint _tex_pool_small with "ls\0-la\0/tmp\0"
+  // (12 bytes; trailing 4 bytes zero-filled implicitly by the loop
+  // above the writes).
+  //
+  // Leaf function. r10 as base scratch, rax as byte const, rcx as loop
+  // index.
+  // ==========================================================================
+  pub let tex_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-005 (#32): reset the test fixture. Zero the two dst pointer arrays (_tex_dst_ptrs 16 qwords + _tex_dst_ptrs_tiny 4 qwords = 20 qwords total, done in two small loops so the compare imms stay <= 0x7FFFFFFF), then paint _tex_pool_small with the canonical NUL-separated argv text 'ls\\0-la\\0/tmp\\0' via 12 byte writes. Byte writes use `mov rax, <const>; mov_b [ptr], rax` (the destination xor-clear guard is not needed for writes, only for the reader that will consume the pool downstream via `xor rax, rax; mov_b rax, [ptr]`). Loop bounds fit imm <= 0x7FFFFFFF trivially (16 and 4). Leaf function -- no push/pop parity. Labels prefixed tex_rs_.",
+      block: {
+        // Zero _tex_dst_ptrs (16 qwords).
+        lea r10, [rip + _tex_dst_ptrs];
+        xor rax, rax;
+        xor rcx, rcx;
+      tex_rs_l1:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 16;
+        jb  tex_rs_l1;
+
+        // Zero _tex_dst_ptrs_tiny (4 qwords).
+        lea r10, [rip + _tex_dst_ptrs_tiny];
+        xor rax, rax;
+        xor rcx, rcx;
+      tex_rs_l2:
+        mov [r10 + rcx * 8], rax;
+        add rcx, 1;
+        cmp rcx, 4;
+        jb  tex_rs_l2;
+
+        // Zero + paint _tex_pool_small (16 bytes). Zero via two qword
+        // stores (offsets 0 + 8), then overwrite offsets 0..11 with
+        // the canonical bytes.
+        lea r10, [rip + _tex_pool_small];
+        xor rax, rax;
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // "ls\0-la\0/tmp\0"
+        //  offset 0: 'l' 0x6c
+        //  offset 1: 's' 0x73
+        //  offset 2: 0x00
+        //  offset 3: '-' 0x2d
+        //  offset 4: 'l' 0x6c
+        //  offset 5: 'a' 0x61
+        //  offset 6: 0x00
+        //  offset 7: '/' 0x2f
+        //  offset 8: 't' 0x74
+        //  offset 9: 'm' 0x6d
+        //  offset 10: 'p' 0x70
+        //  offset 11: 0x00
+        mov rax, 0x6c; mov_b [r10 + 0], rax;
+        mov rax, 0x73; mov_b [r10 + 1], rax;
+        xor rax, rax;  mov_b [r10 + 2], rax;
+        mov rax, 0x2d; mov_b [r10 + 3], rax;
+        mov rax, 0x6c; mov_b [r10 + 4], rax;
+        mov rax, 0x61; mov_b [r10 + 5], rax;
+        xor rax, rax;  mov_b [r10 + 6], rax;
+        mov rax, 0x2f; mov_b [r10 + 7], rax;
+        mov rax, 0x74; mov_b [r10 + 8], rax;
+        mov rax, 0x6d; mov_b [r10 + 9], rax;
+        mov rax, 0x70; mov_b [r10 + 10], rax;
+        xor rax, rax;  mov_b [r10 + 11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_argv_marshal() -> u64
+  //
+  // Canonical pool "ls\0-la\0/tmp\0" (12 bytes, argc=3) into
+  // _tex_dst_ptrs. Verify:
+  //   _tex_dst_ptrs[0] == _tex_pool_small + 0    ("ls")
+  //   _tex_dst_ptrs[1] == _tex_pool_small + 3    ("-la")
+  //   _tex_dst_ptrs[2] == _tex_pool_small + 7    ("/tmp")
+  //   _tex_dst_ptrs[3] == 0                       (NULL sentinel)
+  // ==========================================================================
+  pub let tex_case_argv_marshal : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-005 (#32): the ARGV MARSHAL happy-path case. Drives exec_build_argv_ptrs against the canonical Lexer/Parser output shape for a 3-word stage and verifies every output pointer against the expected pool_base + <offset> value. The offsets 0/3/7 correspond to word starts in 'ls\\0-la\\0/tmp\\0' -- if the walker mis-identified a NUL boundary (e.g. lost track of `found >= argc` and appended a fourth pointer past 'tmp\\0'), the check for dst_ptrs[3] == 0 would catch it. Verifies both the pointer values AND the NULL sentinel; the ABI at design/user/execve-abi.md is explicit that argv[argc] == NULL, and a marshaller that skipped the terminator would silently violate the frozen contract. Uses r12 as the pool_base cache across the SUT call (callee-save; SUT preserves it). 1 push + `sub rsp, 8` prologue for alignment. Labels prefixed tex_am_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        lea r12, [rip + _tex_pool_small];
+
+        // exec_build_argv_ptrs(pool, argv_bytes=12, argc=3, dst, dst_max=16).
+        mov rdi, r12;
+        mov rsi, 12;
+        mov rdx, 3;
+        lea rcx, [rip + _tex_dst_ptrs];
+        mov r8, 16;
+        call exec_build_argv_ptrs;
+        cmp rax, 0;
+        jne tex_am_fail;
+
+        lea r11, [rip + _tex_dst_ptrs];
+
+        // dst[0] == pool + 0.
+        mov rax, [r11 + 0];
+        cmp rax, r12;
+        jne tex_am_fail;
+
+        // dst[1] == pool + 3.
+        mov rax, [r11 + 8];
+        mov r10, r12;
+        add r10, 3;
+        cmp rax, r10;
+        jne tex_am_fail;
+
+        // dst[2] == pool + 7.
+        mov rax, [r11 + 16];
+        mov r10, r12;
+        add r10, 7;
+        cmp rax, r10;
+        jne tex_am_fail;
+
+        // dst[3] == 0 (NULL sentinel).
+        mov rax, [r11 + 24];
+        cmp rax, 0;
+        jne tex_am_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_am_fail:
+        mov rax, 0xFFFFED81;                 // TEX_FAIL_ARGV_MARSHAL
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_argv_overflow() -> u64
+  //
+  // argc=16 with dst_max=16 -> EX_ERR_ARGV_OVERFLOW (the +1 for the
+  // NULL sentinel means dst_max must be >= argc+1 = 17).
+  // ==========================================================================
+  pub let tex_case_argv_overflow : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-005 (#32): the ARGV OVERFLOW case. Verifies exec_build_argv_ptrs refuses argc=16 against dst_max=16 with EX_ERR_ARGV_OVERFLOW. The +1 NULL sentinel at argv[argc] makes the effective ceiling 15 real args when dst_max is 16 (the EX_ARGV_PTRS_MAX default at _ex_argv_ptrs). A caller trying to spawn a 16-word command would hit this gate; the reject fires before any pool walk, so the pool_ptr / argv_bytes values here can be anything non-null / non-zero (still passed as valid values to isolate the overflow gate from the input-gate cases). 1 push + `sub rsp, 8` prologue. Labels prefixed tex_ov_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        // argc=16 > 15; dst_max=16 -> argc + 1 = 17 > 16 -> overflow.
+        lea rdi, [rip + _tex_pool_small];
+        mov rsi, 12;
+        mov rdx, 16;                         // argc
+        lea rcx, [rip + _tex_dst_ptrs];
+        mov r8, 16;
+        call exec_build_argv_ptrs;
+
+        mov r10, 0xFFFFEC27;                 // EX_ERR_ARGV_OVERFLOW
+        cmp rax, r10;
+        jne tex_ov_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_ov_fail:
+        mov rax, 0xFFFFED82;                 // TEX_FAIL_ARGV_OVER
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_argv_gate_pool() -> u64
+  //
+  // exec_build_argv_ptrs(pool_ptr=0, ...) -> EX_ERR_BAD_ARGV.
+  // ==========================================================================
+  pub let tex_case_argv_gate_pool : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-005 (#32): the ARGV POOL=NULL case. Verifies exec_build_argv_ptrs refuses a null pool_ptr with EX_ERR_BAD_ARGV. This gate is the load-bearing 'do not deref NULL' check -- if it slipped, the helper would attempt `mov_b rax, [0]` on the first byte read. All other arg values are valid (argv_bytes=12, argc=3, dst non-null, dst_max=16) so only the pool_ptr==0 branch fires. 1 push + `sub rsp, 8` prologue. Labels prefixed tex_gp_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        xor rdi, rdi;                        // pool_ptr = 0
+        mov rsi, 12;
+        mov rdx, 3;
+        lea rcx, [rip + _tex_dst_ptrs];
+        mov r8, 16;
+        call exec_build_argv_ptrs;
+
+        mov r10, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        cmp rax, r10;
+        jne tex_gp_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_gp_fail:
+        mov rax, 0xFFFFED83;                 // TEX_FAIL_ARGV_POOL
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_argv_gate_dstmax() -> u64
+  //
+  // dst_max = argc (no room for the NULL sentinel) -> EX_ERR_ARGV_OVERFLOW.
+  // ==========================================================================
+  pub let tex_case_argv_gate_dstmax : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-005 (#32): the DST_MAX == argc case. Verifies exec_build_argv_ptrs refuses a dst_max that leaves no room for the NULL sentinel with EX_ERR_ARGV_OVERFLOW. Fixture: argc=3, dst_max=3 -> argc + 1 = 4 > 3 -> overflow. Uses _tex_dst_ptrs_tiny (4 slots) as the destination so a bug that wrote past dst_max would corrupt only a bounded buffer. 1 push + `sub rsp, 8` prologue. Labels prefixed tex_dm_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        lea rdi, [rip + _tex_pool_small];
+        mov rsi, 12;
+        mov rdx, 3;                          // argc = 3
+        lea rcx, [rip + _tex_dst_ptrs_tiny];
+        mov r8, 3;                           // dst_max = 3 (no NULL room)
+        call exec_build_argv_ptrs;
+
+        mov r10, 0xFFFFEC27;                 // EX_ERR_ARGV_OVERFLOW
+        cmp rax, r10;
+        jne tex_dm_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_dm_fail:
+        mov rax, 0xFFFFED84;                 // TEX_FAIL_ARGV_DSTMAX
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_sw_gate_pool() -> u64
+  //
+  // exec_spawn_and_wait(argv_pool_ptr=0, ...) -> EX_ERR_BAD_ARGV.
+  // ==========================================================================
+  pub let tex_case_sw_gate_pool : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-005 (#32): the SW POOL=NULL case. Verifies exec_spawn_and_wait refuses a null argv_pool_ptr with EX_ERR_BAD_ARGV BEFORE any substrate call. This is a top-level input gate; failure here would mean the shell would attempt to walk NULL when Parser hands over an empty stage. The other args (argv_bytes=12, argc=3) are non-zero so only the pool==0 branch fires. Test entry declares the widest effect/cap set of exec_spawn_and_wait ({mem, sysreg} + @{sched, mem, fs}) even though the call short-circuits before reaching any syscall; the compiler unions call-graph effects statically. 1 push + `sub rsp, 8` prologue. Labels prefixed tex_swp_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        xor rdi, rdi;                        // pool = 0
+        mov rsi, 12;
+        mov rdx, 3;
+        call exec_spawn_and_wait;
+
+        mov r10, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        cmp rax, r10;
+        jne tex_swp_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_swp_fail:
+        mov rax, 0xFFFFED85;                 // TEX_FAIL_SW_POOL
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_sw_gate_bytes() -> u64
+  //
+  // exec_spawn_and_wait(argv_bytes=0) -> EX_ERR_BAD_ARGV.
+  // ==========================================================================
+  pub let tex_case_sw_gate_bytes : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-005 (#32): the SW BYTES=0 case. Verifies exec_spawn_and_wait refuses argv_bytes=0 with EX_ERR_BAD_ARGV. An empty pool slice has no words so the spawn is meaningless; without this gate command_record_begin would still succeed (argv_bytes==0 is legal for it -- the encoder produces an empty-argv record for a D3 audit of an Enter on empty prompt), but sys_execve would receive an empty argv[] array with argv[0]==NULL and refuse the exec. Failing early keeps the sequence's error mode local to the shell. 1 push + `sub rsp, 8` prologue. Labels prefixed tex_swb_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        lea rdi, [rip + _tex_pool_small];
+        xor rsi, rsi;                        // argv_bytes = 0
+        mov rdx, 3;
+        call exec_spawn_and_wait;
+
+        mov r10, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        cmp rax, r10;
+        jne tex_swb_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_swb_fail:
+        mov rax, 0xFFFFED86;                 // TEX_FAIL_SW_BYTES
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_sw_gate_argc() -> u64
+  //
+  // exec_spawn_and_wait(argc=0) -> EX_ERR_BAD_ARGV.
+  // ==========================================================================
+  pub let tex_case_sw_gate_argc : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-005 (#32): the SW ARGC=0 case. Verifies exec_spawn_and_wait refuses argc=0 with EX_ERR_BAD_ARGV. Symmetric to bytes=0: a stage with zero words is Parser's PR_ERR_EMPTY_STAGE case (which the parser itself catches upstream), but exec_spawn_and_wait defends against a caller that somehow slipped past. 1 push + `sub rsp, 8` prologue. Labels prefixed tex_swa_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        lea rdi, [rip + _tex_pool_small];
+        mov rsi, 12;
+        xor rdx, rdx;                        // argc = 0
+        call exec_spawn_and_wait;
+
+        mov r10, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
+        cmp rax, r10;
+        jne tex_swa_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_swa_fail:
+        mov rax, 0xFFFFED87;                 // TEX_FAIL_SW_ARGC
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_case_sw_audit_first() -> u64
+  //
+  // Load-bearing test: pass argv_bytes > CMDR_ARGV_MAX (8192) so
+  // command_record_begin rejects with CMDR_ERR_TOO_LONG. Verify that
+  // exec_spawn_and_wait routes this to EX_ERR_AUDIT_BEGIN_FAIL --
+  // proving sys_execve was NOT reached.
+  //
+  // exec_build_argv_ptrs walks argv_bytes bytes of the pool looking
+  // for NUL boundaries; with argc=1 and argv_bytes=9000 against our
+  // 16-byte pool, the walker would over-read. To keep the walker
+  // in-bounds while still tripping the audit gate, we set argc=1 (so
+  // the walker's found >= argc break fires on the very first NUL) and
+  // argv_bytes=9000 (only inspected by command_record_begin as a
+  // count).
+  //
+  // The pool holds "ls\0..." -- the walker sees the NUL at offset 2,
+  // sets found=1, next iteration finds found >= argc=1 and breaks.
+  // Then argv_bytes=9000 arrives at command_record_begin which rejects
+  // with CMDR_ERR_TOO_LONG (> CMDR_ARGV_MAX=8192).
+  //
+  // If exec_spawn_and_wait returned any value OTHER than
+  // EX_ERR_AUDIT_BEGIN_FAIL, either the gate ordering is wrong (execve
+  // reached before audit) or the audit fail was mapped to the wrong
+  // sentinel -- both are D3 invariant violations.
+  // ==========================================================================
+  pub let tex_case_sw_audit_first : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-005 (#32): the LOAD-BEARING AUDIT-FIRST case. This is what makes the D3 audit-first invariant a call-graph property of exec_spawn_and_wait, not just an encoder property (which taf_run_all already covers). The test drives exec_spawn_and_wait with an argv_bytes value (9000) that exceeds command_record_begin's CMDR_ARGV_MAX (8192) cap; the audit encoder refuses with CMDR_ERR_TOO_LONG, and the SUT must route that to EX_ERR_AUDIT_BEGIN_FAIL without proceeding to sys_execve. Argc=1 keeps exec_build_argv_ptrs's walker in-bounds against the 16-byte pool (the break-on-found>=argc trigger fires at the first NUL, offset 2 in 'ls\\0...'), so the audit gate is the only failure surface exercised. If this test fails with any value OTHER than EX_ERR_AUDIT_BEGIN_FAIL, either (a) sys_execve was reached BEFORE the audit gate -- a D3 violation -- or (b) the SUT mapped audit fail to the wrong sentinel. The paideia-os boot smoke will strengthen this into a live-kernel spawn where the audit record's CMDR_EXIT_PENDING -> CLOSED transition is observed post-wait4; here, the encoder-level ordering is falsifiable without the kernel. 1 push + `sub rsp, 8` prologue. Labels prefixed tex_af_.",
+      block: {
+        push r12;
+        sub rsp, 8;
+
+        call tex_reset;
+
+        lea rdi, [rip + _tex_pool_small];
+        mov rsi, 9000;                       // argv_bytes > CMDR_ARGV_MAX (8192)
+        mov rdx, 1;                          // argc = 1 (walker stops at first NUL)
+        call exec_spawn_and_wait;
+
+        mov r10, 0xFFFFEC28;                 // EX_ERR_AUDIT_BEGIN_FAIL
+        cmp rax, r10;
+        jne tex_af_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        ret;
+
+      tex_af_fail:
+        mov rax, 0xFFFFED88;                 // TEX_FAIL_SW_AUDIT
+        add rsp, 8;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tex_run_all() -> u64
+  //
+  // Drive all 8 cases in the order (argv_marshal, argv_overflow,
+  // argv_gate_pool, argv_gate_dstmax, sw_gate_pool, sw_gate_bytes,
+  // sw_gate_argc, sw_audit_first). Return the first non-zero case
+  // result, or 0 on all-pass. Same stop-on-first-fail discipline as
+  // taf_run_all and tcn_run_all.
+  //
+  // Non-leaf; 1 push + `sub rsp, 8` = 16 bytes prologue.
+  // ==========================================================================
+  pub let tex_run_all : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-005 (#32): drive all 8 exec-path test cases in a fixed order (argv_marshal, argv_overflow, argv_gate_pool, argv_gate_dstmax, sw_gate_pool, sw_gate_bytes, sw_gate_argc, sw_audit_first). Stop-on-first-fail matches the taf_run_all / tcn_run_all discipline. Effect/cap set matches exec_spawn_and_wait's own (the SUT's widest row propagates through the union). 1 push + `sub rsp, 8` = 16 bytes prologue; rsp%16==0 for SysV calls. Labels prefixed tex_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call tex_case_argv_marshal;
+        cmp rax, 0;
+        jne tex_ra_done;
+
+        call tex_case_argv_overflow;
+        cmp rax, 0;
+        jne tex_ra_done;
+
+        call tex_case_argv_gate_pool;
+        cmp rax, 0;
+        jne tex_ra_done;
+
+        call tex_case_argv_gate_dstmax;
+        cmp rax, 0;
+        jne tex_ra_done;
+
+        call tex_case_sw_gate_pool;
+        cmp rax, 0;
+        jne tex_ra_done;
+
+        call tex_case_sw_gate_bytes;
+        cmp rax, 0;
+        jne tex_ra_done;
+
+        call tex_case_sw_gate_argc;
+        cmp rax, 0;
+        jne tex_ra_done;
+
+        call tex_case_sw_audit_first;
+
+      tex_ra_done:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}
