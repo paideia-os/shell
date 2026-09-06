@@ -4,6 +4,51 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-001: syscall floor (#28)
+
+First `syscall` instructions land in the tree. The v1.0.0 audit
+(`design/enhancement-plan.md` §1) verified zero `syscall` occurrences
+in `src/`; this change lands nine, one per SC+ wrapper the shell v2.0
+plan enumerates (Stage 0 in the enhancement plan).
+
+### Added
+
+- `src/syscall.pdx` — `Syscall` module. Nine sysno constants
+  (`SYS_READ=0`, `SYS_WRITE=1`, `SYS_OPEN=2`, `SYS_CLOSE=3`,
+  `SYS_EXECVE=59`, `SYS_EXIT=60`, `SYS_WAIT4=61`, `SYS_CHDIR=85`,
+  `SYS_GETCWD=86`) plus a thin callable wrapper per constant. Each
+  wrapper is a leaf function: `mov rax, N; [mov r10, rcx for arity=4];
+  syscall; ret`. Effect and capability annotations mirror the
+  monorepo's canonical `src/user/syscall_shim.pdx` for each SC+ ID.
+- `tests/test_syscall_floor.pdx` — `TestSyscallFloor` module. Runtime
+  fingerprint with two cases (`tsf_case_getcwd`, `tsf_case_write`) +
+  umbrella `tsf_run_all`, in the `0xFFFFED4x` fail-code band. Same
+  driver shape as the four existing test modules; a boot-time smoke
+  harness can invoke all five umbrellas in one loop.
+- `design/architecture.md` §2a — records the design decision (shared
+  module, not per-callsite inline) with the syscall_shim.pdx precedent,
+  documents the wrapper surface + calling convention + fingerprint.
+- `design/architecture.md` §7.4 — extends the fail-code-band table with
+  `0xFFFFED3x` (TestReleaseManifest, prior omission) and `0xFFFFED4x`
+  (TestSyscallFloor).
+
+### Changed
+
+- `manifest.pdxproj` — `src/syscall.pdx` registered ahead of
+  `src/shell.pdx` in the source list (the shell v2.0 wire will call
+  Syscall from Shell::shell_main; source order is documented as
+  order-insensitive per the paideia-as module resolver, but the
+  logical dependency reads better this way);
+  `tests/test_syscall_floor.pdx` appended to the test list.
+
+### Unblocks
+
+Every v2.0 downstream (`#29` lexer, `#30` parser, `#31` builtin
+dispatch, `#32` real exec, `#33` shell_main REPL, `#34` line_reader
+de-stub, `#35` history de-stub) that had "no syscall substrate" as
+its blocker. The critical path from ENH-001 through ENH-006 is now
+open at the substrate boundary.
+
 ## 0.1.0 — 2026-09-03 — R106.SHELL-001 scaffold consolidation
 
 R106 wave opens. Repo version resets to the R106 wave's 0.1.0 baseline;

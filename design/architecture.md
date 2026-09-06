@@ -96,6 +96,123 @@ passing a slot from a newer library version against an older linker
 snapshot cannot corrupt live counters. Same shape as
 `elevate_client_note` / `elevate_client_stat` in libpdx-elevate.
 
+## 2a. `Syscall` module (src/syscall.pdx) — ENH-001 (#28)
+
+### 2a.1 Purpose
+
+The syscall floor. At `v1.0.0` the shell repository contained ZERO
+`syscall` instructions; every stub in the tree (`EX_STUB`, `LR_STUB`,
+`HIST_STUB`, `BB_STUB`, ...) was blocked on this one absence. ENH-001
+lands the SC+ substrate every stage in `design/enhancement-plan.md` §4
+consumes: sysno constants + thin callable wrappers for the nine SC+ IDs
+the shell v2.0 plan enumerates.
+
+The module lands the floor ONLY. No caller in the repository is wired
+up here; the higher-level modules (`Exec`, `LineReader`, `History`,
+`BrokerBind`, ...) invoke these wrappers as their respective `_STUB`
+tails are de-stubbed in ENH-005 (real exec), ENH-007 (real read),
+ENH-008 (PdxFS write), ENH-006 (`shell_main` + `sys_exit`).
+
+### 2a.2 Wrapper surface
+
+```
+Syscall::sys_read (fd, buf, count)           -> u64   SC+ ID 0
+Syscall::sys_write(fd, buf, count)           -> u64   SC+ ID 1
+Syscall::sys_open (path, flags, mode)        -> u64   SC+ ID 2
+Syscall::sys_close(fd)                       -> u64   SC+ ID 3
+Syscall::sys_execve(path, argv, envp)        -> u64   SC+ ID 59
+Syscall::sys_exit(status)                    -> u64   SC+ ID 60 (nrt)
+Syscall::sys_wait4(pid, wstatus, opts, ru)   -> u64   SC+ ID 61
+Syscall::sys_chdir(path, path_len_hint)      -> u64   SC+ ID 85
+Syscall::sys_getcwd(buf, cap)                -> u64   SC+ ID 86
+```
+
+The nine sysno constants are exported as `pub let SYS_READ : u64 = 0`
+etc. — a single point of authority for the SC+ IDs across the shell
+repo, so a future kernel-side renumbering (unlikely: the SC+ table is
+frozen post-R15.M4 with §"IDs are negotiable" latitude only) is a
+single-file change here rather than an N-callsite grep across every
+consumer. The canonical authoritative table lives in the paideia-os
+monorepo at `design/user/syscall-table.md`; this module mirrors the
+subset the shell needs.
+
+### 2a.3 Calling convention
+
+Every wrapper takes SysV arguments (`rdi, rsi, rdx, rcx, r8, r9`) and
+issues `SYSCALL`, which follows the Linux SYSCALL convention (`rdi,
+rsi, rdx, r10, r8, r9`). For wrappers of arity ≤ 3 the argument
+registers overlap and no shuffle is needed; `sys_wait4` (arity 4) alone
+prepends `mov r10, rcx` to relocate SysV arg3 into the SYSCALL arg3
+slot.
+
+Each wrapper is a LEAF function: no push/pop, no local stack frame.
+`syscall` clobbers `rcx` and `r11` per x86-64 SYSCALL semantics — both
+are SysV caller-save, so callers preserve them via SysV convention if
+they need them across the call. All other GP registers are preserved by
+the kernel.
+
+The effect + capability annotations mirror the monorepo's canonical
+`src/user/syscall_shim.pdx` for each corresponding ID. Notably: `mem`
+appears wherever the kernel reads or writes the caller's buffers
+(`sys_read`/`sys_write`/`sys_getcwd` etc.); `sched` on the two
+scheduler-touching wrappers (`sys_execve`, `sys_exit`, `sys_wait4`);
+`fs` on the seven fs-facing wrappers; `mem` capability on `sys_execve`
+which replaces the process address space.
+
+### 2a.4 Design decision: shared module, not inline per callsite
+
+The monorepo has two established patterns for user-space syscalls:
+
+- **Inline at every callsite.** Used by single-file one-ELF binaries
+  (`src/user/cat.pdx:127` explains the pattern verbatim: `child_hello`,
+  `true`, `echo_client`, `mkfs.pdxfs/src/main.pdx`). Every one of these
+  tools compiles to a single-file ELF; extending the pattern to a
+  multi-module program would duplicate the sysno at N callsites and
+  multiply the drift surface against the frozen SC+ table.
+- **Shared shim linked by multi-object-set consumers.** The canonical
+  precedent is `src/user/syscall_shim.pdx` — a 25-wrapper module
+  linked by BOTH `init.elf` and (the kernel-tree) `shell.elf`. Every
+  wrapper is 3 to 4 instructions; the shared surface makes drift
+  auditable at a SINGLE point.
+
+The shell repo has been multi-module since M1 (12 `.pdx` files at
+v1.0.0, each producing its own `.o` under `build-out/`, all destined
+for a single `shell` ELF at link time). Cross-module `call` linkage is
+already the norm — every module in `src/` calls `Shell::shell_note`.
+Introducing a shared `Syscall` wrapper set is architecturally
+consistent with the existing cross-module wiring and matches the
+multi-object-set precedent of `syscall_shim.pdx` rather than the
+single-file-ELF inline pattern of `cat.pdx`.
+
+The two patterns are not in conflict; they cover different
+architectures. The shell's architecture (multi-module, one ELF) maps
+onto the shared-shim pattern by construction.
+
+### 2a.5 Fingerprint (`tests/test_syscall_floor.pdx`)
+
+Two RUNTIME cases in the `0xFFFFED4x` fail-code band prove the shim
+shape end-to-end when invoked from a live kernel:
+
+- `tsf_case_getcwd` — `sys_getcwd(buf, 256)` returns a strlen in
+  `[1, 255]`. Errno, empty, and out-of-range results each map to a
+  distinct sentinel.
+- `tsf_case_write` — `sys_write(1, "syscall floor ok\n", 17)` returns
+  17. Errno, short, and over-write results each map to a distinct
+  sentinel.
+
+Together they exercise `SYSCALL` twice at different sysnos and
+different SysV arities (2 and 3), which is enough to catch a regressed
+shim. The umbrella `tsf_run_all` matches the `tcn_run_all` /
+`taf_run_all` / `tsm_run_all` / `trm_run_all` shape so the future
+boot-time smoke harness can invoke all five drivers in one loop.
+
+Unlike the four M4/M5 encoder-half test modules (which are pure-
+function fixtures against caller-owned buffers), `TestSyscallFloor`
+issues real syscalls when invoked. The compile-clean state remains the
+local guarantee at build time; the substrate-half verification lives
+in the paideia-os v2.0 smoke loop that will invoke `tsf_run_all` after
+a shell binary lands.
+
 ## 3. `LineReader` module (src/line_reader.pdx)
 
 ### 3.1 Contract
@@ -744,6 +861,8 @@ golden bytes don't match, there's no point booting the guest.
 - `0xFFFFED0x` — TestCapsNarrow (M4-001).
 - `0xFFFFED1x` — TestAuditFirst (M4-002).
 - `0xFFFFED2x` — TestSmokeMatrix (M4-003).
+- `0xFFFFED3x` — TestReleaseManifest (M5-001).
+- `0xFFFFED4x` — TestSyscallFloor (ENH-001, #28).
 
 These are disjoint from the shell's own `0xFFFFECxx` band so an
 operator reading a test-run log can tell "SUT rejected input" from

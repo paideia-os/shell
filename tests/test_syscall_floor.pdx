@@ -1,0 +1,319 @@
+// tests/test_syscall_floor.pdx -- shell.ENH-001 (paideia-os/shell#28)
+//
+// TestSyscallFloor module: runtime fingerprint for the Syscall floor.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two runtime cases prove the Syscall module's shape end-to-end when
+// this test is invoked from a live paideia-os kernel:
+//
+//   tsf_case_getcwd  -- sys_getcwd(_tsf_cwd_buf, 256) returns a value
+//                       in [1, 255] (strlen of a non-empty absolute
+//                       path). A negative errno or 0 (empty path) is
+//                       treated as a runtime failure.
+//
+//   tsf_case_write   -- sys_write(1, "syscall floor ok\n", 17) returns
+//                       17 (bytes written). A short write, a zero, or
+//                       a negative errno is treated as a runtime
+//                       failure.
+//
+// These are the two invariants the issue's fingerprint clause names:
+// "at minimum a unit case proving sys_getcwd returns a non-empty path
+// and sys_write(1, ...) reaches the tty." They also transitively
+// exercise the SysV -> SYSCALL calling convention (no arg shuffle
+// for arity 2 and 3), the mov-rax-imm32 sysno load, and the effect/
+// capability propagation from the Syscall module into a caller that
+// declares !{mem, sysreg} @{fs}.
+//
+// The tests DO NOT exercise:
+//   - sys_read (needs a byte source; TTY read op still blocked on
+//     paideia-os#1986 KIND_TTY(read); parallel to the VFS sys_read
+//     path but that requires an open fd, which would need sys_open
+//     against a known /-file -- out of the ENH-001 floor's scope).
+//   - sys_open / sys_close (need a known file path in the mounted
+//     tmpfs; ENH-005's exec path resolution will exercise these).
+//   - sys_execve / sys_wait4 (need a real child binary; ENH-005).
+//   - sys_exit (never returns, cannot be tested from a driver that
+//     wants to run further cases; exercised implicitly by ENH-006's
+//     shell_main).
+//   - sys_chdir (would need a known directory path; ENH-004's cd
+//     builtin covers this).
+//
+// This test module carries the "smoke-adjacent" role for the whole
+// syscall floor: any live invocation exercises the SYSCALL instruction
+// twice with different sysnos and different SysV arities, which is
+// enough to catch a regressed shim.
+//
+// =============================================================================
+// LIVE VS OFFLINE
+// =============================================================================
+//
+// The shell repo builds the test as .o today (per tools/build.sh);
+// running it requires a live kernel. The v2.0 substrate loop's test
+// harness will invoke `tsf_run_all` alongside `tcn_run_all` /
+// `taf_run_all` / `tsm_run_all` / `trm_run_all` at boot; until then,
+// the compile-clean state is the local guarantee (a paideia-as build
+// of tests/test_syscall_floor.pdx that emits ELF proves the sysno
+// constants and wrapper signatures are consistent).
+//
+// The test cases DO run the real syscalls when invoked, unlike the
+// encoder-half tests (test_smoke_matrix / test_release_manifest /
+// test_caps_narrow / test_audit_first) which are pure-function
+// fixtures. This asymmetry is deliberate: the encoder tests were
+// paired with substrate-side smoke on the paideia-os side; the
+// Syscall floor is itself the substrate and has no separable
+// encoder half to test.
+//
+// =============================================================================
+// FAIL-CODE BAND
+// =============================================================================
+//
+//   0            TSF_PASS               both cases passed
+//   0xFFFFED41   TSF_FAIL_GETCWD_ERRNO  sys_getcwd returned a negative errno
+//   0xFFFFED42   TSF_FAIL_GETCWD_EMPTY  sys_getcwd returned 0 (empty path)
+//   0xFFFFED43   TSF_FAIL_GETCWD_OOR    sys_getcwd returned > 255 (impossible)
+//   0xFFFFED44   TSF_FAIL_WRITE_ERRNO   sys_write returned a negative errno
+//   0xFFFFED45   TSF_FAIL_WRITE_SHORT   sys_write returned bytes < 17
+//   0xFFFFED46   TSF_FAIL_WRITE_OVER    sys_write returned bytes > 17
+//
+// Fail codes live in the 0xFFFFED4x band, disjoint from
+//   0xFFFFED0x  TestCapsNarrow
+//   0xFFFFED1x  TestAuditFirst
+//   0xFFFFED2x  TestSmokeMatrix
+//   0xFFFFED3x  TestReleaseManifest
+// so an operator reading a boot-time smoke log can distinguish which
+// test module refused the invariant by the high two bytes of the
+// return.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestSyscallFloor`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (256, 17 both fit).
+//   - r11 scratch reserved for the (unused here) large-imm compare
+//     temporary pattern -- the fail sentinels are mov-rax-imm32 loads,
+//     not compares, so r11 stays untouched.
+//   - Byte writes for _tsf_msg use mov_b (destination-write side of
+//     #1248 pattern).
+//   - Every non-leaf entry (tsf_case_getcwd, tsf_case_write,
+//     tsf_run_all) has 1 push + `sub rsp, 8` = 16 bytes prologue
+//     to keep rsp%16==0 for the nested Syscall.sys_* calls.
+//
+// =============================================================================
+
+module TestSyscallFloor = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED4x band)
+  // ==========================================================================
+  pub let TSF_PASS                : u64 = 0
+  pub let TSF_FAIL_GETCWD_ERRNO   : u64 = 0xFFFFED41
+  pub let TSF_FAIL_GETCWD_EMPTY   : u64 = 0xFFFFED42
+  pub let TSF_FAIL_GETCWD_OOR     : u64 = 0xFFFFED43
+  pub let TSF_FAIL_WRITE_ERRNO    : u64 = 0xFFFFED44
+  pub let TSF_FAIL_WRITE_SHORT    : u64 = 0xFFFFED45
+  pub let TSF_FAIL_WRITE_OVER     : u64 = 0xFFFFED46
+
+  // ==========================================================================
+  // Fixtures (.bss + .rodata)
+  //
+  // _tsf_cwd_buf -- 32 qwords = 256 bytes; enough for any absolute
+  //                 path the paideia-os kernel emits (kernel getcwd
+  //                 body caps at 256 bytes internally per sys_getcwd.pdx).
+  //
+  // _tsf_msg     -- "syscall floor ok\n" (17 bytes payload + NUL = 18).
+  //                 N in `[u8; N]` MUST equal strlen+1 per the paideia-as
+  //                 fingerprint-string rule (feedback_pdx_encoder_pitfalls);
+  //                 payload strlen is 17, so N = 18. The write() call
+  //                 targets 17 bytes; the trailing NUL is not written to
+  //                 the tty.
+  //
+  // TSF_MSG_LEN  -- 17. Used at both the sys_write call and the
+  //                 return-value compare, so a change in the message
+  //                 length changes both places consistently.
+  // ==========================================================================
+  pub let mut _tsf_cwd_buf : [u64; 32] = uninit @align(16)
+  pub let _tsf_msg : [u8; 18] = "syscall floor ok\n\0"
+  pub let TSF_MSG_LEN : u64 = 17
+
+  // ==========================================================================
+  // tsf_case_getcwd() -> u64
+  //
+  // Invoke sys_getcwd(_tsf_cwd_buf, 256) and check the return:
+  //   rax < 0     -> TSF_FAIL_GETCWD_ERRNO  (negative errno; MSB set)
+  //   rax == 0    -> TSF_FAIL_GETCWD_EMPTY  (kernel returned "here's an
+  //                                          empty path", which is a
+  //                                          semantic bug -- even the
+  //                                          root's cwd is "/", strlen 1)
+  //   rax > 255   -> TSF_FAIL_GETCWD_OOR    (impossible; kernel's own
+  //                                          buffer cap is 256 with NUL
+  //                                          reservation, so max strlen
+  //                                          is 255. > 255 signals a
+  //                                          shim regression.)
+  //   else        -> TSF_PASS
+  //
+  // Prologue: `sub rsp, 8` (1 word) to keep rsp%16==0 for the nested
+  // Syscall.sys_getcwd call. Matched `add rsp, 8` at every return.
+  //
+  // Register plan (function-scope):
+  //   rax = return value from sys_getcwd, then compared inline
+  //   rdi, rsi = call args to sys_getcwd (loaded fresh at each call site)
+  //   r10 (large-imm scratch) = 256 for the OOR gate compare
+  // ==========================================================================
+  pub let tsf_case_getcwd : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28) unit case A: sys_getcwd returns a positive strlen in [1..255]. Effect/cap set is the union of Syscall.sys_getcwd's own {mem, sysreg} @{fs} plus this driver's own {mem} on _tsf_cwd_buf. `sub rsp, 8` prologue keeps rsp%16==0 for the SysV call into sys_getcwd; matched `add rsp, 8` before every ret. Three failure gates as documented above; cmp against 0 (errno / empty checks) and cmp against 256 (OOR check) both fit imm32. All labels prefixed tsf_gcw_. Leaf modulo the one sys_getcwd call; no register saves needed since rax/rdi/rsi/r10 are all caller-save under SysV.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16 for sys_getcwd
+
+        lea rdi, [rip + _tsf_cwd_buf];       // arg0 = buf
+        mov rsi, 256;                        // arg1 = cap
+        call sys_getcwd;
+        // rax = strlen written (excl NUL), 1..255 on success; negative errno on failure.
+
+        // Errno gate: rax < 0 (MSB set, treated as signed) -> ERRNO fail.
+        cmp rax, 0;
+        jl  tsf_gcw_errno;
+
+        // Empty gate: rax == 0 -> EMPTY fail.
+        cmp rax, 0;
+        je  tsf_gcw_empty;
+
+        // OOR gate: rax > 255 -> OOR fail. Compare via r10 to stay
+        // within the imm32 window with headroom (256 fits, but we
+        // stage anyway to document the pattern for larger checks).
+        mov r10, 256;
+        cmp rax, r10;
+        ja  tsf_gcw_oor;
+
+        // Success.
+        xor rax, rax;                        // TSF_PASS
+        add rsp, 8;
+        ret;
+
+      tsf_gcw_errno:
+        mov rax, 0xFFFFED41;                 // TSF_FAIL_GETCWD_ERRNO
+        add rsp, 8;
+        ret;
+
+      tsf_gcw_empty:
+        mov rax, 0xFFFFED42;                 // TSF_FAIL_GETCWD_EMPTY
+        add rsp, 8;
+        ret;
+
+      tsf_gcw_oor:
+        mov rax, 0xFFFFED43;                 // TSF_FAIL_GETCWD_OOR
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tsf_case_write() -> u64
+  //
+  // Invoke sys_write(1, _tsf_msg, 17) and check the return:
+  //   rax < 0     -> TSF_FAIL_WRITE_ERRNO   (negative errno)
+  //   rax < 17    -> TSF_FAIL_WRITE_SHORT   (partial write; tty0 is
+  //                                          length-honoring per
+  //                                          write.pdx §4, so short
+  //                                          reads signal shim/tty
+  //                                          regression)
+  //   rax > 17    -> TSF_FAIL_WRITE_OVER    (impossible: kernel cannot
+  //                                          write more than it was
+  //                                          asked; signals shim regression)
+  //   rax == 17   -> TSF_PASS
+  //
+  // Prologue matches tsf_case_getcwd for the same alignment reason.
+  //
+  // The message "syscall floor ok\n" is 17 bytes payload; the NUL
+  // terminator lives in _tsf_msg[17] and is not written.
+  // ==========================================================================
+  pub let tsf_case_write : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28) unit case B: sys_write(1, msg, 17) returns 17. Effect/cap set matches Syscall.sys_write's {mem, sysreg} @{fs}. Three failure gates as documented above: errno (rax < 0), short (rax < 17), over (rax > 17). Every compare is against imm 0 or imm 17 -- both fit imm32 with headroom, no r11 staging needed. The 17-byte message reaches fd 1 (stdout), which on paideia-os is bound to tty0 via the boot init sequence -- so a successful return also proves 'sys_write reaches the tty' per the issue fingerprint. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed tsf_wr_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16 for sys_write
+
+        mov rdi, 1;                          // arg0 = fd = stdout
+        lea rsi, [rip + _tsf_msg];           // arg1 = buf
+        mov rdx, 17;                         // arg2 = count = TSF_MSG_LEN
+        call sys_write;
+        // rax = bytes written on success (== 17), or negative errno.
+
+        // Errno gate: rax < 0 -> ERRNO fail.
+        cmp rax, 0;
+        jl  tsf_wr_errno;
+
+        // Short gate: rax < 17 -> SHORT fail.
+        cmp rax, 17;
+        jl  tsf_wr_short;
+
+        // Over gate: rax > 17 -> OVER fail.
+        cmp rax, 17;
+        jg  tsf_wr_over;
+
+        // Success (rax == 17).
+        xor rax, rax;                        // TSF_PASS
+        add rsp, 8;
+        ret;
+
+      tsf_wr_errno:
+        mov rax, 0xFFFFED44;                 // TSF_FAIL_WRITE_ERRNO
+        add rsp, 8;
+        ret;
+
+      tsf_wr_short:
+        mov rax, 0xFFFFED45;                 // TSF_FAIL_WRITE_SHORT
+        add rsp, 8;
+        ret;
+
+      tsf_wr_over:
+        mov rax, 0xFFFFED46;                 // TSF_FAIL_WRITE_OVER
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tsf_run_all() -> u64
+  //
+  // Umbrella: run both cases in order; first non-zero return short-
+  // circuits and propagates. Same shape as tcn_run_all / taf_run_all
+  // / tsm_run_all / trm_run_all.
+  //
+  // Prologue is `sub rsp, 8` alone (no callee-save pushes -- the two
+  // cases each preserve nothing across their own returns, so this
+  // driver has no state to protect).
+  // ==========================================================================
+  pub let tsf_run_all : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28) umbrella driver: sequential invocation of tsf_case_getcwd then tsf_case_write; short-circuit on first non-zero return. Effect/cap set is the union of both cases (identical: {mem, sysreg} @{fs}). `sub rsp, 8` prologue keeps rsp%16==0 for the two nested SysV calls; matched `add rsp, 8` before every ret. Labels prefixed tsf_ra_. Same shape as tcn_run_all / taf_run_all / tsm_run_all / trm_run_all -- the whole test-driver family in tests/ ships this exact umbrella idiom, so a boot-time smoke harness can invoke all five umbrellas in one loop with a uniform return-code contract.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16
+
+        call tsf_case_getcwd;
+        cmp rax, 0;
+        jne tsf_ra_out;                      // propagate case fail
+
+        call tsf_case_write;
+        cmp rax, 0;
+        jne tsf_ra_out;                      // propagate case fail
+
+        xor rax, rax;                        // TSF_PASS
+        add rsp, 8;
+        ret;
+
+      tsf_ra_out:
+        // rax already holds the failing case's sentinel.
+        add rsp, 8;
+        ret
+      }
+    }
+}

@@ -32,6 +32,7 @@ caps_decl   = caps.decl
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------
 sources:
+  - src/syscall.pdx               # ENH-001 (#28): SC+ sysno constants + wrappers
   - src/shell.pdx                 # M1-001: top-level scaffold + stats
   - src/line_reader.pdx           # M1-002: LineReader skeleton
   - src/exec.pdx                  # M1-003 + M2-003: Exec skeleton + narrow-caps
@@ -73,6 +74,7 @@ tests:
   - tests/test_audit_first.pdx     # M4-002: audit-first invariant matrix
   - tests/test_smoke_matrix.pdx    # M4-003: encoder-half QEMU smoke fixtures
   - tests/test_release_manifest.pdx # M5-001: release-manifest encoder goldens
+  - tests/test_syscall_floor.pdx   # ENH-001 (#28): SC+ shim runtime fingerprint
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

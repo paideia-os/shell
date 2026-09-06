@@ -1,0 +1,325 @@
+// src/syscall.pdx -- shell.ENH-001 (paideia-os/shell#28)
+//
+// Syscall module: SC+ sysno constants + thin callable wrappers.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The shell's syscall floor. At v1.0.0 the shell repository contained
+// ZERO `syscall` instructions -- every deferred item in `STATUS.md`
+// (exec, wait, tty read, PdxFS write, audit send, broker send) was
+// blocked on this one absence. ENH-001 lands the substrate that every
+// stage in the v2.0 plan (`design/enhancement-plan.md` §4 Stage 0)
+// consumes: a `Syscall` module owning the SC+ IDs the shell needs and
+// a thin callable wrapper per ID, ready to be invoked from the higher-
+// level modules (exec, line_reader, history, broker_bind, ...) as
+// their `EX_STUB`/`LR_STUB`/etc. tails are de-stubbed in ENH-005/007/
+// 008.
+//
+// This module lands the FLOOR only. No caller in the repository is
+// wired up here -- that is ENH-002+. The exit criteria for #28 are:
+//   1. `syscall` instructions appear in `src/`.
+//   2. The nine SC+ IDs the shell needs are named symbolically.
+//   3. Each wrapper compiles clean under paideia-as >= 0.21.
+//   4. The unit fingerprint (`tests/test_syscall_floor.pdx`) proves
+//      the shim shape by exercising `sys_getcwd` + `sys_write` when
+//      run against a live kernel.
+//
+// =============================================================================
+// DESIGN DECISION: shared module (not inlined per callsite)
+// =============================================================================
+//
+// The monorepo has two established patterns for user-space syscalls:
+//
+//   (a) INLINE at every callsite. Used by single-file one-ELF binaries
+//       (`src/user/cat.pdx:127`, `child_hello.pdx`, `true.pdx`,
+//       `echo_client.pdx`). The rationale is self-containment: the ELF
+//       stays small, no linker dependency on the shared shim, no
+//       object-set collisions between `init.elf` and `shell.elf`.
+//       Every one of these tools is a single .pdx file compiled to one
+//       .elf; extending the pattern to a 12+-module program would
+//       duplicate the sysno at N callsites and multiply the drift
+//       surface against the frozen SC+ table.
+//
+//   (b) SHARED SHIM linked by multi-object-set consumers. The
+//       canonical precedent is `src/user/syscall_shim.pdx` in the
+//       paideia-os monorepo -- a 25-wrapper module linked by both
+//       `init.elf` and (the kernel-tree) `shell.elf`. Each wrapper is
+//       3 to 4 instructions (`mov rax, N; [shuffle if arity>=4];
+//       syscall; ret`); the shared surface is what makes drift
+//       auditable at a SINGLE point when the SC+ table evolves. This
+//       Syscall module ports the same shape, restricted to the 9
+//       sysnos the shell v2.0 plan enumerates.
+//
+// The shell repo has ALWAYS been multi-module (12 `.pdx` files at
+// v1.0.0, each producing its own `.o` under `build-out/`, all called
+// into a single `shell` ELF at link time). Cross-module `call`
+// linkage is already the norm here -- every module calls
+// `Shell.shell_note`. Introducing a shared Syscall wrapper set is
+// architecturally consistent with the existing cross-module wiring
+// and matches the multi-object-set precedent of `syscall_shim.pdx`.
+// See `design/architecture.md` §2a for the recorded decision.
+//
+// =============================================================================
+// CALLING CONVENTION
+// =============================================================================
+//
+// paideia-as user callers reach these wrappers via SysV:
+//   rdi = arg0, rsi = arg1, rdx = arg2, rcx = arg3, r8 = arg4, r9 = arg5
+// The wrappers set `rax = SC+ ID` and issue `syscall`, which follows
+// the Linux SYSCALL convention:
+//   rdi = arg0, rsi = arg1, rdx = arg2, r10 = arg3, r8 = arg4, r9 = arg5
+// For arity <= 3 no argument shuffle is needed (rdi/rsi/rdx pass
+// through). For `sys_wait4` (arity 4) the wrapper prepends `mov r10,
+// rcx` to move the SysV arg3 (rcx) into the SYSCALL arg3 slot (r10);
+// `rcx` itself is clobbered by SYSCALL semantics on the CPU side, so
+// the shuffle is safe to do at entry. See `syscall_shim.pdx`
+// sys_wait4 body for the identical pattern.
+//
+// Every wrapper is a LEAF function: no push/pop, no local stack
+// frame. The `ret` after `syscall` returns to the SysV caller with
+// `rax` holding the kernel's return value (non-negative on success,
+// negative errno on failure per `design/user/syscall-table.md`).
+//
+// `syscall` clobbers `rcx` and `r11` per x86-64 SYSCALL semantics --
+// both are SysV caller-save, so no caller needs to preserve them
+// across a wrapper call. All other GP registers are preserved by the
+// kernel.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Syscall`), no directory prefix.
+//   - No `test` mnemonic; wrappers make no comparisons.
+//   - No large immediates -- every sysno fits imm32.
+//   - r11 is scratch (paideia-as reserved); wrappers do not touch r11.
+//   - No byte reads.
+//   - Every wrapper is a leaf function (no push/pop parity).
+//   - Effect + capability annotations match `syscall_shim.pdx` for
+//     the corresponding SC+ ID. See per-wrapper justification for the
+//     paideia-os design source.
+
+module Syscall = structure {
+
+  // ==========================================================================
+  // SC+ sysno constants
+  //
+  // Frozen at R15.M4 (paideia-os #536) with two later extensions:
+  // R86.M1 landed 85/86 (chdir/getcwd) at paideia-os #1959/#1960; R62
+  // froze the execve ABI (`design/user/execve-abi.md`) so 59 continues
+  // to name the same handler post-argc/argv marshalling. The full
+  // authoritative table lives at `design/user/syscall-table.md`
+  // (paideia-os).
+  //
+  // The shell needs the following nine (the exhaustive list per
+  // `design/enhancement-plan.md` §4 Stage 0):
+  //   0   read     (line_reader: byte-at-a-time TTY read; ENH-007)
+  //   1   write    (line_reader: prompt echo, `write` builtin; ENH-007)
+  //   2   open     (path-search for exec, `.pds` script open; ENH-005)
+  //   3   close    (exec cleanup, `.pds` script close; ENH-005)
+  //   59  execve   (exec: replace child image with argv[0]; ENH-005)
+  //   60  exit     (Shell::shell_main normal termination; ENH-006)
+  //   61  wait4    (exec: block on child exit code; ENH-005)
+  //   85  chdir    (builtin: cd; ENH-004)
+  //   86  getcwd   (builtin: pwd, prompt render; ENH-004/006)
+  // ==========================================================================
+  pub let SYS_READ    : u64 = 0
+  pub let SYS_WRITE   : u64 = 1
+  pub let SYS_OPEN    : u64 = 2
+  pub let SYS_CLOSE   : u64 = 3
+  pub let SYS_EXECVE  : u64 = 59
+  pub let SYS_EXIT    : u64 = 60
+  pub let SYS_WAIT4   : u64 = 61
+  pub let SYS_CHDIR   : u64 = 85
+  pub let SYS_GETCWD  : u64 = 86
+
+  // ==========================================================================
+  // sys_read(fd, buf, count) -> u64
+  //
+  // Bytes read on success (0 == EOF), or a negative errno.
+  // SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle; arity 3 < 4).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_read.pdx`.
+  // Effect+cap taxonomy mirrors syscall_shim.pdx sys_read.
+  // ==========================================================================
+  pub let sys_read : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (buf: u64) (count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28): SC+ ID 0 wrapper. SysV rdi/rsi/rdx pass through unchanged to SYSCALL rdi/rsi/rdx (no arg3 shuffle: arity 3 < 4). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_read.pdx (landed R15.M4-004). Effect and capability taxonomy match the monorepo canonical shim at src/user/syscall_shim.pdx sys_read: !{mem, sysreg} for the SYSCALL side-effect + memory-touch (kernel writes count bytes into buf) and @{fs} because sys_read is fs-gated by every kernel VFS handler. Leaf function; syscall clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none (linear body).",
+      block: {
+        mov rax, 0;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_write(fd, buf, count) -> u64
+  //
+  // Bytes written on success, or a negative errno.
+  // SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_write.pdx`.
+  // ==========================================================================
+  pub let sys_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (buf: u64) (count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28): SC+ ID 1 wrapper. SysV rdi/rsi/rdx pass through (arity 3). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_write.pdx (landed R15.M4-004 #538). Effect and capability set match syscall_shim.pdx sys_write. The shell will invoke this from at least three consumer paths at v2.0: the line reader's prompt echo (ENH-007), the `write`/`echo` builtin bodies (ENH-004/006), and CommandRecord's audit-first pre-flush (ENH-005). Leaf function.",
+      block: {
+        mov rax, 1;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_open(path, flags, mode) -> u64
+  //
+  // fd on success (>= 0), or a negative errno.
+  // SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_open.pdx`.
+  // ==========================================================================
+  pub let sys_open : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path: u64) (flags: u64) (mode: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28): SC+ ID 2 wrapper. SysV rdi/rsi/rdx pass through (arity 3). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_open.pdx (landed R16.M3-001). Two shell consumers at v2.0: (a) exec's path-search over the InitCap-seeded PATH cap set (ENH-005) opens each candidate binary path to test existence, (b) Pds.M2's `.pds` script header parser reads the script file's header bytes to populate PdsHeader (ENH-005 substrate integration). Leaf function.",
+      block: {
+        mov rax, 2;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_close(fd) -> u64
+  //
+  // 0 on success, or a negative errno.
+  // SysV rdi -> SYSCALL rdi (no shuffle).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_close.pdx`.
+  // Effect set trimmed relative to sys_read/write: no memory touch on the
+  // kernel side; still `sysreg` for SYSCALL itself and `fs` for the vnode-
+  // pool release.
+  // ==========================================================================
+  pub let sys_close : (u64) -> u64 !{sysreg} @{fs} =
+    fn (fd: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28): SC+ ID 3 wrapper. SysV rdi passes through (arity 1). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_close.pdx (landed R16.M3-002). Effect drops `mem` relative to sys_read/write because sys_close does not touch user memory; sysreg + fs stay per syscall_shim.pdx sys_close. Shell consumers: exec cleanup of open fds prior to sys_execve (ENH-005) and Pds body-file close after header parse (ENH-005). Leaf function.",
+      block: {
+        mov rax, 3;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_execve(path, argv, envp) -> u64
+  //
+  // Does NOT return on success (kernel replaces the current image); on
+  // failure returns a negative errno. The frozen ABI at R62 populates
+  // rdi/rsi/rdx with argc/argv/envp for the callee at `_start` -- see
+  // `design/user/execve-abi.md` (paideia-os). This wrapper matches
+  // the CALLING side's ABI: `path` in rdi, `argv` in rsi, `envp` in
+  // rdx; the shim marshals them into the new image's rdi/rsi/rdx per
+  // the frozen contract.
+  //
+  // SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_execve_shim.pdx`.
+  // ==========================================================================
+  pub let sys_execve : (u64, u64, u64) -> u64 !{mem, sysreg} @{sched, mem} =
+    fn (path: u64) (argv: u64) (envp: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem},
+      justification: "shell.ENH-001 (#28): SC+ ID 59 wrapper. SysV rdi/rsi/rdx pass through (arity 3). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_execve_shim.pdx (landed R15.M6, argv/envp marshalling completed R62 per design/user/execve-abi.md). Effect and capability set match syscall_shim.pdx sys_execve: {mem, sysreg} for SYSCALL + argv/envp marshalling on the way in, @{sched, mem} because execve replaces the address space (mem cap) and reschedules the child image (sched cap). The wrapper does not return on the success path -- the kernel loads the new ELF's _start and control never comes back to the caller; the negative-errno path DOES return (bad path, bad argv, etc.) so the wrapper is still typed as `-> u64`. Sole shell consumer at v2.0: exec_spawn_and_wait's post-narrow-caps invocation (ENH-005). Leaf function.",
+      block: {
+        mov rax, 59;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_exit(status) -> u64
+  //
+  // Never returns. Return type is `u64` for signature uniformity with
+  // the other wrappers; every caller must treat the call as
+  // unreachable after the syscall issue.
+  // SysV rdi -> SYSCALL rdi (no shuffle).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_exit.pdx`.
+  // ==========================================================================
+  pub let sys_exit : (u64) -> u64 !{sysreg} @{sched} =
+    fn (status: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {sched},
+      justification: "shell.ENH-001 (#28): SC+ ID 60 wrapper. SysV rdi passes through (arity 1). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_exit.pdx (landed R15.M4-003 #537). Effect and capability set match syscall_shim.pdx sys_exit: sysreg + @{sched} (task teardown reschedules; no user-memory touch). sys_exit does not return; the wrapper's `ret` is unreachable at run time and exists only to satisfy paideia-as's function-shape checker (every function must end in a return-shaped terminator). Sole shell consumer at v2.0: Shell::shell_main's EOF branch (ENH-006). Leaf function.",
+      block: {
+        mov rax, 60;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_wait4(pid, wstatus, options, rusage) -> u64
+  //
+  // Reaped pid on success, or a negative errno. ARITY 4 -- requires
+  // a `mov r10, rcx` prefix to shuffle the SysV arg3 (rcx) into the
+  // SYSCALL arg3 slot (r10). See syscall_shim.pdx sys_wait4 body for
+  // the identical pattern.
+  //
+  // SysV rdi/rsi/rdx/rcx -> SYSCALL rdi/rsi/rdx/r10.
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_wait.pdx`.
+  // ==========================================================================
+  pub let sys_wait4 : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (pid: u64) (wstatus: u64) (options: u64) (rusage: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "shell.ENH-001 (#28): SC+ ID 61 wrapper. SysV rdi/rsi/rdx/rcx must be shuffled to SYSCALL rdi/rsi/rdx/r10 -- SYSCALL clobbers rcx as the return-address slot, so arg3 lives in r10 on the raw entry side (Linux SYSCALL convention, paideia-os matches). The `mov r10, rcx` prefix is safe at wrapper entry: rcx has not yet been touched by anything, and the caller passes it verbatim per SysV. Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_wait.pdx (landed R15.M6). Effect and capability set match syscall_shim.pdx sys_wait4: {mem, sysreg} + @{sched}; the mem effect covers the kernel writing wstatus/rusage back to the caller's buffers. Sole shell consumer at v2.0: exec_spawn_and_wait's blocking wait after execve (ENH-005). Leaf function. Labels: none.",
+      block: {
+        mov r10, rcx;
+        mov rax, 61;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_chdir(path, path_len_hint) -> u64
+  //
+  // 0 on success, or a negative errno. `path_len_hint` is a WALKER
+  // CAP, not an exact strlen -- the kernel copies up to
+  // min(hint, 255) bytes until NUL. Callers typically pass 255 (or
+  // any bound larger than the actual path). See
+  // `design/user/syscall-table.md` §"Walker length hint semantics".
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_chdir.pdx`.
+  // ==========================================================================
+  pub let sys_chdir : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (path: u64) (path_len_hint: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28): SC+ ID 85 wrapper. SysV rdi/rsi pass through (arity 2). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_chdir.pdx (landed R86.M1-002 paideia-os #1959). Effect and capability set match syscall_shim.pdx sys_chdir: {mem, sysreg} + @{fs}; the mem effect covers the kernel's walker read of the path buffer. Sole shell consumer at v2.0: builtin `cd` (ENH-004) -- the monorepo's `cd_builtin` already calls sys_chdir directly at src/user/dispatch.pdx:27, so the shell's builtin body will be a straight port. `path_len_hint = 255` is the standard walker CAP. Leaf function.",
+      block: {
+        mov rax, 85;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_getcwd(buf, cap) -> u64
+  //
+  // strlen (excl. NUL) of the written path on success; NUL-terminated
+  // in the buffer. Negative errno on failure. `cap` is the output
+  // buffer size; the kernel writes at most `cap` bytes.
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_getcwd.pdx`.
+  // ==========================================================================
+  pub let sys_getcwd : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-001 (#28): SC+ ID 86 wrapper. SysV rdi/rsi pass through (arity 2). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_getcwd.pdx (landed R86.M1-003 paideia-os #1960). Effect and capability set match syscall_shim.pdx sys_getcwd: {mem, sysreg} + @{fs}; the mem effect covers the kernel writing at most `cap` bytes into the caller's buf ending in NUL. Two shell consumers at v2.0: builtin `pwd` (ENH-004) and the prompt render's cwd component (ENH-006 -- the shell prompt at v2.0 renders `<cwd> $ ` per README, so the run loop calls sys_getcwd once per prompt). Leaf function.",
+      block: {
+        mov rax, 86;
+        syscall;
+        ret
+      }
+    }
+}
