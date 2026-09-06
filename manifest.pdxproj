@@ -16,16 +16,17 @@
 # release time) a signed build-out/shell.manifest.pdxsig for the
 # pkgs.paideia-os mirror push (see design/mirror-push.md).
 
-# --- ENH-010 (#37): kind + entry note -----------------------------------
-# `kind` was `tool` through v1.0.0; changed to `library` here because no
-# entry point exists — `entry` below names a symbol nothing in `src/`
-# defines. `kind` reverts to `tool` the day ENH-006 (#33) writes
-# `Shell::shell_main`. See design/enhancement-plan.md §6.
+# --- ENH-006 (#33): shell_main + REPL landed. ---------------------------
+# `kind` was `library` between the ENH-010 walk-back and ENH-006 because
+# no entry point existed -- `entry` below named a symbol nothing in
+# `src/` defined. ENH-006 (#33) writes `Shell::shell_main` (src/shell.pdx
+# §"ENH-006 (#33): Shell::shell_main + REPL landing"), so `kind` reverts
+# to `tool` here. See design/enhancement-plan.md §6.
 
 name        = shell
 version     = 0.1.0
-kind        = library
-entry       = Shell::shell_main         # aspirational: undefined until ENH-006 (#33)
+kind        = tool
+entry       = Shell::shell_main         # defined at src/shell.pdx (ENH-006, #33)
 output      = build-out/shell
 caps_decl   = caps.decl
 
@@ -83,6 +84,7 @@ tests:
   - tests/test_parser.pdx          # ENH-003 (#30): parser fingerprint + parser->pipeline_plan golden feed
   - tests/test_builtins.pdx        # ENH-004 (#31): dispatch + builtin handlers fingerprint matrix
   - tests/test_exec.pdx            # ENH-005 (#32): exec-path argv marshalling + D3 audit-first ordering fingerprint
+  - tests/test_shell_main.pdx      # ENH-006 (#33): shell_main entry + shell_repl_step + shell_argv_dispatch fingerprint
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

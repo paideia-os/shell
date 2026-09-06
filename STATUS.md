@@ -1,19 +1,31 @@
 # shell — status
 
-> **v1.0.0 was a wire-format encoder suite. `shell` COULD not execute a
-> command.** Zero syscall instructions in `src/`; its only executed
-> call was a `.bss` counter bump; its declared entry symbol
-> (`Shell::shell_main`) was not defined anywhere in the repository. See
-> `design/enhancement-plan.md` §1 for the grep-verified audit and §6
-> for why the release that first executes a command is numbered
-> `v2.0`, not `v0.2` (shell#37 / ENH-010).
+> **v1.0.0 was a wire-format encoder suite; `shell` could not execute a
+> command.** ENH-001 (#28) landed the syscall floor, ENH-005 (#32)
+> landed the real exec path, and **ENH-006 (#33) lands
+> `Shell::shell_main` + REPL and flips `manifest.pdxproj` `kind` back
+> to `tool`**. The commit that lands #33 is the first at which `shell`
+> is a shell: `src/shell.pdx` now defines `shell_main` (the ELF entry
+> the manifest has declared since M1), a CLI flag walker
+> (`shell_argv_dispatch`) that recognises `-c` / `--no-history` /
+> `--no-cap:<KIND>` / positional `<script.pds>`, and
+> `shell_repl_step` that runs one line through lex -> parse ->
+> dispatch -> exec.
 >
-> **ENH-001 (#28) and ENH-005 (#32) invalidate the walk-back.** The
-> shell now has `syscall` instructions in `src/syscall.pdx` and
-> `exec_spawn_and_wait` calls `sys_execve` for real (with a
-> `ShellCommandRecord` opened before the call per D3). The remaining
-> gap is ENH-006 (#33), which defines `Shell::shell_main` and wires
-> the shell into `bin_seeds.pdx` for boot-time smoke exercise.
+> Two runtime gaps remain and are documented deferrals rather than
+> walk-backs on this landing: ENH-007 (#34) puts real bytes into
+> `line_reader_read_line` (today it still returns `LR_STUB` on the
+> happy path; shell_main treats that as EOF and exits cleanly) and
+> ENH-008 (#35) persists the in-memory history ring to
+> `~/.history/<session>-<ts>.pdxhist` (today `shell_main` appends the
+> encoded HistoryEntry bytes to a `.bss` staging ring). The
+> paideia-os side needs a paired landing (add the `shell` satellite
+> as a submodule + wire `bin_seeds.pdx`) before the exec cutover
+> named in `design/roadmap/rows-4-5-6-scoping.md` §4.2 fires; that
+> paired landing is a paideia-os change, not a shell satellite
+> change. See `design/enhancement-plan.md` §1 for the original
+> grep-verified audit and §6 for why the release that first executes
+> a command is numbered `v2.0`, not `v0.2` (shell#37 / ENH-010).
 
 **Current milestone:** R106 — shell scaffolding + tokenizer novel semantics
 **Version:** 0.1.0 (see `CHANGELOG.md`)
@@ -256,6 +268,11 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFECE5 | BI_ERR_EXPORT_TABLE_FULL  | Builtins.ENH-004: shell-local env table at BI_ENV_TABLE_MAX (32) |
 | 0xFFFFECE6 | BI_ERR_EXPORT_POOL_FULL   | Builtins.ENH-004: name+value would exceed 4096-byte env pool |
 | 0xFFFFECE7 | BI_ERR_PWD_TOO_LONG       | Builtins.ENH-004: sys_getcwd returned negative errno |
+| 0xFFFFECF0 | SM_ERR_ARG_FLAG_UNKNOWN   | shell_main.ENH-006: unknown CLI flag (`--foo`, or `-c` without command) |
+| 0xFFFFECF1 | SM_ERR_LINE_TOO_LONG      | shell_main.ENH-006: reserved for read overflow (ENH-007 will use) |
+| 0xFFFFECF2 | SM_ERR_SESSION_MINT_FAIL  | shell_main.ENH-006: session_mint refused at startup |
+| 0xFFFFECF3 | SM_ERR_DISPATCH_INIT_FAIL | shell_main.ENH-006: reserved (dispatch_init returns () today) |
+| 0xFFFFECF8 | SR_EOF                    | shell_repl_step.ENH-006: reserved for future explicit EOF signal |
 
 ## Milestone rollup
 
@@ -375,29 +392,33 @@ landed upstream.
   (declared as a shell build dependency but never linked — see
   `design/enhancement-plan.md` §5 / ENH-009, #36).
 
-**What landing that substrate did *not* do: make `shell` a shell.**
-Every item above is now available for `shell` to call; nothing in
-`src/` calls any of it yet. The real gaps, per the grep-verified audit
-in `design/enhancement-plan.md` §1, are all still open in *this*
-repo:
+**Prior walk-back on this section (retained for continuity).** The
+text below was written when the shell was still a wire-format encoder
+suite. ENH-001 (#28), ENH-002 (#29), ENH-003 (#30), ENH-004 (#31),
+ENH-005 (#32), and now ENH-006 (#33) invalidate every bullet:
 
 - No syscall instruction anywhere in `src/` (ENH-001, #28) — every
-  item below is blocked on this one absence.
+  item below is blocked on this one absence. **LANDED at #28.**
 - No lexer / tokenizer (ENH-002, #29) and no parser (ENH-003, #30) —
   nothing derives `pipeline_plan`'s `stages_count` from text.
+  **LANDED at #29 / #30.**
 - No builtin dispatch table — no `cd`, `pwd`, `export`, or `exit`
-  handler exists (ENH-004, #31).
+  handler exists (ENH-004, #31). **LANDED at #31.**
 - `exec_spawn_and_wait` still returns `EX_STUB` — the real
-  execve/wait4 sequence is unwritten (ENH-005, #32).
+  execve/wait4 sequence is unwritten (ENH-005, #32). **LANDED at
+  #32.**
 - `Shell::shell_main` — the entry symbol `manifest.pdxproj` has
   declared since M1 — is not defined anywhere in the repository
-  (ENH-006, #33).
+  (ENH-006, #33). **LANDED at #33 (this commit): src/shell.pdx
+  defines shell_main + shell_repl_step + shell_argv_dispatch;
+  manifest.pdxproj `kind` flips back to `tool`.**
 - `line_reader_read_line` still returns `LR_STUB` (ENH-007, #34);
   `history_encode_record`'s bytes are never written to disk
   (ENH-008, #35); the M3-002 tab-completion encoder has no registry
-  walk or tab-key binding behind it.
+  walk or tab-key binding behind it. **#34 and #35 remain open.**
 - Cross-repo linkage (shell → libpdx-cap / libpdx-semantic-pipe /
   libpdx-audit symbols) — no build pulls all sides together yet.
+  **Still open.**
 
 ## Next
 
@@ -414,18 +435,23 @@ milestones are open concurrently today:
   `design/enhancement-plan.md`) — the plan that makes `shell` able to
   execute a command for the first time. Critical path: ENH-001
   syscall floor (#28) → ENH-002 lexer (#29) → ENH-003 parser (#30) →
-  ENH-004/ENH-005 builtins + real exec (#31/#32) → ENH-006
-  `Shell::shell_main` + REPL (#33). ENH-007..009 (#34-#36) de-stub
-  the line reader, history, and libpdx-elevate behind that path.
-  ENH-010 (#37, this walk-back) and ENH-011 (#38, correcting the
-  R66/R73 issue bodies) carry no dependencies and land independently.
+  ENH-004/ENH-005 builtins + real exec (#31/#32) → **ENH-006
+  `Shell::shell_main` + REPL (#33) LANDED**. ENH-007..009 (#34-#36)
+  de-stub the line reader, history persistence, and libpdx-elevate
+  behind that path. ENH-010 (#37, this walk-back) and ENH-011 (#38,
+  correcting the R66/R73 issue bodies) carry no dependencies and
+  land independently.
 
 The M5-001 encoder half + M5-002 doc source + design contracts remain
 what the release-time lint (once paideia-as reaches v0.33-crypto-kdf
 and ENH-005/ENH-009 land a real broker `sys_ipc_send`) signs and
 re-pushes to `pkgs.paideia-os/main/shell/1.0.0/`. The M4 encoder-half
 tests (`tcn_run_all`, `taf_run_all`, `tsm_run_all`) plus the M5
-addition (`trm_run_all`) are what that lint re-runs to confirm no
-regression against the golden fingerprints; the interactive QEMU
-smoke (`login → prompt → ls | cat → reboot → history`) has no
-`shell_main` to boot until ENH-006 lands.
+addition (`trm_run_all`) and the ENH-006 addition (`tshm_run_all`)
+are what that lint re-runs to confirm no regression against the
+golden fingerprints; the interactive QEMU smoke (`login → prompt →
+ls | cat → reboot → history`) is now boot-reachable — the shell's
+own side is done, and the paired paideia-os landing (add the shell
+satellite as a submodule + wire `bin_seeds.pdx`) is what fires the
+interactive cutover named in
+`design/roadmap/rows-4-5-6-scoping.md` §4.2.

@@ -307,4 +307,693 @@ module Shell = structure {
         ret
       }
     }
+
+  // ==========================================================================
+  // ENH-006 (#33): Shell::shell_main + REPL landing.
+  //
+  // What this section adds:
+  //   * SM_ / SR_ return-code sub-bands (0xFFFFECFx).
+  //   * .bss singletons for the parsed CLI options, the minted session
+  //     cap, the per-child derived sub-cap, the interactive line buf,
+  //     and the in-memory history ring (persistence deferred to #35).
+  //   * Byte-string helpers (sm_strlen, sm_streq_lit, sm_str_prefix)
+  //     used by the argv walker.
+  //   * shell_argv_dispatch -- walk argv[1..argc], parse -c / --no-
+  //     history / --no-cap:<KIND> / positional <script.pds>.
+  //   * shell_repl_step(line_ptr, line_len) -- lex -> parse -> dispatch
+  //     -> exec pipeline for one line. Pipeline-of-stages fan-out is
+  //     future work; ENH-006 handles _pr_stages[0] only.
+  //   * shell_main (@no_frame) -- ELF entry frame. Reads argc/argv from
+  //     the initial SysV process stack, mints the session cap, then
+  //     enters the interactive REPL (or -c one-shot).
+  //
+  // The line-reader body remains ENH-007 (#34) work: line_reader_read_
+  // line still returns LR_STUB on the happy path. shell_main treats
+  // LR_STUB (and LR_ERR_EOF, and a bare 0 return) as a synthetic EOF
+  // for now so the REPL loop always terminates cleanly rather than
+  // spinning. The moment #34 lands, the same code path picks up real
+  // bytes without an edit here.
+  // ==========================================================================
+  pub let SM_OK                     : u64 = 0
+  pub let SM_ERR_ARG_FLAG_UNKNOWN   : u64 = 0xFFFFECF0
+  pub let SM_ERR_LINE_TOO_LONG      : u64 = 0xFFFFECF1
+  pub let SM_ERR_SESSION_MINT_FAIL  : u64 = 0xFFFFECF2
+  pub let SM_ERR_DISPATCH_INIT_FAIL : u64 = 0xFFFFECF3
+  pub let SR_OK                     : u64 = 0
+  pub let SR_EOF                    : u64 = 0xFFFFECF8
+
+  // Session-id placeholder handed to session_mint at startup. Real
+  // session ids arrive with the InitCap-sidecar runtime introspection
+  // wiring in a later enhancement; the placeholder value 1 is non-zero
+  // so session_mint does not refuse it as SS_ERR_BAD_ID. Kernel readers
+  // of a downstream KIND_SHELL_SESSION cap treat the target_ptr field
+  // as opaque today, so a placeholder id is honest about what the shell
+  // knows at ENH-006.
+  pub let SM_SESSION_ID : u64 = 1
+
+  // Line-buffer cap for one interactive read. 4096 matches Parser's
+  // PR_ARGV_POOL_SIZE ceiling -- a line longer than the pool cannot
+  // survive parser_parse anyway, so bounding the read to the same
+  // ceiling avoids reading bytes we'd immediately refuse.
+  pub let SM_LINE_BUF_CAP  : u64 = 4096
+
+  // In-memory history ring for ENH-006. Persistence to
+  // `~/.history/<session>-<ts>.pdxhist` is ENH-008 (#35) work; here we
+  // just append the wire bytes history_encode_record produces to a
+  // .bss ring so the encoder is reachable from the REPL and its bytes
+  // exist somewhere for a future flush. When the ring fills, subsequent
+  // appends are silently dropped (a shell that lives long enough to
+  // fill 8 KiB of history bytes will land ENH-008 before this becomes
+  // a real limit).
+  pub let SM_HIST_RING_CAP : u64 = 8192
+
+  // ==========================================================================
+  // .bss singletons for parsed CLI options + session state
+  //
+  //   _sm_opt_c_cmd_ptr    argv[i+1] pointer after `-c`, else 0
+  //   _sm_opt_c_cmd_len    strlen of the -c command, else 0
+  //   _sm_opt_no_history   1 if --no-history seen, else 0
+  //   _sm_opt_no_cap_kind  1 if any --no-cap:<KIND> seen; KIND parse +
+  //                        cap-narrowing hook lands with ENH-005+ wiring
+  //                        (the flag is remembered but its KIND argument
+  //                        is not decoded here)
+  //   _sm_opt_script_ptr   positional script name, else 0
+  //   _sm_session_cap      16-byte session Cap wire record (from
+  //                        session_mint at startup)
+  //   _sm_child_cap        16-byte per-child derived sub-cap (from
+  //                        session_derive_subcap inside shell_repl_step
+  //                        before each exec_spawn_and_wait)
+  //   _sm_line_buf         the 4096-byte interactive-read scratch
+  //   _sm_hist_buf         the 8192-byte in-memory history ring
+  //   _sm_hist_used        bytes consumed in _sm_hist_buf
+  // ==========================================================================
+  pub let mut _sm_opt_c_cmd_ptr   : u64        = uninit @align(8)
+  pub let mut _sm_opt_c_cmd_len   : u64        = uninit @align(8)
+  pub let mut _sm_opt_no_history  : u64        = uninit @align(8)
+  pub let mut _sm_opt_no_cap_kind : u64        = uninit @align(8)
+  pub let mut _sm_opt_script_ptr  : u64        = uninit @align(8)
+  pub let mut _sm_session_cap     : [u64; 2]   = uninit @align(16)
+  pub let mut _sm_child_cap       : [u64; 2]   = uninit @align(16)
+  pub let mut _sm_line_buf        : [u8; 4096] = uninit @align(16)
+  pub let mut _sm_hist_buf        : [u8; 8192] = uninit @align(16)
+  pub let mut _sm_hist_used       : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // rodata: prompt, newline, flag literals, error messages
+  //
+  // N in `[u8; N]` = strlen+1 per the paideia-as fingerprint-string
+  // rule (feedback_pdx_encoder_pitfalls).
+  // ==========================================================================
+  pub let sm_prompt_str           : [u8; 3]  = "$ \0"
+  pub let sm_nl_str               : [u8; 2]  = "\n\0"
+  pub let sm_flag_c_str           : [u8; 3]  = "-c\0"
+  pub let sm_flag_no_history_str  : [u8; 13] = "--no-history\0"
+  pub let sm_flag_no_cap_prefix   : [u8; 10] = "--no-cap:\0"
+  pub let sm_err_unknown_flag_str : [u8; 21] = "shell: unknown flag\n\0"
+  pub let sm_err_session_mint_str : [u8; 28] = "shell: session_mint failed\n\0"
+
+  // ==========================================================================
+  // sm_strlen(ptr) -> u64
+  //
+  // Byte count until NUL. Leaf function.
+  // rdi (input): ptr (caller-owned; caller responsibility for non-null)
+  // rax (output): length in bytes, excluding NUL
+  //
+  // Register plan: rax = accumulator, rcx = byte scratch.
+  // ==========================================================================
+  pub let sm_strlen : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): NUL-bounded byte count for the argv walker + the line-length reload in the -c path. Byte load via `xor rcx, rcx; mov_b rcx, [rdi + rax * 1]` per #1248 (with explicit * 1 scale to dodge U1606). Leaf function; no callee-save state. Labels prefixed sm_sl_.",
+      block: {
+        xor rax, rax;
+      sm_sl_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rdi + rax * 1];
+        cmp rcx, 0;
+        je  sm_sl_done;
+        add rax, 1;
+        jmp sm_sl_loop;
+      sm_sl_done:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sm_streq_lit(a, b) -> u64
+  //
+  // Compare two NUL-terminated byte strings. Leaf function.
+  // rdi (input): a  -- caller-owned NUL-terminated bytes
+  // rsi (input): b  -- caller-owned NUL-terminated bytes (typically a
+  //                    rodata literal)
+  // rax (output): 0 if bytes match through both NULs, else 1.
+  // ==========================================================================
+  pub let sm_streq_lit : (u64, u64) -> u64 !{mem} @{} =
+    fn (a: u64) (b: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): pointer-per-side NUL-terminated byte compare. Walker rdi=a and rsi=b advance in lockstep; a mismatch or a one-side-early NUL rejects with rax=1; both-side simultaneous NUL matches with rax=0. Byte loads via `xor <reg>, <reg>; mov_b <reg>, [ptr]` per #1248. Leaf function. Labels prefixed sm_se_.",
+      block: {
+      sm_se_loop:
+        xor rax, rax;
+        mov_b rax, [rdi];
+        xor rcx, rcx;
+        mov_b rcx, [rsi];
+        cmp rax, rcx;
+        jne sm_se_ne;
+        cmp rax, 0;
+        je  sm_se_eq;
+        add rdi, 1;
+        add rsi, 1;
+        jmp sm_se_loop;
+      sm_se_eq:
+        xor rax, rax;
+        ret;
+      sm_se_ne:
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sm_str_prefix(a, prefix) -> u64
+  //
+  // Test whether `a`'s bytes begin with `prefix`. Both inputs are
+  // NUL-terminated; only prefix's NUL delimits the compare (a may have
+  // more bytes after the matched region). Leaf function.
+  // rdi (input): a       -- caller-owned NUL-terminated
+  // rsi (input): prefix  -- caller-owned NUL-terminated
+  // rax (output): 0 if a[0..strlen(prefix)] == prefix, else 1.
+  // ==========================================================================
+  pub let sm_str_prefix : (u64, u64) -> u64 !{mem} @{} =
+    fn (a: u64) (prefix: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): NUL-terminated prefix test. Walker rsi=prefix drives; loop exits with rax=0 when rsi hits its NUL (all preceding bytes matched), else compares rdi's byte at the same offset. Byte loads via `xor <reg>, <reg>; mov_b <reg>, [ptr]` per #1248. Leaf function. Labels prefixed sm_sp_.",
+      block: {
+      sm_sp_loop:
+        xor rcx, rcx;
+        mov_b rcx, [rsi];
+        cmp rcx, 0;
+        je  sm_sp_eq;
+        xor rax, rax;
+        mov_b rax, [rdi];
+        cmp rax, rcx;
+        jne sm_sp_ne;
+        add rdi, 1;
+        add rsi, 1;
+        jmp sm_sp_loop;
+      sm_sp_eq:
+        xor rax, rax;
+        ret;
+      sm_sp_ne:
+        mov rax, 1;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shell_argv_dispatch(argc, argv_base) -> u64
+  //
+  // Walk argv[1..argc] and populate the _sm_opt_* .bss singletons.
+  // Recognises:
+  //
+  //   -c <command>            _sm_opt_c_cmd_ptr / _sm_opt_c_cmd_len
+  //   --no-history            _sm_opt_no_history = 1
+  //   --no-cap:<KIND>         _sm_opt_no_cap_kind = 1 (KIND parse
+  //                           deferred until the cap-narrowing hook
+  //                           lands; the flag is remembered but its
+  //                           KIND argument is not decoded here)
+  //   <positional>            _sm_opt_script_ptr (last one wins;
+  //                           multi-script invocation is out of scope
+  //                           for ENH-006)
+  //
+  // Any other argv[i] beginning with '-' returns SM_ERR_ARG_FLAG_UNKNOWN;
+  // shell_main then writes an error to stderr and sys_exit(1).
+  //
+  // Register plan (5 callee-save pushes + sub 8 = 48 bytes; rsp%16==0
+  // at every nested SysV call):
+  //   r12 = argc
+  //   r13 = argv_base
+  //   r14 = i (index into argv)
+  //   r15 = argv[i] pointer (per iteration)
+  //   rbx = scratch (peer index for -c argv[i+1], call arg staging)
+  // ==========================================================================
+  pub let shell_argv_dispatch : (u64, u64) -> u64 !{mem} @{} =
+    fn (argc: u64) (argv_base: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): CLI flag walker. Walks argv[1..argc] and populates the _sm_opt_* .bss singletons. -c requires argv[i+1] (recorded as (ptr, strlen)); --no-history is a boolean; --no-cap:<KIND> is remembered as a boolean today (the KIND argument is not decoded until the cap-narrowing hook lands with ENH-005+ wiring). Unknown flag or -c-without-argument returns SM_ERR_ARG_FLAG_UNKNOWN. All argv[i] slots (including argv[argc], the NULL sentinel) are read via `mov r15, [r13 + r14 * 8]` (the argv qword array on the SysV initial stack has argv[argc]==NULL by contract; the loop guard against `cmp r15, 0` catches an early NULL if a hostile loader passes fewer than argc pointers). Byte peeks via `xor rax, rax; mov_b rax, [ptr]` per #1248. Prologue: 5 callee-save pushes (rbx scratch, r12 argc, r13 argv_base, r14 i, r15 argv[i]) + `sub rsp, 8` = 48 bytes; rsp%16==0 for the three nested SysV calls (sm_strlen, sm_streq_lit, sm_str_prefix) and any subsequent hookins. Resets all five _sm_opt_* singletons on entry so a repeated invocation (tests) starts from a known-empty state. Large-immediate return sentinel 0xFFFFECF0 stored via `mov rax, imm32` (fits the 32-bit MOV zero-extend). Labels prefixed sm_ad_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // argc
+        mov r13, rsi;                        // argv_base
+
+        // Reset all _sm_opt_* singletons.
+        xor rax, rax;
+        lea r11, [rip + _sm_opt_c_cmd_ptr];
+        mov [r11], rax;
+        lea r11, [rip + _sm_opt_c_cmd_len];
+        mov [r11], rax;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        lea r11, [rip + _sm_opt_no_cap_kind];
+        mov [r11], rax;
+        lea r11, [rip + _sm_opt_script_ptr];
+        mov [r11], rax;
+
+        mov r14, 1;                          // i = 1 (skip argv[0])
+
+      sm_ad_loop:
+        cmp r14, r12;
+        jae sm_ad_done;
+
+        // Load argv[i].
+        mov r15, [r13 + r14 * 8];
+        cmp r15, 0;
+        je  sm_ad_done;                      // NULL argv[i] terminates
+
+        // Peek first byte.
+        xor rax, rax;
+        mov_b rax, [r15];
+        cmp rax, 0x2D;                       // '-'
+        jne sm_ad_positional;
+
+        // Peek second byte.
+        xor rax, rax;
+        mov_b rax, [r15 + 1];
+
+        cmp rax, 0x2D;                       // second byte is '-'  -> long flag
+        je  sm_ad_long_flag;
+
+        // '-<X>' single-dash form. Only -c is recognised.
+        mov rdi, r15;
+        lea rsi, [rip + sm_flag_c_str];
+        call sm_streq_lit;
+        cmp rax, 0;
+        jne sm_ad_unknown;
+
+        // -c requires argv[i+1].
+        mov rbx, r14;
+        add rbx, 1;
+        cmp rbx, r12;
+        jae sm_ad_unknown;                   // no command argument follows
+
+        mov rax, [r13 + rbx * 8];
+        cmp rax, 0;
+        je  sm_ad_unknown;
+        lea r11, [rip + _sm_opt_c_cmd_ptr];
+        mov [r11], rax;
+
+        // strlen(argv[i+1])
+        mov rdi, rax;
+        call sm_strlen;
+        lea r11, [rip + _sm_opt_c_cmd_len];
+        mov [r11], rax;
+
+        add r14, 2;                          // consume "-c" + command
+        jmp sm_ad_loop;
+
+      sm_ad_long_flag:
+        // Try --no-history exact match first.
+        mov rdi, r15;
+        lea rsi, [rip + sm_flag_no_history_str];
+        call sm_streq_lit;
+        cmp rax, 0;
+        jne sm_ad_check_no_cap;
+
+        mov rax, 1;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        add r14, 1;
+        jmp sm_ad_loop;
+
+      sm_ad_check_no_cap:
+        mov rdi, r15;
+        lea rsi, [rip + sm_flag_no_cap_prefix];
+        call sm_str_prefix;
+        cmp rax, 0;
+        jne sm_ad_unknown;
+
+        mov rax, 1;
+        lea r11, [rip + _sm_opt_no_cap_kind];
+        mov [r11], rax;
+        add r14, 1;
+        jmp sm_ad_loop;
+
+      sm_ad_positional:
+        // Non-dash argv[i] -> script name; last one wins.
+        lea r11, [rip + _sm_opt_script_ptr];
+        mov [r11], r15;
+        add r14, 1;
+        jmp sm_ad_loop;
+
+      sm_ad_unknown:
+        mov rax, 0xFFFFECF0;                 // SM_ERR_ARG_FLAG_UNKNOWN
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sm_ad_done:
+        xor rax, rax;                        // SM_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shell_repl_step(line_ptr, line_len) -> u64
+  //
+  // Feed one command line through lex -> parse -> dispatch -> exec.
+  // Pipeline-of-stages fan-out is future work; ENH-006 executes
+  // Parser::_pr_stages[0] only. When per-stage forking + pipe wiring
+  // lands, the outer stage walk slots in here without touching the
+  // per-stage body.
+  //
+  // Return:
+  //   SR_OK (0)                empty line, or handler/exec returned 0
+  //   dispatch_line return     builtin hit (BI_OK / BI_ERR_*)
+  //   exec_spawn_and_wait rc   builtin miss (child exit code or
+  //                             EX_ERR_*)
+  //   LX_ERR_*                 lexer refused input
+  //   PR_ERR_*                 parser refused token stream
+  //
+  // Register plan (5 callee-save pushes + sub 8 = 48 bytes; rsp%16==0
+  // at every nested SysV call):
+  //   r12 = line_ptr
+  //   r13 = line_len
+  //   r14 = argv_ptr (resolved from _pr_argv_pool + stage.argv_offset)
+  //   r15 = argv_bytes
+  //   rbx = argc
+  // ==========================================================================
+  pub let shell_repl_step : (u64, u64) -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn (line_ptr: u64) (line_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-006 (#33): one-line REPL step. Runs lexer_reset + lexer_tokenize on the caller's line buffer, then parser_reset + parser_parse over the same buffer (the parser consumes tokens the lexer just published in _lx_tokens). Empty-line and whitespace-only-line short-circuit to SR_OK -- an empty _pr_stage_count is not an error, it is a user pressing Enter on an empty prompt. Non-empty: resolve stage[0]'s argv slice from Parser::_pr_argv_pool + _pr_stages[0].argv_offset, then dispatch_line first (builtin match returns handler code directly); on BI_MISS derive a KIND_SHELL_SESSION SS_RIGHTS_CHILD sub-cap into _sm_child_cap via session_derive_subcap (the child cap the future InitCap sidecar handoff will carry; today the derivation runs but the wire slot is not yet consumed by sys_execve -- see Exec §DEFERRALS) then invoke exec_spawn_and_wait with the pool-slice signature (pool_ptr, argv_bytes, argc). Pipeline stages 1..stage_count are ignored at ENH-006; the outer stage walk is a future addition here without touching the per-stage body. Effect/cap set is the union of every downstream call: {mem, sysreg} + @{sched, mem, fs} (matches exec_spawn_and_wait's widest set). Prologue: 5 callee-save pushes (rbx argc, r12 line_ptr, r13 line_len, r14 argv_ptr, r15 argv_bytes) + `sub rsp, 8` = 48 bytes; rsp%16==0 at every nested SysV call. Large-immediate compare 0xFFFFECE0 (BI_MISS) stages via `mov r11, imm64; cmp rax, r11` per paideia-as imm32 discipline. Labels prefixed sr_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;
+        mov r13, rsi;
+
+        // Empty line -> SR_OK without touching the lexer/parser.
+        cmp r13, 0;
+        je  sr_ok_empty;
+
+        // Lex.
+        call lexer_reset;
+        mov rdi, r12;
+        mov rsi, r13;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne sr_propagate;
+
+        // Parse.
+        call parser_reset;
+        mov rdi, r12;
+        mov rsi, r13;
+        call parser_parse;
+        cmp rax, 0;
+        jne sr_propagate;
+
+        // Stage count.
+        lea r11, [rip + _pr_stage_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  sr_ok_empty;                     // whitespace-only line
+
+        // Resolve stage[0].argv_offset, argv_bytes, argc.
+        lea r11, [rip + _pr_stages];
+        mov r14, [r11 + 0];                  // argv_offset
+        mov r15, [r11 + 8];                  // argv_bytes
+        mov rbx, [r11 + 16];                 // argc
+
+        // argv_ptr = _pr_argv_pool + argv_offset
+        lea r11, [rip + _pr_argv_pool];
+        add r14, r11;
+
+        // Try builtin dispatch first.
+        mov rdi, r14;
+        mov rsi, rbx;
+        call dispatch_line;
+
+        // If not BI_MISS (0xFFFFECE0), return whatever dispatch_line
+        // gave us (BI_OK on success, BI_ERR_* on handler reject).
+        mov r11, 0xFFFFECE0;                 // BI_MISS
+        cmp rax, r11;
+        jne sr_propagate;
+
+        // Builtin miss -> derive child sub-cap then external exec.
+        // The derived cap lands in _sm_child_cap. Today the wire slot
+        // is not consumed by sys_execve (Exec §DEFERRALS: kernel ABI
+        // does not accept a sidecar arg yet); the derivation still
+        // runs so the session-cap wiring is exercised and complete
+        // when the sidecar plumbing lands.
+        lea rdi, [rip + _sm_child_cap];
+        mov rsi, 1;                          // slot 1 in child's cap_table
+        mov rdx, 1;                          // parent session_id placeholder
+        call session_derive_subcap;
+        // Ignore rax; a failed derivation does not block exec today
+        // because the sidecar consumer is not yet plumbed.
+
+        // exec_spawn_and_wait(argv_ptr, argv_bytes, argc).
+        mov rdi, r14;
+        mov rsi, r15;
+        mov rdx, rbx;
+        call exec_spawn_and_wait;
+        // Fall through with rax = exit code or EX_ERR_*.
+
+      sr_propagate:
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      sr_ok_empty:
+        xor rax, rax;                        // SR_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // shell_main() -- ELF entry (@no_frame)
+  //
+  // SysV process entry: rsp is 16-byte aligned; argc at [rsp+0]; argv
+  // pointer array at [rsp+8] (one qword per argv[i], argv[argc]==NULL);
+  // envp array after argv's NULL terminator; the paideia-os InitCap
+  // sidecar follows envp per design/user/execve-abi.md. ENH-006 reads
+  // argc + argv only; envp is untouched (D5: shell does not consume
+  // environment variables) and the InitCap sidecar is loader-managed
+  // today (no runtime cap-table introspection in this repo yet).
+  //
+  // Sequence:
+  //   0. Read argc/argv from initial stack (r15/r14).
+  //   1. shell_reset -- clear stats counters.
+  //   2. shell_argv_dispatch -- populate _sm_opt_* singletons.
+  //   3. dispatch_init -- populate builtin table + reset env table.
+  //   4. session_mint -- root session Cap into _sm_session_cap.
+  //   5. If -c was set: run one shell_repl_step then sys_exit(0).
+  //   6. Otherwise interactive REPL loop:
+  //        write prompt -> read line -> shell_repl_step ->
+  //        history_encode_record (unless --no-history) -> loop.
+  //   7. EOF / LR_STUB (documented #34 gap) -> newline + sys_exit(0).
+  //
+  // shell_main never returns; sys_exit terminates the task on every
+  // exit path. The `hlt` after each sys_exit is unreachable-belt-and-
+  // suspenders, matching init.pdx's own tail-of-_start convention.
+  //
+  // Register plan:
+  //   r15 = argc (survives every nested call: every callee that
+  //         touches r15 pushes it in its own prologue per SysV; the
+  //         wrappers that do not touch r15 leave it alone).
+  //   r14 = argv_base (same discipline).
+  //   r13 = interactive line length (set after each line_reader_read_
+  //         line; consumed by shell_repl_step + history_encode_record;
+  //         both push r13 across their internal use so it survives).
+  //
+  // Alignment: entry rsp % 16 == 0 (SysV process entry). No push/pop
+  // or sub rsp in this body, so rsp % 16 == 0 at every nested `call`.
+  // ==========================================================================
+  pub let shell_main : () -> () !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-006 (#33): the shell's ELF entry frame. Reads argc/argv from the SysV initial process stack (argc at [rsp+0], argv qwords at [rsp+8..], argv[argc]==NULL); envp/InitCap follow but are untouched at ENH-006 (D5: no env; sidecar loader-managed). Sequence: shell_reset -> shell_argv_dispatch (unknown flag -> stderr `shell: unknown flag\\n` + sys_exit(1)) -> dispatch_init -> session_mint into _sm_session_cap with SM_SESSION_ID (bad-return -> stderr `shell: session_mint failed\\n` + sys_exit(1)) -> either one shell_repl_step (if -c) then sys_exit(0), or the interactive REPL loop. Interactive loop: `$ ` prompt via sys_write(fd=1, 2), line via line_reader_read_line into _sm_line_buf (cap 4096), shell_repl_step, history_encode_record into _sm_hist_buf ring (unless --no-history), repeat. EOF is signalled by line_reader returning 0, LR_ERR_EOF (0xFFFFEC13), or LR_STUB (0xFFFFEC10; the ENH-007 gap -- until #34 lands, the very first read returns LR_STUB so shell prints a prompt and then exits cleanly with a trailing newline + sys_exit(0), which is the correct behaviour for a shell whose stdin is stubbed). LR_ERR_BAD_BUF is also treated as EOF defensively -- the alternative is a spin on a misbehaving line reader. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (large-imm sentinels 0xFFFFEC1x stage via `mov r11, imm64; cmp rax, r11`). r15/r14 hold argc/argv_base across nested calls; every callee that uses those regs preserves them per SysV (verified: dispatch_line, exec_spawn_and_wait, lexer_tokenize, parser_parse, session_mint, line_reader_read_line, dispatch_init, shell_reset -- none clobber r14/r15 without a matching push+pop). r13 holds the interactive line length across shell_repl_step + history_encode_record; both push r13 in their prologues so the value survives. @no_frame: this function is the ELF entry point (manifest.pdxproj `entry = Shell::shell_main`), so no push/pop parity is set up; rsp % 16 == 0 at process entry (SysV) and remains so at every nested `call` since no local stack activity happens in this body. History ring append: dst = _sm_hist_buf + _sm_hist_used; skips when _sm_hist_used >= 8192 (ring full or would-underflow the remaining-capacity compute) or when the remaining capacity is < 32 bytes (smallest useful record is 24-byte header + 1 byte + 7 bytes pad = 32). Labels prefixed sm_. Never returns; sys_exit terminates the task on every exit path.",
+      block: {
+        // Read argc / argv from initial stack.
+        mov r15, [rsp + 0];                  // argc
+        mov r14, rsp;
+        add r14, 8;                          // argv_base = &argv[0]
+
+        // (1) Reset stats.
+        call shell_reset;
+
+        // (2) Parse CLI flags into _sm_opt_* singletons.
+        mov rdi, r15;
+        mov rsi, r14;
+        call shell_argv_dispatch;
+        cmp rax, 0;
+        jne sm_err_argv;
+
+        // (3) Populate the builtin dispatch table + reset env table.
+        call dispatch_init;
+
+        // (4) Mint the root KIND_SHELL_SESSION cap.
+        lea rdi, [rip + _sm_session_cap];
+        xor rsi, rsi;                        // slot 0
+        mov rdx, 1;                          // SM_SESSION_ID placeholder
+        call session_mint;
+        cmp rax, 0;
+        jne sm_err_session;
+
+        // (5) -c one-shot path.
+        lea r11, [rip + _sm_opt_c_cmd_ptr];
+        mov rdi, [r11];
+        cmp rdi, 0;
+        je  sm_repl_loop;
+
+        // Run one line then sys_exit(0).
+        lea r11, [rip + _sm_opt_c_cmd_len];
+        mov rsi, [r11];
+        call shell_repl_step;
+        xor rdi, rdi;
+        call sys_exit;
+        hlt;
+
+      sm_repl_loop:
+        // Prompt: sys_write(1, "$ ", 2)
+        mov rdi, 1;
+        lea rsi, [rip + sm_prompt_str];
+        mov rdx, 2;
+        call sys_write;
+
+        // Read line: line_reader_read_line(_sm_line_buf, 4096)
+        lea rdi, [rip + _sm_line_buf];
+        mov rsi, 4096;
+        call line_reader_read_line;
+
+        // EOF sentinels: rax == 0, LR_ERR_EOF (0xFFFFEC13), LR_STUB
+        // (0xFFFFEC10; #34 gap), or LR_ERR_BAD_BUF (0xFFFFEC11,
+        // defensive) all route to a clean exit.
+        cmp rax, 0;
+        je  sm_eof;
+        mov r11, 0xFFFFEC10;                 // LR_STUB
+        cmp rax, r11;
+        je  sm_eof;
+        mov r11, 0xFFFFEC13;                 // LR_ERR_EOF
+        cmp rax, r11;
+        je  sm_eof;
+        mov r11, 0xFFFFEC11;                 // LR_ERR_BAD_BUF (defensive)
+        cmp rax, r11;
+        je  sm_eof;
+
+        // Bound the returned length to the buffer cap.
+        mov r13, rax;                        // r13 = line_len
+        cmp r13, 4096;
+        ja  sm_eof;                          // overflow -> clean exit
+
+        // shell_repl_step(_sm_line_buf, r13). rc ignored for ENH-006.
+        lea rdi, [rip + _sm_line_buf];
+        mov rsi, r13;
+        call shell_repl_step;
+
+        // History append (skip if --no-history).
+        lea r11, [rip + _sm_opt_no_history];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne sm_hist_skip;
+
+        // Skip if ring is at capacity (also guards the sub below from
+        // underflowing the remaining-capacity compute).
+        lea r11, [rip + _sm_hist_used];
+        mov rcx, [r11];
+        cmp rcx, 8192;
+        jae sm_hist_skip;
+
+        // dst = &_sm_hist_buf + _sm_hist_used;
+        // dst_len = 8192 - _sm_hist_used
+        lea r11, [rip + _sm_hist_buf];
+        mov rdi, r11;
+        add rdi, rcx;
+        mov rsi, 8192;
+        sub rsi, rcx;
+
+        // Need at least header(24) + 1 byte + 7 bytes pad = 32 bytes.
+        cmp rsi, 32;
+        jbe sm_hist_skip;
+
+        lea rdx, [rip + _sm_line_buf];       // cmd_ptr
+        mov rcx, r13;                        // cmd_len
+        xor r8,  r8;                         // ts_ns = 0 (no clock yet)
+        xor r9,  r9;                         // flags = 0
+        call history_encode_record;
+        cmp rax, 0;
+        jne sm_hist_skip;                    // encoder refused -> drop
+
+        // Advance _sm_hist_used by history_bytes_written.
+        lea r11, [rip + history_bytes_written];
+        mov rax, [r11];
+        lea r11, [rip + _sm_hist_used];
+        mov rcx, [r11];
+        add rcx, rax;
+        mov [r11], rcx;
+
+      sm_hist_skip:
+        jmp sm_repl_loop;
+
+      sm_eof:
+        // Trailing newline so the terminal cursor lands on a fresh line.
+        mov rdi, 1;
+        lea rsi, [rip + sm_nl_str];
+        mov rdx, 1;
+        call sys_write;
+        xor rdi, rdi;
+        call sys_exit;
+        hlt;
+
+      sm_err_argv:
+        // stderr "shell: unknown flag\n" then sys_exit(1).
+        mov rdi, 2;
+        lea rsi, [rip + sm_err_unknown_flag_str];
+        mov rdx, 20;                         // exclude trailing NUL
+        call sys_write;
+        mov rdi, 1;
+        call sys_exit;
+        hlt;
+
+      sm_err_session:
+        mov rdi, 2;
+        lea rsi, [rip + sm_err_session_mint_str];
+        mov rdx, 27;                         // exclude trailing NUL
+        call sys_write;
+        mov rdi, 1;
+        call sys_exit;
+        hlt
+      }
+    } @no_frame
 }

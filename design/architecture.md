@@ -17,42 +17,100 @@ threads text-and-schema-and-cap layers through pipes.
 
 The shell is not a library — it is a binary. Its "surface" from a
 programmatic point of view is a small set of module entry points the
-`_start` frame calls in order:
+ELF entry (`Shell::shell_main`, per `manifest.pdxproj`) calls in order:
 
 - `Shell` (`src/shell.pdx`) — top-level orchestration, constants shared
   across the shell's modules, session-level state (bounded stats table,
-  reset function), and the M1 skeleton for the run loop.
+  reset function), and — as of ENH-006 (#33) — the ELF entry
+  `shell_main`, the CLI flag walker `shell_argv_dispatch`, the one-line
+  REPL step `shell_repl_step`, and the byte-string helpers (`sm_strlen`,
+  `sm_streq_lit`, `sm_str_prefix`) the walker consumes.
 - `LineReader` (`src/line_reader.pdx`) — the interactive line reader.
   Wraps the semterm engine's line editor
   (paideia-os `src/kernel/core/semterm/line_editor.pdx`, R41.M4-002)
   from userspace, exposing `line_reader_read_line(buf, buf_len) → u64`.
   M1 ships the SKELETON: prompt-render + buffer wiring returns
   `LR_STUB`; the actual byte-source binding to KIND_TTY(read) and the
-  echo-back to KIND_TTY(write) land at M2 once the KIND_TTY substrate
-  in the paideia-os kernel is ready to service userspace.
-- `Exec` (`src/exec.pdx`) — the exec path. `exec_spawn_and_wait(argv,
-  argv_count) → u64` assembles an InitCap sidecar for the child,
-  invokes `sys_execve`, blocks on `sys_wait4`, and returns the exit
-  code. M1 ships the SKELETON: argv gating returns `EX_STUB`; the
-  actual sys_execve call lands at M2 alongside the pipeline substrate
-  (`|` mint of `KIND_IPC_ENDPOINT`).
+  echo-back to KIND_TTY(write) land at ENH-007 (#34) once the
+  KIND_TTY substrate in the paideia-os kernel is ready to service
+  userspace. `shell_main` treats `LR_STUB` / `LR_ERR_EOF` / a bare 0
+  as EOF signals structurally so the REPL always terminates cleanly.
+- `Exec` (`src/exec.pdx`) — the exec path. `exec_spawn_and_wait(pool,
+  bytes, argc) → u64` marshals argv from the parser's pool slice,
+  narrows the child's cap set against the parent's, opens an audit
+  record BEFORE `sys_execve`, then blocks on `sys_wait4`. Real at
+  ENH-005 (#32); the sole substrate-scope gap remaining is the
+  fork-vs-execve pattern (see the module's §FORK GAP note).
+- `Lexer` / `Parser` / `Dispatch` / `Builtins` (`src/lexer.pdx` /
+  `src/parser.pdx` / `src/dispatch.pdx` / `src/builtins.pdx`) —
+  landed at ENH-002..ENH-004 (#29 / #30 / #31). Together they consume
+  a line of bytes and produce either a matched builtin invocation
+  (bi_cd / bi_exit / bi_export / bi_pwd) or `BI_MISS` for the REPL
+  to route to `exec_spawn_and_wait`.
 
-The shell's `_start` frame (not part of M1 — the loader's entry
-convention lands in the paideia-os R14b bootstrap) calls the three
-modules in this order:
+### 1.1 REPL loop
+
+`Shell::shell_main` (ELF entry, `@no_frame`) reads argc + argv from
+the SysV initial process stack (argc at `[rsp+0]`, argv qwords at
+`[rsp+8..]`, `argv[argc]==NULL`), populates the `_sm_opt_*` singletons
+via `shell_argv_dispatch`, runs `dispatch_init` + `session_mint`
+(into `_sm_session_cap`), then enters this loop:
 
 ```
-1. Shell::shell_reset()                       // clear stats
-2. loop:
-     let n = LineReader::line_reader_read_line(cmd_buf, 256)
-     if n == 0 { exit 0 (EOF) }
-     let rc = Exec::exec_spawn_and_wait(cmd_buf, n)
-     // rc is the child's exit code (or an EX_ERR_* code)
+loop:
+    sys_write(1, "$ ", 2)                          // prompt
+    let n = LineReader::line_reader_read_line(_sm_line_buf, 4096)
+    if n in { 0, LR_STUB, LR_ERR_EOF, LR_ERR_BAD_BUF }:
+        sys_write(1, "\n", 1); sys_exit(0)         // EOF path
+    if n > 4096: sys_exit(0)                       // defensive
+    let rc = Shell::shell_repl_step(_sm_line_buf, n)
+    if not _sm_opt_no_history:
+        History::history_encode_record(
+            &_sm_hist_buf[_sm_hist_used],
+            8192 - _sm_hist_used,
+            _sm_line_buf, n, ts_ns=0, flags=0)
+        _sm_hist_used += history_bytes_written    // if OK
 ```
 
-At M1 both `line_reader_read_line` and `exec_spawn_and_wait` return
-their `_STUB` code so the harness in tests/ can call the run loop
-without blocking on a live TTY or live process.
+`shell_repl_step(line_ptr, line_len)` runs one pipeline stage
+(stage[0]; multi-stage fan-out is future work) through
+`Lexer::lexer_tokenize` -> `Parser::parser_parse` ->
+`Dispatch::dispatch_line`. On `BI_MISS` it derives a
+`KIND_SHELL_SESSION` sub-cap into `_sm_child_cap` via
+`Session::session_derive_subcap` (the child cap the future InitCap
+sidecar handoff will carry; see `src/exec.pdx` §DEFERRALS) then
+invokes `Exec::exec_spawn_and_wait` with the parser's pool slice.
+Empty and whitespace-only lines short-circuit to `SR_OK` without
+touching the exec path.
+
+The `-c <command>` one-shot path bypasses the loop: `shell_main`
+calls `shell_repl_step` once with the recorded command bytes, then
+`sys_exit(0)`. This matches the POSIX `-c` semantics without
+carrying the interactive prompt discipline.
+
+### 1.2 CLI options
+
+`shell_argv_dispatch` walks argv[1..argc] and populates `_sm_opt_*`
+singletons per the following table. Any argv[i] beginning with `-`
+that does not match one of the two recognised long flags or the
+single-dash `-c` form returns `SM_ERR_ARG_FLAG_UNKNOWN` (0xFFFFECF0);
+`shell_main` writes `shell: unknown flag\n` to stderr and
+`sys_exit(1)`.
+
+| Flag                 | Populates                                                                |
+|----------------------|--------------------------------------------------------------------------|
+| `-c <command>`       | `_sm_opt_c_cmd_ptr` (argv[i+1]) + `_sm_opt_c_cmd_len` (strlen)          |
+| `--no-history`       | `_sm_opt_no_history = 1`                                                 |
+| `--no-cap:<KIND>`    | `_sm_opt_no_cap_kind = 1` (KIND parse + cap-narrowing hook deferred)     |
+| `<positional>`       | `_sm_opt_script_ptr` (last one wins; `.pds` script dispatcher deferred)  |
+
+Session-cap wiring at startup: `shell_main` calls `session_mint`
+into `_sm_session_cap` with `SM_SESSION_ID = 1` (placeholder;
+real session ids arrive when runtime cap-table introspection lands).
+`shell_repl_step` calls `session_derive_subcap` into `_sm_child_cap`
+before each external exec so the derivation is exercised end-to-end,
+even though the sidecar consumer inside `sys_execve` is a documented
+deferral (see `src/exec.pdx` §DEFERRALS step 2).
 
 ## 2. `Shell` module (src/shell.pdx)
 

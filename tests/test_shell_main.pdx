@@ -1,0 +1,805 @@
+// tests/test_shell_main.pdx -- shell.ENH-006 (paideia-os/shell#33)
+//
+// TestShellMain module: fingerprint driver for shell_main's helpers +
+// shell_argv_dispatch + shell_repl_step.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Ten cases cover the pure-function surface of ENH-006:
+//
+//   tshm_case_strlen           sm_strlen("hello") == 5; sm_strlen("") == 0
+//   tshm_case_streq            sm_streq_lit("hello","hello")==0;
+//                              sm_streq_lit("hello","hell")==1
+//   tshm_case_str_prefix       sm_str_prefix("hello","hell")==0;
+//                              sm_str_prefix("hell","hello")==1
+//   tshm_case_argv_c           argv = ["shell","-c","ls"] -> _sm_opt_c_*
+//   tshm_case_argv_nohist      argv = ["shell","--no-history"] -> _sm_opt_no_history=1
+//   tshm_case_argv_nocap       argv = ["shell","--no-cap:FOO"] -> _sm_opt_no_cap_kind=1
+//   tshm_case_argv_script      argv = ["shell","/tmp/s.pds"] -> _sm_opt_script_ptr
+//   tshm_case_argv_unknown     argv = ["shell","--foo"] -> SM_ERR_ARG_FLAG_UNKNOWN
+//   tshm_case_repl_empty       shell_repl_step("",0) -> SR_OK
+//   tshm_case_repl_cd_noarg    shell_repl_step("cd",2) -> BI_ERR_CD_NO_ARG
+//
+// Deliberately NOT tested here (documented deferrals):
+//
+//   * shell_main itself. Reading argc/argv from the SysV initial stack
+//     and issuing sys_exit both make shell_main untestable from a driver
+//     that would need to survive the sys_exit. The entry-frame body IS
+//     structurally exercised by every test case above through its
+//     helpers (shell_argv_dispatch, shell_repl_step, and the string
+//     helpers), and the paideia-os boot-time smoke harness will drive
+//     shell_main via init.pdx's exec /bin/sh cycle once the shell
+//     satellite is wired into paideia-os as a submodule.
+//   * The external-exec path in shell_repl_step (dispatch_line miss ->
+//     session_derive_subcap + exec_spawn_and_wait). exec_spawn_and_wait
+//     issues sys_execve which either replaces the test binary's image
+//     with the target (killing the driver) or returns a failure whose
+//     specific value depends on the live kernel. Same runtime-verification
+//     deferral test_builtins.pdx documents for bi_pwd's sys_getcwd path.
+//     The dispatch_line-hit path (tshm_case_repl_cd_noarg) does exercise
+//     the pre-dispatch pipeline (lex + parse + dispatch) end-to-end.
+//   * line_reader_read_line inside the REPL loop. The reader body is
+//     ENH-007 (#34) work; shell_main handles LR_STUB / LR_ERR_EOF / 0
+//     as EOF signals structurally and the driver would need to mock
+//     the reader to exercise that arm, which is out of scope for the
+//     pure-function surface.
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFED8x
+// =============================================================================
+//
+//   0            TSHM_PASS                       all cases passed
+//   0xFFFFED80   TSHM_FAIL_STRLEN                sm_strlen returned wrong length
+//   0xFFFFED81   TSHM_FAIL_STREQ                 sm_streq_lit returned wrong code
+//   0xFFFFED82   TSHM_FAIL_STR_PREFIX            sm_str_prefix returned wrong code
+//   0xFFFFED83   TSHM_FAIL_ARGV_C                -c did not populate _sm_opt_c_*
+//   0xFFFFED84   TSHM_FAIL_ARGV_NOHIST           --no-history did not set flag
+//   0xFFFFED85   TSHM_FAIL_ARGV_NOCAP            --no-cap:FOO did not set flag
+//   0xFFFFED86   TSHM_FAIL_ARGV_SCRIPT           positional did not set script ptr
+//   0xFFFFED87   TSHM_FAIL_ARGV_UNKNOWN          unknown flag did not raise error
+//   0xFFFFED88   TSHM_FAIL_REPL_EMPTY            empty-line did not return SR_OK
+//   0xFFFFED89   TSHM_FAIL_REPL_CD_NOARG        "cd" did not reach bi_cd(argc=1)
+//
+// The 0xFFFFED8x band extends the family:
+//   0xFFFFED0x TestCapsNarrow  0xFFFFED4x TestSyscallFloor
+//   0xFFFFED1x TestAuditFirst  0xFFFFED5x TestLexer
+//   0xFFFFED2x TestSmokeMatrix 0xFFFFED6x TestParser
+//   0xFFFFED3x TestReleaseManifest 0xFFFFED7x TestBuiltins
+//   0xFFFFED8x TestShellMain           <-- this module
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestShellMain`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF; large-imm sentinel
+//     compares stage via `mov r11, imm64; cmp rax, r11`.
+//   - r11 scratch for .bss reach + large-imm compare staging.
+//   - Byte writes to fixtures use `mov rax, <lit>; mov_b [r10 + N], rax`
+//     (or `xor rax, rax; mov_b ...` for NUL). Byte reads use the #1248
+//     pattern; the tests only compare qwords loaded via `mov rax, [ptr]`.
+//   - Each case pushes rbx + r12 + `sub rsp, 8` = 24 bytes prologue for
+//     the nested SysV calls (sm_strlen / shell_argv_dispatch / etc.);
+//     matched pop before every ret. Entry rsp%16==8; 2 pushes -> 0-off;
+//     sub 8 -> 8-off? Wait: entry rsp%16==8 (post-call return addr);
+//     after push rbx rsp%16==0; after push r12 rsp%16==8; `sub rsp, 8`
+//     -> rsp%16==0 for the nested call. Same idiom as test_builtins.pdx.
+
+module TestShellMain = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED8x band)
+  // ==========================================================================
+  pub let TSHM_PASS                : u64 = 0
+  pub let TSHM_FAIL_STRLEN         : u64 = 0xFFFFED80
+  pub let TSHM_FAIL_STREQ          : u64 = 0xFFFFED81
+  pub let TSHM_FAIL_STR_PREFIX     : u64 = 0xFFFFED82
+  pub let TSHM_FAIL_ARGV_C         : u64 = 0xFFFFED83
+  pub let TSHM_FAIL_ARGV_NOHIST    : u64 = 0xFFFFED84
+  pub let TSHM_FAIL_ARGV_NOCAP     : u64 = 0xFFFFED85
+  pub let TSHM_FAIL_ARGV_SCRIPT    : u64 = 0xFFFFED86
+  pub let TSHM_FAIL_ARGV_UNKNOWN   : u64 = 0xFFFFED87
+  pub let TSHM_FAIL_REPL_EMPTY     : u64 = 0xFFFFED88
+  pub let TSHM_FAIL_REPL_CD_NOARG  : u64 = 0xFFFFED89
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  //   _tshm_arg_prog    "shell\0"        6 bytes
+  //   _tshm_arg_dashc   "-c\0"           3 bytes
+  //   _tshm_arg_ls      "ls\0"           3 bytes
+  //   _tshm_arg_nohist  "--no-history\0" 13 bytes
+  //   _tshm_arg_nocap   "--no-cap:FOO\0" 13 bytes
+  //   _tshm_arg_script  "/tmp/s.pds\0"   11 bytes
+  //   _tshm_arg_unknown "--foo\0"        6 bytes
+  //   _tshm_arg_cd      "cd\0"           3 bytes
+  //   _tshm_hello       "hello\0"        6 bytes
+  //   _tshm_hell        "hell\0"         5 bytes
+  //   _tshm_argv        [u64; 4]         shared argv[] scratch
+  //
+  // Each buffer is sized to hold the argv text with headroom.
+  // ==========================================================================
+  pub let mut _tshm_arg_prog    : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_arg_dashc   : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_arg_ls      : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_arg_nohist  : [u8; 16] = uninit @align(8)
+  pub let mut _tshm_arg_nocap   : [u8; 16] = uninit @align(8)
+  pub let mut _tshm_arg_script  : [u8; 16] = uninit @align(8)
+  pub let mut _tshm_arg_unknown : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_arg_cd      : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_hello       : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_hell        : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_argv        : [u64; 4] = uninit @align(16)
+
+  // ==========================================================================
+  // tshm_reset() -> ()
+  //
+  // Populate all fixture buffers via mov_b writes AND call dispatch_init
+  // so tshm_case_repl_cd_noarg's shell_repl_step -> dispatch_line path
+  // sees a populated _bi_names / _bi_handlers table. Same discipline
+  // test_builtins.pdx's tbi_reset uses (dispatch_init at the tail of
+  // the reset so the case body starts from a known-good dispatch table).
+  //
+  // Not a leaf function -- the tail dispatch_init call needs SysV
+  // alignment. `sub rsp, 8` prologue + `add rsp, 8` before ret.
+  // ==========================================================================
+  pub let tshm_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): populate argv-string + helper fixtures via mov_b writes AND call dispatch_init at the tail so tshm_case_repl_cd_noarg's shell_repl_step -> dispatch_line path sees a populated builtin table (a BI_MISS on `cd` would otherwise route to exec_spawn_and_wait -> sys_execve, which would kill the test driver). Same idiom test_builtins / test_lexer / test_smoke_matrix established (literal byte in rax; mov_b to fixture; xor rax, rax; mov_b for NUL terminators). Every literal byte is ASCII (0x2D..0x79 range); every literal fits imm8 by construction. `sub rsp, 8` prologue aligns rsp % 16 for the nested dispatch_init call; matched `add rsp, 8` before ret. Labels prefixed tshm_rs_ (none needed -- linear body).",
+      block: {
+        sub rsp, 8;                            // align for dispatch_init call
+
+        // _tshm_arg_prog: "shell\0" (6 bytes)
+        lea r10, [rip + _tshm_arg_prog];
+        mov rax, 0x73; mov_b [r10 + 0], rax;   // 's'
+        mov rax, 0x68; mov_b [r10 + 1], rax;   // 'h'
+        mov rax, 0x65; mov_b [r10 + 2], rax;   // 'e'
+        mov rax, 0x6C; mov_b [r10 + 3], rax;   // 'l'
+        mov rax, 0x6C; mov_b [r10 + 4], rax;   // 'l'
+        xor rax, rax;  mov_b [r10 + 5], rax;   // NUL
+
+        // _tshm_arg_dashc: "-c\0" (3 bytes)
+        lea r10, [rip + _tshm_arg_dashc];
+        mov rax, 0x2D; mov_b [r10 + 0], rax;   // '-'
+        mov rax, 0x63; mov_b [r10 + 1], rax;   // 'c'
+        xor rax, rax;  mov_b [r10 + 2], rax;   // NUL
+
+        // _tshm_arg_ls: "ls\0" (3 bytes)
+        lea r10, [rip + _tshm_arg_ls];
+        mov rax, 0x6C; mov_b [r10 + 0], rax;   // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;   // 's'
+        xor rax, rax;  mov_b [r10 + 2], rax;   // NUL
+
+        // _tshm_arg_nohist: "--no-history\0" (13 bytes)
+        lea r10, [rip + _tshm_arg_nohist];
+        mov rax, 0x2D; mov_b [r10 +  0], rax;
+        mov rax, 0x2D; mov_b [r10 +  1], rax;
+        mov rax, 0x6E; mov_b [r10 +  2], rax;  // 'n'
+        mov rax, 0x6F; mov_b [r10 +  3], rax;  // 'o'
+        mov rax, 0x2D; mov_b [r10 +  4], rax;
+        mov rax, 0x68; mov_b [r10 +  5], rax;  // 'h'
+        mov rax, 0x69; mov_b [r10 +  6], rax;  // 'i'
+        mov rax, 0x73; mov_b [r10 +  7], rax;  // 's'
+        mov rax, 0x74; mov_b [r10 +  8], rax;  // 't'
+        mov rax, 0x6F; mov_b [r10 +  9], rax;  // 'o'
+        mov rax, 0x72; mov_b [r10 + 10], rax;  // 'r'
+        mov rax, 0x79; mov_b [r10 + 11], rax;  // 'y'
+        xor rax, rax;  mov_b [r10 + 12], rax;
+
+        // _tshm_arg_nocap: "--no-cap:FOO\0" (13 bytes)
+        lea r10, [rip + _tshm_arg_nocap];
+        mov rax, 0x2D; mov_b [r10 +  0], rax;
+        mov rax, 0x2D; mov_b [r10 +  1], rax;
+        mov rax, 0x6E; mov_b [r10 +  2], rax;
+        mov rax, 0x6F; mov_b [r10 +  3], rax;
+        mov rax, 0x2D; mov_b [r10 +  4], rax;
+        mov rax, 0x63; mov_b [r10 +  5], rax;  // 'c'
+        mov rax, 0x61; mov_b [r10 +  6], rax;  // 'a'
+        mov rax, 0x70; mov_b [r10 +  7], rax;  // 'p'
+        mov rax, 0x3A; mov_b [r10 +  8], rax;  // ':'
+        mov rax, 0x46; mov_b [r10 +  9], rax;  // 'F'
+        mov rax, 0x4F; mov_b [r10 + 10], rax;  // 'O'
+        mov rax, 0x4F; mov_b [r10 + 11], rax;  // 'O'
+        xor rax, rax;  mov_b [r10 + 12], rax;
+
+        // _tshm_arg_script: "/tmp/s.pds\0" (11 bytes)
+        lea r10, [rip + _tshm_arg_script];
+        mov rax, 0x2F; mov_b [r10 +  0], rax;  // '/'
+        mov rax, 0x74; mov_b [r10 +  1], rax;  // 't'
+        mov rax, 0x6D; mov_b [r10 +  2], rax;  // 'm'
+        mov rax, 0x70; mov_b [r10 +  3], rax;  // 'p'
+        mov rax, 0x2F; mov_b [r10 +  4], rax;  // '/'
+        mov rax, 0x73; mov_b [r10 +  5], rax;  // 's'
+        mov rax, 0x2E; mov_b [r10 +  6], rax;  // '.'
+        mov rax, 0x70; mov_b [r10 +  7], rax;  // 'p'
+        mov rax, 0x64; mov_b [r10 +  8], rax;  // 'd'
+        mov rax, 0x73; mov_b [r10 +  9], rax;  // 's'
+        xor rax, rax;  mov_b [r10 + 10], rax;
+
+        // _tshm_arg_unknown: "--foo\0" (6 bytes)
+        lea r10, [rip + _tshm_arg_unknown];
+        mov rax, 0x2D; mov_b [r10 + 0], rax;
+        mov rax, 0x2D; mov_b [r10 + 1], rax;
+        mov rax, 0x66; mov_b [r10 + 2], rax;  // 'f'
+        mov rax, 0x6F; mov_b [r10 + 3], rax;
+        mov rax, 0x6F; mov_b [r10 + 4], rax;
+        xor rax, rax;  mov_b [r10 + 5], rax;
+
+        // _tshm_arg_cd: "cd\0" (3 bytes)
+        lea r10, [rip + _tshm_arg_cd];
+        mov rax, 0x63; mov_b [r10 + 0], rax;
+        mov rax, 0x64; mov_b [r10 + 1], rax;
+        xor rax, rax;  mov_b [r10 + 2], rax;
+
+        // _tshm_hello: "hello\0" (6 bytes)
+        lea r10, [rip + _tshm_hello];
+        mov rax, 0x68; mov_b [r10 + 0], rax;
+        mov rax, 0x65; mov_b [r10 + 1], rax;
+        mov rax, 0x6C; mov_b [r10 + 2], rax;
+        mov rax, 0x6C; mov_b [r10 + 3], rax;
+        mov rax, 0x6F; mov_b [r10 + 4], rax;
+        xor rax, rax;  mov_b [r10 + 5], rax;
+
+        // _tshm_hell: "hell\0" (5 bytes)
+        lea r10, [rip + _tshm_hell];
+        mov rax, 0x68; mov_b [r10 + 0], rax;
+        mov rax, 0x65; mov_b [r10 + 1], rax;
+        mov rax, 0x6C; mov_b [r10 + 2], rax;
+        mov rax, 0x6C; mov_b [r10 + 3], rax;
+        xor rax, rax;  mov_b [r10 + 4], rax;
+
+        // Zero the argv[] scratch so a leftover pointer from a
+        // previous case cannot bleed into this one.
+        xor rax, rax;
+        lea r10, [rip + _tshm_argv];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        // Populate the builtin dispatch table + reset shell-local env
+        // so tshm_case_repl_cd_noarg's dispatch_line sees `cd`.
+        call dispatch_init;
+
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_strlen() -> u64
+  //
+  // sm_strlen("hello") == 5; sm_strlen("") == 0 (using the NUL at
+  // _tshm_hello[5] as an empty-string source).
+  // ==========================================================================
+  pub let tshm_case_strlen : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): sm_strlen fingerprint. `hello` is 5 bytes; the &_tshm_hello[5] slot is a NUL, so sm_strlen against that address returns 0 (empty string). Two nested sm_strlen calls; 2 callee-save pushes + sub 8 = 24 bytes prologue for rsp%16==0. Labels prefixed tshm_sl_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        // sm_strlen(&_tshm_hello) == 5
+        lea rdi, [rip + _tshm_hello];
+        call sm_strlen;
+        cmp rax, 5;
+        jne tshm_sl_fail;
+
+        // sm_strlen(&_tshm_hello + 5) == 0 (NUL byte)
+        lea rdi, [rip + _tshm_hello];
+        add rdi, 5;
+        call sm_strlen;
+        cmp rax, 0;
+        jne tshm_sl_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_sl_fail:
+        mov rax, 0xFFFFED80;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_streq() -> u64
+  //
+  // sm_streq_lit("hello","hello") == 0 (equal).
+  // sm_streq_lit("hello","hell")  == 1 (a longer than b's NUL boundary).
+  // sm_streq_lit("hell","hello")  == 1 (a shorter than b at compare byte).
+  // ==========================================================================
+  pub let tshm_case_streq : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): sm_streq_lit fingerprint. Equal strings return 0; length mismatches in either direction return 1. Same pointer for both args (both `_tshm_hello`) exercises the both-side simultaneous-NUL exit. Different-length pairs exercise both mismatch arms (one-side-NUL vs other-side-nonzero). Three nested calls. 2 callee-save pushes + sub 8 = 24 bytes prologue. Labels prefixed tshm_se_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        // hello == hello
+        lea rdi, [rip + _tshm_hello];
+        lea rsi, [rip + _tshm_hello];
+        call sm_streq_lit;
+        cmp rax, 0;
+        jne tshm_se_fail;
+
+        // hello vs hell (a longer)
+        lea rdi, [rip + _tshm_hello];
+        lea rsi, [rip + _tshm_hell];
+        call sm_streq_lit;
+        cmp rax, 1;
+        jne tshm_se_fail;
+
+        // hell vs hello (a shorter)
+        lea rdi, [rip + _tshm_hell];
+        lea rsi, [rip + _tshm_hello];
+        call sm_streq_lit;
+        cmp rax, 1;
+        jne tshm_se_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_se_fail:
+        mov rax, 0xFFFFED81;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_str_prefix() -> u64
+  //
+  // sm_str_prefix("hello","hell") == 0 (hello starts with hell).
+  // sm_str_prefix("hell","hello") == 1 (hell shorter than "hello",
+  //                                    mismatch at compare offset 4:
+  //                                    hell[4]==NUL vs hello[4]=='o').
+  // ==========================================================================
+  pub let tshm_case_str_prefix : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): sm_str_prefix fingerprint. hello starts with hell -> 0; hell does not start with hello (mismatch when the walker prefix reaches its 4th char and hell has hit NUL there) -> 1. 2 pushes + sub 8 = 24 bytes prologue. Labels prefixed tshm_sp_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        // hello prefix hell -> 0
+        lea rdi, [rip + _tshm_hello];
+        lea rsi, [rip + _tshm_hell];
+        call sm_str_prefix;
+        cmp rax, 0;
+        jne tshm_sp_fail;
+
+        // hell prefix hello -> 1
+        lea rdi, [rip + _tshm_hell];
+        lea rsi, [rip + _tshm_hello];
+        call sm_str_prefix;
+        cmp rax, 1;
+        jne tshm_sp_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_sp_fail:
+        mov rax, 0xFFFFED82;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_argv_c() -> u64
+  //
+  // Build argv = ["shell","-c","ls",NULL], argc = 3.
+  // Expect shell_argv_dispatch -> SM_OK, _sm_opt_c_cmd_ptr == &_tshm_arg_ls,
+  // _sm_opt_c_cmd_len == 2.
+  // ==========================================================================
+  pub let tshm_case_argv_c : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): -c flag load-bearing case. Populates _tshm_argv[0..3] with pointers to argv strings, calls shell_argv_dispatch, then verifies the three post-conditions (return SM_OK, _sm_opt_c_cmd_ptr == &_tshm_arg_ls, _sm_opt_c_cmd_len == 2). Any mismatch is TSHM_FAIL_ARGV_C. 2 pushes + sub 8 = 24 bytes prologue. Labels prefixed tshm_ac_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        // Populate argv[]
+        lea r10, [rip + _tshm_argv];
+        lea rax, [rip + _tshm_arg_prog];
+        mov [r10 +  0], rax;
+        lea rax, [rip + _tshm_arg_dashc];
+        mov [r10 +  8], rax;
+        lea rax, [rip + _tshm_arg_ls];
+        mov [r10 + 16], rax;
+        xor rax, rax;
+        mov [r10 + 24], rax;
+
+        mov rdi, 3;                          // argc
+        lea rsi, [rip + _tshm_argv];         // argv_base
+        call shell_argv_dispatch;
+        cmp rax, 0;
+        jne tshm_ac_fail;
+
+        // _sm_opt_c_cmd_ptr == &_tshm_arg_ls
+        lea r12, [rip + _tshm_arg_ls];
+        lea r11, [rip + _sm_opt_c_cmd_ptr];
+        mov rax, [r11];
+        cmp rax, r12;
+        jne tshm_ac_fail;
+
+        // _sm_opt_c_cmd_len == 2
+        lea r11, [rip + _sm_opt_c_cmd_len];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne tshm_ac_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_ac_fail:
+        mov rax, 0xFFFFED83;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_argv_nohist() -> u64
+  //
+  // argv = ["shell","--no-history",NULL], argc = 2. Expect SM_OK and
+  // _sm_opt_no_history == 1.
+  // ==========================================================================
+  pub let tshm_case_argv_nohist : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): --no-history boolean case. Sets _sm_opt_no_history to 1 via shell_argv_dispatch's long-flag exact-match arm. 2 pushes + sub 8 = 24 bytes prologue. Labels prefixed tshm_nh_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        lea r10, [rip + _tshm_argv];
+        lea rax, [rip + _tshm_arg_prog];
+        mov [r10 + 0], rax;
+        lea rax, [rip + _tshm_arg_nohist];
+        mov [r10 + 8], rax;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+
+        mov rdi, 2;
+        lea rsi, [rip + _tshm_argv];
+        call shell_argv_dispatch;
+        cmp rax, 0;
+        jne tshm_nh_fail;
+
+        lea r11, [rip + _sm_opt_no_history];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne tshm_nh_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_nh_fail:
+        mov rax, 0xFFFFED84;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_argv_nocap() -> u64
+  //
+  // argv = ["shell","--no-cap:FOO",NULL], argc = 2. Expect SM_OK and
+  // _sm_opt_no_cap_kind == 1. KIND parse is deferred (see shell.pdx
+  // shell_argv_dispatch justification); the flag is remembered as a
+  // boolean today.
+  // ==========================================================================
+  pub let tshm_case_argv_nocap : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): --no-cap:<KIND> boolean case (KIND parse deferred; the flag is remembered as a boolean today per shell_argv_dispatch's inline note). 2 pushes + sub 8 = 24 bytes prologue. Labels prefixed tshm_nc_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        lea r10, [rip + _tshm_argv];
+        lea rax, [rip + _tshm_arg_prog];
+        mov [r10 + 0], rax;
+        lea rax, [rip + _tshm_arg_nocap];
+        mov [r10 + 8], rax;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+
+        mov rdi, 2;
+        lea rsi, [rip + _tshm_argv];
+        call shell_argv_dispatch;
+        cmp rax, 0;
+        jne tshm_nc_fail;
+
+        lea r11, [rip + _sm_opt_no_cap_kind];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne tshm_nc_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_nc_fail:
+        mov rax, 0xFFFFED85;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_argv_script() -> u64
+  //
+  // argv = ["shell","/tmp/s.pds",NULL], argc = 2. Expect SM_OK and
+  // _sm_opt_script_ptr == &_tshm_arg_script.
+  // ==========================================================================
+  pub let tshm_case_argv_script : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): positional-script case. First byte '/' (0x2F) is not '-', so shell_argv_dispatch routes to the positional arm and stores argv[1] into _sm_opt_script_ptr. 2 pushes + sub 8 = 24 bytes prologue. Labels prefixed tshm_as_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        lea r10, [rip + _tshm_argv];
+        lea rax, [rip + _tshm_arg_prog];
+        mov [r10 + 0], rax;
+        lea rax, [rip + _tshm_arg_script];
+        mov [r10 + 8], rax;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+
+        mov rdi, 2;
+        lea rsi, [rip + _tshm_argv];
+        call shell_argv_dispatch;
+        cmp rax, 0;
+        jne tshm_as_fail;
+
+        lea r12, [rip + _tshm_arg_script];
+        lea r11, [rip + _sm_opt_script_ptr];
+        mov rax, [r11];
+        cmp rax, r12;
+        jne tshm_as_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_as_fail:
+        mov rax, 0xFFFFED86;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_argv_unknown() -> u64
+  //
+  // argv = ["shell","--foo",NULL], argc = 2. Expect
+  // SM_ERR_ARG_FLAG_UNKNOWN (0xFFFFECF0) -- --foo matches neither
+  // --no-history exactly nor the --no-cap: prefix.
+  // ==========================================================================
+  pub let tshm_case_argv_unknown : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-006 (#33): unknown-flag reject case. --foo falls through both long-flag branches (streq_lit --no-history and str_prefix --no-cap:) and lands on sm_ad_unknown -> SM_ERR_ARG_FLAG_UNKNOWN. 2 pushes + sub 8 = 24 bytes prologue. Large-imm return sentinel 0xFFFFECF0 stages via mov r11, imm64; cmp rax, r11. Labels prefixed tshm_au_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        lea r10, [rip + _tshm_argv];
+        lea rax, [rip + _tshm_arg_prog];
+        mov [r10 + 0], rax;
+        lea rax, [rip + _tshm_arg_unknown];
+        mov [r10 + 8], rax;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+
+        mov rdi, 2;
+        lea rsi, [rip + _tshm_argv];
+        call shell_argv_dispatch;
+
+        mov r11, 0xFFFFECF0;                 // SM_ERR_ARG_FLAG_UNKNOWN
+        cmp rax, r11;
+        jne tshm_au_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_au_fail:
+        mov rax, 0xFFFFED87;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_repl_empty() -> u64
+  //
+  // shell_repl_step(anything, 0) -> SR_OK. The short-circuit at the
+  // top of shell_repl_step means the lexer/parser are not called and
+  // the .bss stage table is not touched.
+  // ==========================================================================
+  pub let tshm_case_repl_empty : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-006 (#33): empty-line short-circuit. shell_repl_step must return SR_OK (0) when line_len == 0 without dispatching. If it returns non-zero, either the short-circuit is missing or downstream state is being touched despite an empty input. 2 pushes + sub 8 = 24 bytes prologue. Effect/cap set matches shell_repl_step's declaration (union of every downstream call). Labels prefixed tshm_re_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        // Pass any non-null buf ptr with len=0; short-circuit fires
+        // before the buffer is inspected. Use _tshm_hello for a valid
+        // pointer.
+        lea rdi, [rip + _tshm_hello];
+        xor rsi, rsi;                        // line_len = 0
+        call shell_repl_step;
+        cmp rax, 0;
+        jne tshm_re_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_re_fail:
+        mov rax, 0xFFFFED88;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_case_repl_cd_noarg() -> u64
+  //
+  // shell_repl_step("cd", 2) -> BI_ERR_CD_NO_ARG (0xFFFFECE1).
+  // This is the load-bearing end-to-end pipeline test that stays inside
+  // the pure-function surface: the input goes through lexer_tokenize
+  // (produces one WORD token "cd") -> parser_parse (produces one stage
+  // with argv "cd\0" argc=1) -> dispatch_line (matches "cd" by length
+  // gate + byte compare, calls bi_cd) -> bi_cd(argc=1) returns
+  // BI_ERR_CD_NO_ARG without touching sys_chdir. shell_repl_step
+  // propagates the code back to the caller.
+  //
+  // If shell_repl_step returns anything else:
+  //   - SR_OK             empty-line short-circuit misfired
+  //   - LX_ERR_*          lexer refused "cd"
+  //   - PR_ERR_*          parser refused the token stream
+  //   - BI_MISS           dispatch table missing "cd" (or length gate wrong)
+  //   - EX_ERR_*          fell through to the exec path (dispatch broken)
+  // ==========================================================================
+  pub let tshm_case_repl_cd_noarg : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-006 (#33): end-to-end pipeline test that stays inside the pure-function surface. `cd` (no arg) is a builtin that gates on argc<2 BEFORE reaching sys_chdir, so the full lex+parse+dispatch chain runs and the handler returns BI_ERR_CD_NO_ARG cleanly. If the chain breaks anywhere (short-circuit misfire, lex/parse reject, dispatch miss or lookup wrong, exec-path fallthrough), the sentinel visible in rax will not be 0xFFFFECE1. 2 pushes + sub 8 = 24 bytes prologue. Large-imm compare 0xFFFFECE1 stages via mov r11, imm64; cmp rax, r11. Uses _tshm_arg_cd (populated by tshm_reset) as the input buffer; passes length 2 which matches strlen(\"cd\"). Labels prefixed tshm_cd_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        // shell_repl_step(&_tshm_arg_cd, 2)
+        lea rdi, [rip + _tshm_arg_cd];
+        mov rsi, 2;
+        call shell_repl_step;
+
+        mov r11, 0xFFFFECE1;                 // BI_ERR_CD_NO_ARG
+        cmp rax, r11;
+        jne tshm_cd_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_cd_fail:
+        mov rax, 0xFFFFED89;
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tshm_run_all() -> u64
+  //
+  // Drive all 10 cases in issue order. Short-circuit on the first
+  // non-zero return.
+  //
+  // Prologue: 1 push (rbx) + `sub rsp, 8` = 16 bytes; rsp%16==0 for
+  // the nested case calls.
+  // ==========================================================================
+  pub let tshm_run_all : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.ENH-006 (#33): drive all 10 TestShellMain cases in fingerprint order (strlen, streq, str_prefix, argv_c, argv_nohist, argv_nocap, argv_script, argv_unknown, repl_empty, repl_cd_noarg). Short-circuit on first non-zero. Effect/cap set is the union of every case; the widest is {mem, sysreg} @{sched, mem, fs} (repl_empty / repl_cd_noarg inherit shell_repl_step's declared union). 1 push + sub 8 = 16 bytes prologue; rsp%16==0 at every nested case call. Labels prefixed tshm_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call tshm_case_strlen;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_streq;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_str_prefix;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_argv_c;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_argv_nohist;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_argv_nocap;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_argv_script;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_argv_unknown;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_repl_empty;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_repl_cd_noarg;
+
+      tshm_ra_out:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}

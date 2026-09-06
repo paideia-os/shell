@@ -1,14 +1,57 @@
 # shell
 
-Interactive shell for PaideiaOS — tokenizer + dispatcher + builtins.
+Interactive shell for PaideiaOS — tokenizer + dispatcher + builtins +
+REPL.
 
-> **v1.0.0 is a wire-format encoder suite. `shell` cannot execute a
-> command.** Zero syscall instructions in `src/`, and its declared
-> entry symbol (`Shell::shell_main`) is not defined anywhere in the
-> repository. See
+> **ENH-006 (#33) lands `Shell::shell_main` and the REPL.** The commit
+> that lands #33 is the first at which `shell` is a shell:
+> `src/shell.pdx` now defines the ELF entry (`shell_main`), the CLI
+> flag walker (`shell_argv_dispatch`) that recognises `-c` /
+> `--no-history` / `--no-cap:<KIND>` / positional `<script.pds>`, and
+> the one-line REPL (`shell_repl_step`) that runs lex -> parse ->
+> dispatch -> exec. `manifest.pdxproj` `kind` flips back to `tool`.
+> Two runtime gaps remain and are documented deferrals: ENH-007 (#34)
+> puts real bytes into `line_reader_read_line` (today it still
+> returns `LR_STUB`; shell_main treats that as EOF and exits cleanly)
+> and ENH-008 (#35) persists the in-memory history ring to
+> `~/.history/`. See
 > [`design/enhancement-plan.md`](design/enhancement-plan.md) §1 for
 > the grep-verified audit and §6 for why the release that first
 > executes a command is `v2.0`, not `v0.2` (shell#37 / ENH-010).
+
+## Synopsis
+
+```
+shell [-c <command>] [--no-history] [--no-cap:<KIND>] [<script.pds>]
+```
+
+## Options
+
+| Flag                 | Behaviour                                                                          |
+|----------------------|------------------------------------------------------------------------------------|
+| `-c <command>`       | Run `<command>` once through the REPL step then `sys_exit(0)`. Non-interactive.   |
+| `--no-history`       | Skip the `history_encode_record` append after each line (ring stays empty).       |
+| `--no-cap:<KIND>`    | Refuse to hand children the named `KIND` cap. Flag is remembered; the KIND parse + cap-narrowing hook lands with ENH-005+ wiring. |
+| `<script.pds>`       | Positional. Recorded in `_sm_opt_script_ptr`; `.pds` script execution lands with the `Pds` runtime wiring (M2-004 encoder is done, dispatcher hookup is future work). |
+
+Any other flag returns `SM_ERR_ARG_FLAG_UNKNOWN` (0xFFFFECF0), which
+`shell_main` maps to `shell: unknown flag\n` on stderr + `sys_exit(1)`.
+
+## Maturity
+
+The exec substrate is live (ENH-001 syscall floor, ENH-002 lexer,
+ENH-003 parser, ENH-004 builtins + dispatcher, ENH-005 real
+sys_execve + audit-first ShellCommandRecord, ENH-006 shell_main +
+REPL). The `line_reader_read_line` body remains an ENH-007 (#34)
+deferral -- today the reader returns `LR_STUB` on the happy path,
+which `shell_main` treats as EOF. This means an interactive prompt
+today prints `$ ` then exits cleanly; the moment #34 lands, the
+existing REPL body picks up real bytes without an edit. History
+persistence to `~/.history/` remains ENH-008 (#35) work; today the
+encoded HistoryEntry bytes are appended to an in-memory `.bss` ring
+so the encoder is exercised end-to-end from the REPL. Cross-repo
+linkage (shell → libpdx-cap / libpdx-audit / libpdx-semantic-pipe
+symbols) is ENH-009 (#36) work.
 
 ## Status
 
@@ -119,13 +162,16 @@ entries for the full v1.0.0 surface.
 
 The substrate this encoder half was waiting on (KIND_TTY, `sys_execve`
 with real argv/envp at R62, `sys_wait4`, `sys_chdir`/`sys_getcwd` at
-R86, PdxFS write) has since landed upstream in paideia-os. What has
-not landed is the code in *this* repo that calls any of it: no lexer,
-no parser, no builtin dispatch table, and no `Shell::shell_main` entry
-frame (declared in `manifest.pdxproj` since M1, never written). Wiring
-that up is the `v2.0 — real exec substrate` milestone
-([`design/enhancement-plan.md`](design/enhancement-plan.md)), separate
-from the R106 tokenizer/scaffold wave above.
+R86, PdxFS write) has since landed upstream in paideia-os. Wiring that
+substrate up in the shell repo is the
+`v2.0 — real exec substrate` milestone
+([`design/enhancement-plan.md`](design/enhancement-plan.md)); ENH-001..
+ENH-006 are landed as of the ENH-006 commit -- lexer, parser, builtin
+dispatch table, real exec, and the `Shell::shell_main` entry frame
+(declared in `manifest.pdxproj` since M1) now all exist. ENH-007
+(line reader body), ENH-008 (history persistence), and ENH-009
+(cross-repo linkage) remain open; this milestone is separate from the
+R106 tokenizer/scaffold wave above.
 
 ## License
 
