@@ -21,17 +21,26 @@
 > invoke is deferred behind the same seam until paideia-os#1986
 > lands `KIND_TTY_OP_READ`; see `design/architecture.md` §3.3.
 >
-> One runtime gap remains as a documented deferral rather than a
-> walk-back: ENH-008 (#35) persists the in-memory history ring to
-> `~/.history/<session>-<ts>.pdxhist` (today `shell_main` appends the
-> encoded HistoryEntry bytes to a `.bss` staging ring). The
-> paideia-os side needs a paired landing (add the `shell` satellite
-> as a submodule + wire `bin_seeds.pdx`) before the exec cutover
-> named in `design/roadmap/rows-4-5-6-scoping.md` §4.2 fires; that
-> paired landing is a paideia-os change, not a shell satellite
-> change. See `design/enhancement-plan.md` §1 for the original
-> grep-verified audit and §6 for why the release that first executes
-> a command is numbered `v2.0`, not `v0.2` (shell#37 / ENH-010).
+> **ENH-008 (#35) landed: the shell persists its history to disk.**
+> `shell_main` now opens `~/.history/<session>-<ts>.pdxhist` at
+> startup via `sys_open(O_WRONLY|O_CREAT|O_APPEND)` (guarded by
+> `--no-history`), drains the encoded HistoryEntry ring to disk via
+> `sys_write` after every REPL step, and closes the fd on EOF. The
+> R106.M1 persistent-home substrate (paideia-os #2228) is what the
+> writer sys_opens into. The `ts` argument is passed as `session_id`
+> twice today because no `sys_clock_read_ns` wrapper exists in the
+> SC+ floor at ENH-008 landing time; a one-line fix at the shell_main
+> call site lands when a clock syscall does. The paideia-os side
+> still needs a paired landing (add the `shell` satellite as a
+> submodule + wire `bin_seeds.pdx`) before the exec cutover named in
+> `design/roadmap/rows-4-5-6-scoping.md` §4.2 fires; that paired
+> landing is a paideia-os change, not a shell satellite change. The
+> reboot-persistence invariant ("run a command, reboot, observe the
+> record") is a runtime property proved by the paideia-os boot
+> smoke, not this repo. See `design/enhancement-plan.md` §1 for the
+> original grep-verified audit and §6 for why the release that first
+> executes a command is numbered `v2.0`, not `v0.2` (shell#37 /
+> ENH-010).
 
 **Current milestone:** R106 — shell scaffolding + tokenizer novel semantics
 **Version:** 0.1.0 (see `CHANGELOG.md`)
@@ -424,9 +433,11 @@ ENH-005 (#32), and now ENH-006 (#33) invalidate every bullet:
   manifest.pdxproj `kind` flips back to `tool`.**
 - `line_reader_read_line` now reads real bytes from fd 0 behind
   the `lr_read_one_byte` seam (ENH-007, #34) **LANDED at #34**;
-  `history_encode_record`'s bytes are never written to disk
-  (ENH-008, #35); the M3-002 tab-completion encoder has no registry
-  walk or tab-key binding behind it. **#35 remains open.**
+  `history_encode_record`'s bytes are drained to
+  `~/.history/<session>-<ts>.pdxhist` via `sys_write` after every
+  REPL step (ENH-008, #35) **LANDED at #35**; the M3-002
+  tab-completion encoder has no registry walk or tab-key binding
+  behind it (ENH-009, #36) — still open.
 - Cross-repo linkage (shell → libpdx-cap / libpdx-semantic-pipe /
   libpdx-audit symbols) — no build pulls all sides together yet.
   **Still open.**

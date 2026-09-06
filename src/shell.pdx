@@ -407,6 +407,22 @@ module Shell = structure {
   pub let mut _sm_hist_buf        : [u8; 8192] = uninit @align(16)
   pub let mut _sm_hist_used       : u64        = uninit @align(8)
 
+  // ENH-008 (#35): fd for the per-session ~/.history/<session>-<ts>
+  // .pdxhist journal file. Populated at shell_main startup via
+  // history_open_file (guarded by --no-history); consumed by
+  // history_persist_flush after every REPL step (drains _sm_hist_buf
+  // to disk) and closed by history_close_file on EOF. A value with
+  // the sign bit set (initialised to -1 == 0xFFFFFFFFFFFFFFFF via the
+  // startup path, or a returned HI_ERR_OPEN_FAIL == 0xFFFFEC63 on
+  // sys_open refusal) tells the flush/close helpers to no-op. This
+  // "invalid fd is silent" discipline lets an open failure (e.g. the
+  // persistent-home substrate hasn't landed yet) degrade to "shell
+  // still runs, history is not persisted" rather than "shell refuses
+  // to start". The persistent-home substrate proof lives in
+  // paideia-os boot smoke (paideia-os R106.M5 / R107.M1 pair), not
+  // here.
+  pub let mut _sm_hist_fd         : u64        = uninit @align(8)
+
   // ==========================================================================
   // rodata: prompt, newline, flag literals, error messages
   //
@@ -880,6 +896,38 @@ module Shell = structure {
         cmp rax, 0;
         jne sm_err_session;
 
+        // (4b) ENH-008 (#35): open the per-session history file, unless
+        // --no-history is set. On open failure we store the sentinel
+        // (raw HI_ERR_OPEN_FAIL, high bit set) in _sm_hist_fd and
+        // continue -- the flush/close helpers no-op on a bad fd, so
+        // the shell keeps running even if the persistent-home
+        // substrate has not landed yet. `ts` argument: no
+        // sys_clock_* wrapper exists in the SC+ floor today (grep
+        // of design/user/syscall-table.md returns no clock entry);
+        // per issue #35's deferral we pass session_id as `ts` too.
+        // When a clock syscall lands, only this call site changes.
+        lea r11, [rip + _sm_opt_no_history];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne sm_hist_open_skip;
+
+        mov rdi, 1;                          // session_id = SM_SESSION_ID
+        mov rsi, 1;                          // ts placeholder (== session_id)
+        call history_open_file;
+        // rax = fd (>=0) or HI_ERR_OPEN_FAIL (high bit set).
+        lea r11, [rip + _sm_hist_fd];
+        mov [r11], rax;
+        jmp sm_hist_open_done;
+
+      sm_hist_open_skip:
+        // --no-history set: store the -1 sentinel so flush + close
+        // no-op silently.
+        mov rax, 0xFFFFFFFFFFFFFFFF;
+        lea r11, [rip + _sm_hist_fd];
+        mov [r11], rax;
+
+      sm_hist_open_done:
+
         // (5) -c one-shot path.
         lea r11, [rip + _sm_opt_c_cmd_ptr];
         mov rdi, [r11];
@@ -890,6 +938,17 @@ module Shell = structure {
         lea r11, [rip + _sm_opt_c_cmd_len];
         mov rsi, [r11];
         call shell_repl_step;
+
+        // ENH-008 (#35): close the history fd before -c exit for
+        // symmetry with the interactive-mode EOF path. The -c path
+        // does not itself append to _sm_hist_buf today (history_encode_
+        // record is only reached from the interactive loop), so no
+        // flush is needed; a future -c "record the -c command in
+        // history" polish would call flush here before close.
+        lea r11, [rip + _sm_hist_fd];
+        mov rdi, [r11];
+        call history_close_file;
+
         xor rdi, rdi;
         call sys_exit;
         hlt;
@@ -973,10 +1032,27 @@ module Shell = structure {
         add rcx, rax;
         mov [r11], rcx;
 
+        // ENH-008 (#35): drain the ring to disk. history_persist_flush
+        // internally checks --no-history and fd validity, so we call
+        // unconditionally and ignore the return: a failed flush is
+        // silent-with-counter-bump today (SH_ST_ERRORS incremented by
+        // the flush's own reject path); a future error-surfacing polish
+        // can promote it to a user-visible message.
+        lea r11, [rip + _sm_hist_fd];
+        mov rdi, [r11];
+        call history_persist_flush;
+
       sm_hist_skip:
         jmp sm_repl_loop;
 
       sm_eof:
+        // ENH-008 (#35): close the history fd before exiting so the
+        // last-batch data reaches the filesystem cleanly. close_file
+        // no-ops on a bad fd; return code ignored.
+        lea r11, [rip + _sm_hist_fd];
+        mov rdi, [r11];
+        call history_close_file;
+
         // Trailing newline so the terminal cursor lands on a fresh line.
         mov rdi, 1;
         lea rsi, [rip + sm_nl_str];

@@ -127,6 +127,108 @@ module History = structure {
   pub let HIST_ERR_TRUNCATED  : u64 = 0xFFFFEC62
 
   // ==========================================================================
+  // Persistence sub-band 0xFFFFEC63..0xFFFFEC66 (ENH-008 / #35).
+  //
+  // Extends the History module's own 0xFFFFEC6x sub-band with the four
+  // sentinels the disk-writer path produces. Placed here (not in the
+  // 0xFFFFED0x band the issue text initially suggested) because
+  // 0xFFFFED0x is TestCapsNarrow's fail-code band -- a shell-layer
+  // sentinel cannot alias a test-driver's return without corrupting
+  // the boot-time smoke harness's decoder. The alternative wording in
+  // the same issue ("next free above line_reader's 0xFFFFEC1x") is the
+  // architecturally-correct choice: every shell layer sentinel lives
+  // in the 0xFFFFECxx band per design/architecture.md §5. Sub-band
+  // 6x is History's own; we extend it by three codes rather than
+  // burning a fresh sub-band.
+  //
+  //   HI_OK                    == 0 (also HIST_OK; --no-history skip
+  //                                    returns this)
+  //   HI_ERR_OPEN_FAIL         sys_open refused the path or the path
+  //                            format exceeded the buffer.
+  //   HI_ERR_WRITE_FAIL        sys_write returned <= 0 (negative errno
+  //                            or a zero-byte write we cannot loop on).
+  //   HI_ERR_CLOSE_FAIL        sys_close returned a negative errno.
+  //   HI_ERR_PATH_TOO_LONG     history_format_path's out_cap was too
+  //                            small to hold the composed path.
+  // ==========================================================================
+  pub let HI_OK                : u64 = 0
+  pub let HI_ERR_OPEN_FAIL     : u64 = 0xFFFFEC63
+  pub let HI_ERR_WRITE_FAIL    : u64 = 0xFFFFEC64
+  pub let HI_ERR_CLOSE_FAIL    : u64 = 0xFFFFEC65
+  pub let HI_ERR_PATH_TOO_LONG : u64 = 0xFFFFEC66
+
+  // ==========================================================================
+  // Persistence constants (ENH-008 / #35)
+  //
+  // HI_PATH_BUF_CAP: fixed cap for the .bss path scratch. 256 bytes
+  // is 2x the worst case: 70 (home) + 10 (/.history/) + 20 (session
+  // decimal, u64::MAX) + 1 (hyphen) + 20 (ts decimal) + 9 (.pdxhist\0)
+  // = 130 bytes. The extra head-room lets a future timestamp or
+  // fingerprint growth (real founder fp is a 64-hex-char fingerprint,
+  // same size as the placeholder today, but bump-proofing) stay in
+  // the same buffer.
+  //
+  // HI_O_* mirror src/kernel/core/fs/vfs_open.pdx bit values:
+  //   O_WRONLY = 0x01 (bit 0)
+  //   O_CREAT  = 0x40 (bit 6)
+  //   O_APPEND = 0x200 (bit 9)
+  //   Combined = 0x241 (write-only, create if absent, append at EOF).
+  //   Cross-referenced against src/user/dispatch.pdx:979 which uses
+  //   the identical mask for O_WRONLY|O_CREAT|O_APPEND.
+  //
+  // HI_O_MODE_0644 = 0x1A4 = 0o644 (owner rw, group r, other r). The
+  // mount-point access gate lives on the KIND_PDXFS_FILE(write) cap
+  // per design/user/content-addressed-identity.md §5; the mode bits
+  // are defence-in-depth for a future POSIX-shaped consumer, matching
+  // src/user/cp.pdx:259's dst-open mode.
+  // ==========================================================================
+  pub let HI_PATH_BUF_CAP : u64 = 256
+  pub let HI_O_FLAGS      : u64 = 0x241
+  pub let HI_O_MODE_0644  : u64 = 0x1A4
+
+  // ==========================================================================
+  // Placeholder home path (ENH-008 / #35)
+  //
+  // Mirrors paideia-os `FounderConstants::fc_placeholder_home_path`
+  // from src/user/founder_constants.pdx (R106.M1, paideia-os #2228).
+  // 70 bytes: "/home/deadbeef" + 60 zero-hex characters, matching the
+  // R106.M1 rootfs-seed shape `/home/<64-hex-fp>/`. The shell
+  // satellite is a standalone repo and does not link the monorepo's
+  // founder_constants.pdx; we mirror the byte pattern here with the
+  // module-header cross-reference pointing to the authoritative
+  // source. R108.M2 will replace the placeholder in the monorepo with
+  // the real founder fingerprint (SHAKE-256(pk)[0..32]); a paired
+  // update to this literal lands here at that time. Storage is 71
+  // bytes (70 chars + NUL); the wire copy uses the 70-byte length.
+  //
+  // hi_history_dir: the fixed "/.history/" component that separates
+  // the home root from the per-session journal file. 10 chars +
+  // trailing NUL (kept in storage per shell.pdx sm_prompt_str
+  // convention; the wire copy uses length 10 and skips the NUL).
+  //
+  // hi_ext: the ".pdxhist" file extension plus one trailing NUL byte
+  // that the caller writes verbatim as the string terminator. 9 bytes
+  // total (8-char extension + NUL); the wire copy uses length 9 so
+  // the resulting path buffer is NUL-terminated for sys_open.
+  // ==========================================================================
+  pub let hi_home_path     : [u8; 71] = "/home/deadbeef00000000000000000000000000000000000000000000000000000000\0"
+  pub let hi_home_path_len : u64      = 70
+
+  pub let hi_history_dir     : [u8; 11] = "/.history/\0"
+  pub let hi_history_dir_len : u64      = 10
+
+  pub let hi_ext     : [u8; 9] = ".pdxhist\0"
+  pub let hi_ext_len : u64     = 9
+
+  // ==========================================================================
+  // .bss path scratch. Composed by history_open_file via
+  // history_format_path; sys_open reads the resulting NUL-terminated
+  // bytes. Not exposed on any wire, but @align(16) so a future SIMD-
+  // widened memcpy stays cache-line friendly.
+  // ==========================================================================
+  pub let mut _hi_path_buf : [u8; 256] = uninit @align(16)
+
+  // ==========================================================================
   // Caller-visible output (singleton .bss)
   //
   // history_encode_record writes the number of bytes it appended to
@@ -356,6 +458,497 @@ module History = structure {
         pop r13;
         pop r12;
         pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // history_format_u64_dec(value, out_buf) -> u64
+  //
+  // Signature: history_format_u64_dec : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): value    -- u64 to render decimal
+  // RSI (input): out_buf  -- caller-owned scratch, at least 20 bytes
+  //                          (max u64 == 20 decimal chars). No NUL is
+  //                          written; the caller places any terminator
+  //                          separately.
+  // RAX (output): bytes written (1..20).
+  //
+  // Leaf helper. Uses the divide-by-10 loop shape from
+  // src/user/cp.pdx `cp_print_u64_dec`, but writes into a caller-owned
+  // buffer rather than emitting through sys_debug_puts. Zero is a
+  // special case: writes one '0' byte and returns 1. Otherwise the
+  // remainders are staged right-to-left into a 24-byte stack scratch
+  // (20 digits + 4-byte 16-B align pad), then copied MSB-first to
+  // out_buf so the caller sees a natural decimal reading. No syscall
+  // issues from this body; the sub-rsp 24 slot exists only for the
+  // reversed-digit scratch.
+  //
+  // Register plan (leaf modulo the sub-rsp scratch):
+  //   r9  = remaining value (drives the divide loop)
+  //   r10 = cursor into the reversed scratch (rsp+19 down to rsp)
+  //   rax = quotient / copy staging
+  //   rcx = divisor 10 / copy loop index
+  //   rdx = remainder / byte staging
+  // Labels prefixed hi_fu_.
+  // ==========================================================================
+  pub let history_format_u64_dec : (u64, u64) -> u64 !{mem} @{} =
+    fn (value: u64) (out_buf: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-008 (#35): u64 -> decimal ASCII into caller-owned buffer. Verbatim divide-by-10 loop shape from src/user/cp.pdx cp_print_u64_dec (itself a copy of init.pdx's reference implementation, R17-M2-736 D12 / #736), but emits to a caller buffer rather than sys_debug_puts. Zero special case writes single '0' and returns 1 without touching the stack (no sub rsp). Nonzero path: sub rsp, 24 gives a 20-digit scratch + 4-byte 16-B align pad; r9 holds the remainder, r10 the reversed-cursor at rsp+19 stepping down; each iteration computes rax:rdx = r9/10 via xor rdx,rdx; div rcx, converts rdx to ASCII, stores it at [r10] via `mov_b [r10], rdx` (byte store from rdx's low byte per the #1248 mitigation the tree uses -- see history_encode_record hs_er_pad's own mov_b [r12+rbx*1], rax pattern), then decrements the cursor. After the loop, length = (rsp+20) - r10 and the digits are copied MSB-first from [r10 .. r10+len) to [rsi .. rsi+len) via a byte-copy loop using the xor+mov_b load/store pair. Leaf modulo the stack scratch; no nested calls (no push/pop parity to preserve). Labels prefixed hi_fu_.",
+      block: {
+        // Zero special case: emit single '0', return 1.
+        cmp rdi, 0;
+        jne hi_fu_setup;
+        mov rax, 0x30;                       // '0'
+        mov_b [rsi], rax;
+        mov rax, 1;
+        ret;
+
+      hi_fu_setup:
+        sub rsp, 24;                         // 20-digit scratch + 4-byte pad
+        mov r9,  rdi;                        // r9 = remaining value
+        mov r10, rsp;
+        add r10, 19;                         // cursor at scratch[19] (rightmost)
+
+      hi_fu_div_loop:
+        mov rax, r9;
+        mov rcx, 10;
+        xor rdx, rdx;                        // zero-extend rdx:rax for div
+        div rcx;                             // rax = quotient, rdx = remainder
+        add rdx, 0x30;                       // remainder -> ASCII '0'..'9'
+        mov_b [r10], rdx;                    // store digit at cursor
+        mov r9, rax;                         // r9 = quotient
+        cmp r9, 0;
+        je  hi_fu_div_done;
+        sub r10, 1;                          // advance cursor left
+        jmp hi_fu_div_loop;
+
+      hi_fu_div_done:
+        // length = (rsp + 20) - r10
+        mov rax, rsp;
+        add rax, 20;
+        sub rax, r10;                        // rax = digit count
+
+        // Copy digits MSB-first from [r10, r10+rax) to [rsi, rsi+rax).
+        // rcx = copy index, rdx = byte staging.
+        xor rcx, rcx;
+      hi_fu_cp_head:
+        cmp rcx, rax;
+        jae hi_fu_cp_done;
+        xor rdx, rdx;
+        mov_b rdx, [r10 + rcx * 1];
+        mov_b [rsi + rcx * 1], rdx;
+        add rcx, 1;
+        jmp hi_fu_cp_head;
+      hi_fu_cp_done:
+
+        add rsp, 24;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // history_format_path(session_id, ts, out_buf, out_cap) -> u64
+  //
+  // Signature: history_format_path : (u64, u64, u64, u64) -> u64
+  //                                   !{mem} @{}
+  // RDI (input): session_id  -- session identifier (decimal-rendered)
+  // RSI (input): ts          -- boot-time timestamp (decimal-rendered).
+  //                              Per issue #35 substrate deferral: no
+  //                              sys_clock_* wrapper exists in the SC+
+  //                              floor today (grep of design/user/
+  //                              syscall-table.md returns no clock/tick
+  //                              entry), so shell_main passes session_id
+  //                              twice with a documented deferral. When
+  //                              a clock syscall lands, only the shell_
+  //                              main call site changes.
+  // RDX (input): out_buf     -- caller-owned buffer, NUL-terminated on
+  //                              return; passed to sys_open verbatim
+  // RCX (input): out_cap     -- bytes available at out_buf; must be
+  //                              >= 130 (worst case: 70 home + 10
+  //                              "/.history/" + 20 session-decimal +
+  //                              1 hyphen + 20 ts-decimal + 9
+  //                              ".pdxhist\\0")
+  // RAX (output): bytes written INCLUDING the trailing NUL on success;
+  //               HI_ERR_PATH_TOO_LONG on out_buf==0 || out_cap<130.
+  //
+  // Composed path shape:
+  //   "/home/<64-hex-founder-fp>/.history/<session>-<ts>.pdxhist\0"
+  //
+  // The 64-hex-founder-fp is the R106.M1 placeholder (see hi_home_path
+  // docstring). No format string interpretation; the composition is
+  // three fixed byte-copy loops + two decimal renders + one hyphen +
+  // one NUL.
+  //
+  // Register plan (5 callee-save pushes + `sub rsp, 8` = 48 bytes
+  // prologue; rsp % 16 == 0 at every nested SysV call to
+  // history_format_u64_dec):
+  //   rbx = session_id save
+  //   r12 = ts save
+  //   r13 = out_buf save
+  //   r14 = cursor (bytes written so far)
+  //   r15 = out_cap save
+  // Labels prefixed hi_fp_.
+  // ==========================================================================
+  pub let history_format_path : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (session_id: u64) (ts: u64) (out_buf: u64) (out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-008 (#35): compose the per-session history path bytes without invoking any syscall. Byte layout: `/home/<placeholder-fp>/.history/<session-dec>-<ts-dec>.pdxhist\\0`. The placeholder fp mirrors paideia-os FounderConstants::fc_placeholder_home_path (src/user/founder_constants.pdx R106.M1 / #2228); the shell satellite is standalone and does not link that module, so the byte pattern is duplicated in hi_home_path with a docstring cross-reference. R108.M2 will retire the placeholder in the monorepo; a paired update to hi_home_path lands here. Gate: out_cap must be >= 130 (worst case for u64::MAX session_id AND ts); out_buf must be non-null. Composition sequence: (1) inline byte copy hi_home_path[0..70]; (2) inline byte copy hi_history_dir[0..10]; (3) call history_format_u64_dec(session_id, out_buf+cursor) returning digit count; (4) write '-' (0x2D) byte; (5) call history_format_u64_dec(ts, out_buf+cursor); (6) inline byte copy hi_ext[0..9] (\".pdxhist\" + \\0). Total return length is variable but bounded at 130. Byte loads via `xor rax, rax; mov_b rax, [ptr + idx*1]` per #1248 (with explicit *1 scale to dodge U1606); byte stores via `mov_b [ptr + idx*1], rax`. Both format_u64_dec calls are nested SysV calls; the 5 callee-save pushes + sub rsp, 8 = 48 bytes give rsp%16==0 at both call sites. r15 (out_cap) is unused after the gate but kept in the register plan for symmetry with the other 5-push module functions. Labels prefixed hi_fp_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // session_id
+        mov r12, rsi;                        // ts
+        mov r13, rdx;                        // out_buf
+        mov r15, rcx;                        // out_cap
+
+        // Gate: out_buf non-null.
+        cmp r13, 0;
+        je  hi_fp_too_long;
+        // Gate: out_cap >= 130.
+        cmp r15, 130;
+        jb  hi_fp_too_long;
+
+        xor r14, r14;                        // cursor = 0
+
+        // (1) Copy hi_home_path[0..70] to out_buf[0..70].
+      hi_fp_home_head:
+        cmp r14, 70;
+        jae hi_fp_home_done;
+        lea r11, [rip + hi_home_path];
+        xor rax, rax;
+        mov_b rax, [r11 + r14 * 1];
+        mov_b [r13 + r14 * 1], rax;
+        add r14, 1;
+        jmp hi_fp_home_head;
+      hi_fp_home_done:
+
+        // (2) Copy hi_history_dir[0..10] to out_buf[70..80].
+        xor rcx, rcx;                        // local index
+      hi_fp_hist_head:
+        cmp rcx, 10;
+        jae hi_fp_hist_done;
+        lea r11, [rip + hi_history_dir];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        mov_b [r13 + r14 * 1], rax;
+        add r14, 1;
+        add rcx, 1;
+        jmp hi_fp_hist_head;
+      hi_fp_hist_done:
+
+        // (3) Format session_id decimal at out_buf + cursor.
+        mov rdi, rbx;
+        mov rsi, r13;
+        add rsi, r14;
+        call history_format_u64_dec;
+        add r14, rax;
+
+        // (4) Append '-' byte.
+        mov rax, 0x2D;                       // '-'
+        mov_b [r13 + r14 * 1], rax;
+        add r14, 1;
+
+        // (5) Format ts decimal at out_buf + cursor.
+        mov rdi, r12;
+        mov rsi, r13;
+        add rsi, r14;
+        call history_format_u64_dec;
+        add r14, rax;
+
+        // (6) Copy hi_ext[0..9] to out_buf + cursor (includes NUL).
+        xor rcx, rcx;
+      hi_fp_ext_head:
+        cmp rcx, 9;
+        jae hi_fp_ext_done;
+        lea r11, [rip + hi_ext];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        mov_b [r13 + r14 * 1], rax;
+        add r14, 1;
+        add rcx, 1;
+        jmp hi_fp_ext_head;
+      hi_fp_ext_done:
+
+        // Return cursor (bytes written including terminating NUL).
+        mov rax, r14;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hi_fp_too_long:
+        mov rax, 0xFFFFEC66;                 // HI_ERR_PATH_TOO_LONG
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // history_open_file(session_id, ts) -> u64
+  //
+  // Signature: history_open_file : (u64, u64) -> u64 !{mem, sysreg}
+  //                                                @{fs}
+  // RDI (input): session_id  -- forwarded to history_format_path
+  // RSI (input): ts          -- forwarded to history_format_path
+  // RAX (output): fd (>= 0) on success; HI_ERR_OPEN_FAIL on sys_open
+  //               refusal or path-format overflow.
+  //
+  // Composes the per-session history path into _hi_path_buf, then
+  // sys_open's it with O_WRONLY|O_CREAT|O_APPEND, mode 0644. On
+  // success returns the raw fd (a small non-negative integer); on
+  // failure returns HI_ERR_OPEN_FAIL (a shell-layer sentinel with
+  // its high bit set, so a signed compare `cmp rax, 0; jl` at the
+  // caller treats it as "invalid fd" without a dedicated compare
+  // against the sentinel value).
+  //
+  // The child-cap non-propagation invariant per caps.decl: the shell
+  // holds KIND_PDXFS_FILE(write) narrowed to its own ~/.history/
+  // subtree; children never receive this cap because
+  // session_derive_subcap (src/session.pdx:287) only mints KIND_SHELL_
+  // SESSION sub-caps with SS_RIGHTS_CHILD (0x3 = read | write, no
+  // mint), never a KIND_PDXFS_FILE cap of any shape. The
+  // history-write authority is per-shell state, not per-session
+  // state; the derivation surface does not touch it.
+  //
+  // Register plan: 1 callee-save push (rbx = session_id save) + 8-byte
+  // ret-addr = 16-byte aligned. sub rsp, 8 balances rsp%16 to 0 for
+  // the nested SysV calls (history_format_path and sys_open).
+  // ==========================================================================
+  pub let history_open_file : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (session_id: u64) (ts: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35): compose the per-session history path into _hi_path_buf and sys_open it O_WRONLY|O_CREAT|O_APPEND with mode 0644. The R106.M1 persistent-home substrate (paideia-os #2228) has published the /home/<placeholder-fp>/ subtree; the shell writes to its own ~/.history/ under that tree. Path format helper history_format_path is called first; on HI_ERR_PATH_TOO_LONG (0xFFFFEC66 > 0x7FFFFFFF) the compare against r11-staged sentinel routes to HI_ERR_OPEN_FAIL. Open flags 0x241 = O_WRONLY(0x01) | O_CREAT(0x40) | O_APPEND(0x200) match vfs_open.pdx and src/user/dispatch.pdx:979's identical mask. Mode 0x1A4 = 0o644 matches src/user/cp.pdx:259 dst-open mode. sys_open returns fd (>=0) or negative errno; the signed compare `cmp rax, 0; jl` routes negative returns to HI_ERR_OPEN_FAIL. On happy path, returns the raw fd (a small non-negative integer that the caller can store in a .bss slot and use as a subsequent sys_write argument). Prologue: 2 callee-save pushes (rbx = session_id save, r12 = ts save) + sub rsp, 8 = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 at every nested SysV call. On error path, bumps SH_ST_ERRORS via shell_note per the same discipline as history_encode_record's reject paths. Labels prefixed hi_of_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // session_id
+        mov r12, rsi;                        // ts
+
+        // Format path into _hi_path_buf.
+        mov rdi, rbx;
+        mov rsi, r12;
+        lea rdx, [rip + _hi_path_buf];
+        mov rcx, 256;
+        call history_format_path;
+        // rax = bytes written (incl NUL) or HI_ERR_PATH_TOO_LONG.
+
+        // Reject on HI_ERR_PATH_TOO_LONG (0xFFFFEC66 > 0x7FFFFFFF).
+        mov r11, 0xFFFFEC66;
+        cmp rax, r11;
+        je  hi_of_fail;
+
+        // sys_open(_hi_path_buf, 0x241, 0x1A4).
+        lea rdi, [rip + _hi_path_buf];
+        mov rsi, 0x241;                      // O_WRONLY|O_CREAT|O_APPEND
+        mov rdx, 0x1A4;                      // mode 0644
+        call sys_open;
+        // rax = fd (>=0) or negative errno.
+
+        cmp rax, 0;
+        jl  hi_of_fail;                      // negative errno
+
+        // Success: return raw fd.
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      hi_of_fail:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC63;                 // HI_ERR_OPEN_FAIL
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // history_persist_flush(fd) -> u64
+  //
+  // Signature: history_persist_flush : (u64) -> u64 !{mem, sysreg}
+  //                                              @{fs}
+  // RDI (input): fd  -- the fd returned by history_open_file, or any
+  //                     negative value (treated as an invalid fd,
+  //                     silent no-op). Negative here means the sign
+  //                     bit is set; both -1 (all ones) and
+  //                     HI_ERR_OPEN_FAIL (0xFFFFEC63) qualify.
+  // RAX (output): HI_OK on success (or no-op paths: --no-history set,
+  //               ring empty, fd invalid); HI_ERR_WRITE_FAIL if any
+  //               sys_write returned <= 0 (negative errno or a zero-
+  //               byte write that would spin the retry loop forever).
+  //
+  // Drains the accumulated bytes in Shell::_sm_hist_buf[0.._sm_hist_
+  // used) to the caller's fd via a partial-write retry loop, then
+  // resets _sm_hist_used to 0 on success. On failure the ring is NOT
+  // reset -- the shell's next flush attempt will retry the whole
+  // buffer (with any new bytes appended after the last successful
+  // flush). This matches the POSIX partial-write semantic: a short
+  // write is not a failure per se, but a zero-byte or negative-errno
+  // return signals the transport is stuck and further attempts on
+  // the same fd are unlikely to make progress -- so we refuse rather
+  // than spin.
+  //
+  // Skip conditions (all return HI_OK):
+  //   1. _sm_opt_no_history != 0  -- the --no-history flag was set.
+  //      The flush is a no-op even if _sm_hist_used is non-zero (a
+  //      test may pre-populate the ring; shell_main will not).
+  //   2. _sm_hist_used == 0       -- nothing to write.
+  //   3. fd < 0                    -- invalid fd (open failed or was
+  //                                   never called).
+  //
+  // Register plan (3 callee-save pushes + `sub rsp, 8` = 32 bytes
+  // prologue; rsp%16==0 at every nested SysV call):
+  //   r12 = fd
+  //   r13 = total bytes to write (from _sm_hist_used at entry)
+  //   r14 = bytes written so far
+  // Labels prefixed hi_pf_.
+  // ==========================================================================
+  pub let history_persist_flush : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35): drain Shell::_sm_hist_buf[0.._sm_hist_used) to fd via sys_write with partial-write retry. --no-history skip is checked first so a test that pre-populates the ring while _sm_opt_no_history == 1 still gets a no-op HI_OK. Ring-empty check second so a test with fd=-1 and empty ring returns HI_OK cleanly (no sys_write attempt against a bad fd). fd < 0 (signed compare, catches all-ones and any 0xFFFFECxx sentinel with the sign bit set) third; a bad fd with a non-empty ring is a shell startup issue (open failed but bytes accumulated), documented but preserved for future replay if a subsequent open succeeds. Write loop: bytes_left = r13 - r14; sys_write(r12, _sm_hist_buf + r14, bytes_left); on rax <= 0 (signed jle) refuse with HI_ERR_WRITE_FAIL; on partial rax > 0 add to r14 and loop. POSIX partial-write semantic per src/kernel/core/syscall/handlers/sys_write.pdx (returns bytes written, which may be less than count on a short write to a pipe/socket; regular files typically write in full). Reset _sm_hist_used = 0 only on the success path so a failed flush preserves the ring for the next attempt. Prologue: 3 callee-save pushes (r12 fd, r13 total, r14 written) + sub rsp, 8 = 32 bytes; entry rsp%16==8 + 32 = rsp%16==0 at every nested SysV call. Reaches into Shell::_sm_opt_no_history, Shell::_sm_hist_buf, and Shell::_sm_hist_used via `lea r11, [rip + <sym>]` -- these are pub let mut singletons resolved by the linker at their global symbol names (same discipline as history_bytes_written's own lea r11 reach in history_encode_record). Labels prefixed hi_pf_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // fd
+
+        // Skip if --no-history is set.
+        lea r11, [rip + _sm_opt_no_history];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne hi_pf_ok;
+
+        // Load total bytes to write from _sm_hist_used.
+        lea r11, [rip + _sm_hist_used];
+        mov r13, [r11];
+
+        // Skip if ring is empty.
+        cmp r13, 0;
+        je  hi_pf_ok;
+
+        // Skip if fd is invalid (signed jl catches -1 and any
+        // 0xFFFFECxx sentinel with the sign bit set).
+        cmp r12, 0;
+        jl  hi_pf_ok;
+
+        xor r14, r14;                        // written = 0
+
+      hi_pf_loop:
+        // Loop termination via `written >= total` (unsigned jae). The
+        // `cmp reg, reg` form dodges any subtract-wraparound edge if
+        // sys_write ever returned more bytes than requested (impossible
+        // per POSIX but defensive).
+        cmp r14, r13;
+        jae hi_pf_done;
+
+        // bytes_left = r13 - r14 (r14 < r13 here, so no wrap)
+        mov rdx, r13;
+        sub rdx, r14;
+
+        // sys_write(fd, _sm_hist_buf + written, bytes_left)
+        mov rdi, r12;
+        lea r11, [rip + _sm_hist_buf];
+        add r11, r14;
+        mov rsi, r11;
+        // rdx already = bytes_left
+        call sys_write;
+        // rax = bytes written or negative errno.
+
+        // Fail on rax <= 0 (negative errno or zero-byte write).
+        cmp rax, 0;
+        jle hi_pf_write_fail;
+
+        // written += rax
+        add r14, rax;
+        jmp hi_pf_loop;
+
+      hi_pf_done:
+        // Reset _sm_hist_used = 0 on success.
+        xor rax, rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+
+      hi_pf_ok:
+        xor rax, rax;                        // HI_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      hi_pf_write_fail:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC64;                 // HI_ERR_WRITE_FAIL
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // history_close_file(fd) -> u64
+  //
+  // Signature: history_close_file : (u64) -> u64 !{sysreg} @{fs}
+  // RDI (input): fd  -- fd from history_open_file, or any negative
+  //                     value (no-op, treated as invalid).
+  // RAX (output): HI_OK on success (or fd invalid); HI_ERR_CLOSE_FAIL
+  //               on sys_close negative errno.
+  //
+  // Register plan: sub rsp, 8 aligns rsp%16==0 for the nested sys_close
+  // call. No callee-save pushes; fd arrives in rdi and is consumed
+  // in-place by the sys_close wrapper.
+  // ==========================================================================
+  pub let history_close_file : (u64) -> u64 !{sysreg} @{fs} =
+    fn (fd: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35): sys_close wrapper for the history fd. Signed-jl check on fd catches -1 (never opened) and any 0xFFFFECxx sentinel (open failed with the sign bit set); a bad fd is a no-op HI_OK, not an error. sys_close returns 0 or negative errno per src/kernel/core/syscall/handlers/sys_close.pdx; the signed compare `cmp rax, 0; jl` routes negative returns to HI_ERR_CLOSE_FAIL. On error, bumps SH_ST_ERRORS via shell_note per the same discipline as the other reject paths in this module. Prologue: sub rsp, 8 aligns rsp%16==0 for the nested sys_close call (entry rsp%16==8 + 8 = 16). No callee-save pushes needed; fd flows through rdi (SysV arg0) directly into sys_close. Effect set trimmed to {sysreg} (sys_close does not touch user memory on the kernel side, matching Syscall.sys_close's own !{sysreg} declaration). Labels prefixed hi_cf_.",
+      block: {
+        sub rsp, 8;
+
+        // Skip if fd is invalid.
+        cmp rdi, 0;
+        jl  hi_cf_ok;
+
+        call sys_close;
+        // rax = 0 or negative errno.
+
+        cmp rax, 0;
+        jl  hi_cf_fail;
+
+      hi_cf_ok:
+        xor rax, rax;                        // HI_OK
+        add rsp, 8;
+        ret;
+
+      hi_cf_fail:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC65;                 // HI_ERR_CLOSE_FAIL
+        add rsp, 8;
         ret
       }
     }

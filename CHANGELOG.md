@@ -4,6 +4,146 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-008: history persist to disk (#35)
+
+`history_encode_record`'s wire bytes now reach the filesystem. The
+shell opens `~/.history/<session>-<ts>.pdxhist` at startup via
+`sys_open(O_WRONLY|O_CREAT|O_APPEND, 0644)` (guarded by
+`--no-history`), drains the encoded HistoryEntry ring to disk via a
+`sys_write` partial-write retry loop after every REPL step, and
+closes the fd on EOF. The R106.M1 persistent-home substrate
+(paideia-os #2228) is what the writer sys_opens into. Runtime
+persistence proof (reboot-across boundary) is a paideia-os boot
+smoke; the shell repo's local tests verify the writer path
+assembles correctly against the encoder's golden bytes.
+
+### Added
+
+- `src/history.pdx` `HI_OK` (0) + `HI_ERR_OPEN_FAIL` (0xFFFFEC63)
+  + `HI_ERR_WRITE_FAIL` (0xFFFFEC64) + `HI_ERR_CLOSE_FAIL`
+  (0xFFFFEC65) + `HI_ERR_PATH_TOO_LONG` (0xFFFFEC66). Extends the
+  History module's own 0xFFFFEC6x sub-band (the initial issue text
+  proposed 0xFFFFED0x, but that band belongs to TestCapsNarrow —
+  aliasing a test-driver's return with a shell-layer sentinel would
+  corrupt the boot-time smoke's decoder; the "next free above line
+  reader's 0xFFFFEC1x" alternative in the same issue is the
+  architecturally-correct choice, and every occupied sub-band except
+  6x is fully allocated).
+- `src/history.pdx` `hi_home_path` — 70-byte placeholder home path
+  literal `/home/deadbeef00...000000` mirroring paideia-os
+  `FounderConstants::fc_placeholder_home_path` (R106.M1 / #2228).
+  The shell satellite is standalone and does not link the monorepo's
+  `founder_constants.pdx`; the byte pattern is duplicated with a
+  docstring cross-reference. R108.M2 will retire the placeholder in
+  the monorepo with a paired update here.
+- `src/history.pdx` `hi_history_dir` (`/.history/`) + `hi_ext`
+  (`.pdxhist\0`) — the fixed path components appended to the home
+  path.
+- `src/history.pdx` `_hi_path_buf : [u8; 256]` — .bss scratch for
+  the composed sys_open path. Aligned @16 for a future SIMD-widened
+  memcpy.
+- `src/history.pdx` `history_format_u64_dec(value, out_buf) -> u64`
+  — leaf helper writing a u64 as decimal ASCII to a caller-owned
+  buffer. Verbatim divide-by-10 loop shape from `cp_print_u64_dec`,
+  but emits to a buffer rather than sys_debug_puts.
+- `src/history.pdx` `history_format_path(session_id, ts, out_buf,
+  out_cap) -> u64` — composes the per-session path bytes
+  `/home/<placeholder-fp>/.history/<session>-<ts>.pdxhist\0` into
+  the caller's buffer. Returns the length (including NUL) or
+  `HI_ERR_PATH_TOO_LONG` on out_cap overflow. Cap gate requires
+  `out_cap >= 130` (u64::MAX worst case).
+- `src/history.pdx` `history_open_file(session_id, ts) -> u64` —
+  composes the path into `_hi_path_buf` and calls
+  `sys_open(O_WRONLY|O_CREAT|O_APPEND, 0644)`. Returns fd (>=0) or
+  `HI_ERR_OPEN_FAIL` (sign bit set so a caller's
+  `cmp rax, 0; jl` treats it as invalid fd).
+- `src/history.pdx` `history_persist_flush(fd) -> u64` — drains
+  `Shell::_sm_hist_buf[0.._sm_hist_used)` to fd via a partial-write
+  retry loop, then resets `_sm_hist_used = 0` on success. Skips
+  silently on `--no-history`, on an empty ring, and on an invalid
+  fd. Refuses with `HI_ERR_WRITE_FAIL` when `sys_write` returns
+  `<= 0`.
+- `src/history.pdx` `history_close_file(fd) -> u64` — thin
+  `sys_close` wrapper. No-ops on an invalid fd.
+- `src/shell.pdx` `_sm_hist_fd : u64` — .bss slot for the history
+  fd. Populated at shell_main startup via `history_open_file`
+  (guarded by `--no-history`), consumed by
+  `history_persist_flush` after every REPL step, and closed by
+  `history_close_file` on EOF.
+- `tests/test_history.pdx` `TestHistory` module. Seven offline
+  cases in the `0xFFFFEDAx` fail band:
+  `thi_case_format_u64_zero`, `thi_case_format_u64_multi`,
+  `thi_case_open_path_format` (verifies the composed bytes for
+  session=1, ts=42 at every region boundary + NUL terminator),
+  `thi_case_flush_no_history`, `thi_case_flush_ring_empty`,
+  `thi_case_flush_fd_invalid`, `thi_case_close_fd_invalid`. Umbrella
+  `thi_run_all`. The runtime write matrix (real sys_open + sys_write
+  + sys_close against a live filesystem) is deferred to the
+  paideia-os boot smoke — the shell repo cannot boot itself and
+  paideia-as does not carry conditional compilation for a mock-shim
+  redirect.
+- `manifest.pdxproj` — registered `tests/test_history.pdx`.
+
+### Changed
+
+- `src/shell.pdx` `shell_main` — after `session_mint` succeeds,
+  the entry frame now checks `_sm_opt_no_history`; if unset, it
+  calls `history_open_file(1, 1)` (session_id placeholder twice
+  today — no `sys_clock_read_ns` wrapper exists in the SC+ floor;
+  documented deferral) and stores the raw return in `_sm_hist_fd`.
+  On `--no-history` the sentinel `-1` (all-ones) is stored so
+  subsequent flush and close calls no-op. The interactive REPL
+  loop now calls `history_persist_flush(_sm_hist_fd)` after the
+  in-memory ring advance (encoder + `_sm_hist_used += bytes`)
+  drains those bytes to disk. Both interactive-mode EOF and `-c`
+  exit paths call `history_close_file(_sm_hist_fd)` before
+  `sys_exit` for graceful shutdown.
+- `caps.decl` — the `KIND_PDXFS_FILE(write)` comment walks back
+  the "shell.M2-005" narrative to name ENH-008 as the landing that
+  wires the runtime write path, and adds the explicit
+  child-cap-non-propagation verification (verified against
+  `src/session.pdx::session_derive_subcap`: sub-caps carry
+  `SS_RIGHTS_CHILD = 0x3` read+write and never a
+  `KIND_PDXFS_FILE` cap of any shape).
+- `design/architecture.md` §4b.4 — retitled from "Substrate
+  deferral (PdxFS write)" to "Substrate wiring (PdxFS write) —
+  landed at ENH-008 (#35)". Walk-back paragraph corrects two
+  errors in the original M2 note: the transport is `sys_write` on
+  a `KIND_PDXFS_FILE` fd (not `sys_ipc_send` to a broker; no
+  `svc.pdxfs-journal` broker exists in the paideia-os tree), and
+  the userspace-write path IS wired now. Documents the four new
+  functions, the timestamp deferral, and the reboot-persistence
+  proof that lives in the paideia-os boot harness.
+- `design/architecture.md` §5 — the return-code band table adds
+  the four `HI_ERR_*` sentinels under the History module block.
+- `STATUS.md` — the "One runtime gap remains" paragraph walks
+  back to "**ENH-008 (#35) landed: the shell persists its history
+  to disk.**" and the M1 walk-back's ENH-008 bullet flips from
+  "still open" to "LANDED at #35". The paideia-os paired landing
+  (submodule + `bin_seeds.pdx` wiring) is preserved as a separate
+  paideia-os-side gap.
+
+### Deferred
+
+- Timestamp source. No `sys_clock_read_ns` wrapper exists in the
+  SC+ floor at ENH-008 landing time; the `ts` argument is passed
+  as `session_id` twice with a documented one-line fix at the
+  shell_main call site when a clock syscall lands. The wire
+  format still carries the ts field verbatim from the encoder's
+  input, so the schema is stable.
+- Live-kernel partial-write retry test. Verifying the retry loop
+  in `history_persist_flush` requires mocking `sys_write` to
+  return a short-write count; paideia-as does not carry
+  conditional compilation for a function-pointer redirect. The
+  retry loop's structural correctness is proved by inspection in
+  the flush's justification block; a live-kernel test lands with
+  the boot-time smoke harness alongside the reboot-persistence
+  proof.
+- Reboot-persistence proof. The invariant "run a command, reboot,
+  observe the record" requires a live kernel plus persistent-home
+  substrate. paideia-os R106.M5 / R107.M1 provide that substrate;
+  the boot smoke asserts the invariant, not this repo.
+
 ## Unreleased — ENH-007: line reader real bytes (#34)
 
 The `LR_STUB = 0xFFFFEC10` tail of `line_reader_read_line` is retired.

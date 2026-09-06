@@ -1121,15 +1121,76 @@ mask).
 
 All three are fail-fast — `dst` is not touched on reject.
 
-### 4b.4 Substrate deferral (PdxFS write)
+### 4b.4 Substrate wiring (PdxFS write) — landed at ENH-008 (#35)
 
-The M2 module builds the wire bytes; the M3+ substrate wiring appends
-them to `~/.history/<session>-<ts>.pdxhist` via
-`sys_ipc_send(svc.pdxfs-journal, encoded_bytes)`. PdxFS v1 has landed
-`KIND_PDXFS_FILE` at HEAD (paideia-os R42 scaffold, commits `411ad0e`
-/ `2ff76d4`), but the userspace-write path is not wired in the shell
-repo at HEAD. Same discipline as `LineReader` / `Exec`: build the
-pure logic at M2, defer the substrate boundary to M3+.
+**Walk-back of the M2 deferral.** The paragraph above used to read
+"the M2 module builds the wire bytes; the M3+ substrate wiring
+appends them to `~/.history/<session>-<ts>.pdxhist` via
+`sys_ipc_send(svc.pdxfs-journal, encoded_bytes)`." That framing
+carried two errors, both corrected by ENH-008 (#35):
+
+1. **The transport is `sys_write` on a `KIND_PDXFS_FILE` fd, not
+   `sys_ipc_send` to a broker.** PdxFS v1 exposes the file-backed
+   write path directly through the SC+ floor (sysno 1) — the R42
+   scaffold's `kind_pdxfs_file.pdx` is what a `sys_open` cap-narrows
+   over. There is no `svc.pdxfs-journal` broker in the paideia-os
+   tree; the M2 justification cited one but no such service exists.
+2. **The userspace-write path is wired.** The shell repo's own
+   `Syscall` module (ENH-001, #28) has `sys_open` / `sys_write` /
+   `sys_close` wrappers; `caps.decl` already requests
+   `KIND_PDXFS_FILE(write)`; the R106.M1 persistent-home substrate
+   (paideia-os #2228) has published the `/home/<placeholder-fp>/`
+   subtree that a user-space writer can sys_open into. Nothing was
+   missing except the writer path in this repo.
+
+**ENH-008 (#35) landing.** `src/history.pdx` adds four functions
+that together de-stub persistence:
+
+- `history_format_u64_dec(value, out_buf) -> u64` — leaf helper
+  writing a u64 as decimal ASCII into a caller-owned buffer.
+- `history_format_path(session_id, ts, out_buf, out_cap) -> u64` —
+  composes the per-session path bytes
+  `/home/<placeholder-fp>/.history/<session>-<ts>.pdxhist\0` into
+  the caller's buffer, returning the length (including NUL) or
+  `HI_ERR_PATH_TOO_LONG` on out_cap overflow.
+- `history_open_file(session_id, ts) -> u64` — composes the path
+  into a module-owned `.bss` scratch (`_hi_path_buf`) and issues
+  `sys_open(path, O_WRONLY|O_CREAT|O_APPEND, 0644)`. Returns the fd
+  on success (a small non-negative integer) or `HI_ERR_OPEN_FAIL`
+  (sentinel with the sign bit set, so `cmp rax, 0; jl` at the
+  caller treats it as "invalid fd").
+- `history_persist_flush(fd) -> u64` — drains
+  `Shell::_sm_hist_buf[0.._sm_hist_used)` to fd via a partial-write
+  retry loop, then resets `_sm_hist_used = 0` on success. Skips
+  silently on `--no-history`, on an empty ring, and on an invalid
+  fd — each returning `HI_OK`. Refuses with `HI_ERR_WRITE_FAIL`
+  when `sys_write` returns `<= 0` (negative errno or a zero-byte
+  write that would spin the retry loop).
+- `history_close_file(fd) -> u64` — thin `sys_close` wrapper.
+  No-ops on an invalid fd.
+
+`shell_main` opens the file after `session_mint` (guarded by
+`--no-history`, storing `HI_FD_INVALID = -1` as a sentinel when
+skipped), calls `history_persist_flush(_sm_hist_fd)` after every
+`history_encode_record` in the REPL loop, and calls
+`history_close_file(_sm_hist_fd)` on EOF (both interactive and
+`-c` paths).
+
+**Timestamp deferral.** The SC+ floor does not carry a
+`sys_clock_read_ns` wrapper at ENH-008 landing time (grep of
+`design/user/syscall-table.md` returns no clock entry). The `ts`
+argument is passed as `session_id` twice today with a documented
+deferral; the fix is a one-line change at the `shell_main`
+call site when a clock syscall lands.
+
+**Reboot-persistence proof.** The invariant "run a command, reboot,
+observe the record" is a runtime property that requires a live
+kernel plus persistent-home substrate. paideia-os R106.M5 / R107.M1
+provide that substrate; the boot smoke asserts the persistence
+invariant, not this repo. The shell satellite's local tests
+(`test_history.pdx::thi_run_all`) prove the writer path assembles
+correctly against the encoder's golden bytes; the reboot proof
+lives in the paideia-os boot harness.
 
 ### 4b.5 caps.decl amendment
 
@@ -1351,6 +1412,10 @@ the smoke matrix pulls both sides into one build.
 0xFFFFEC60  HIST_ERR_BAD_ARGS   History.M2: dst == 0 or cmd_ptr == 0
 0xFFFFEC61  HIST_ERR_TOO_LONG   History.M2: cmd_len > HIST_CMD_MAX
 0xFFFFEC62  HIST_ERR_TRUNCATED  History.M2: dst_len < required
+0xFFFFEC63  HI_ERR_OPEN_FAIL    History.ENH-008: sys_open refused or path overflow
+0xFFFFEC64  HI_ERR_WRITE_FAIL   History.ENH-008: sys_write <= 0 (negative errno or short-loop)
+0xFFFFEC65  HI_ERR_CLOSE_FAIL   History.ENH-008: sys_close returned negative errno
+0xFFFFEC66  HI_ERR_PATH_TOO_LONG History.ENH-008: out_cap < required path length
 0xFFFFEC70  PP_ERR_BAD_ARGS     PipePassthrough.M3: src/dst null or src_len<8
 0xFFFFEC71  PP_ERR_TRUNCATED    PipePassthrough.M3: src_len < 8+payload_len
 0xFFFFEC72  PP_ERR_DST_OVERFLOW PipePassthrough.M3: dst_max < 8+payload_len

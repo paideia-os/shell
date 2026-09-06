@@ -31,11 +31,22 @@
 #   * KIND_PDXFS_FILE(write) (0x195, paideia-os
 #     src/kernel/core/cap/kind_pdxfs_file.pdx, R42 scaffold) — the
 #     shell writes CoW-journal records to `~/.history/` at every
-#     interactive line commit (shell.M2-005). Write cap is narrowed
-#     per-session to the invoker's own history subtree via
-#     libpdx-cap's cap_pack_narrowed at session start; children never
-#     receive this cap (the history subtree is the shell's own state,
-#     not a child's).
+#     interactive line commit. Encoder half landed at shell.M2-005;
+#     runtime writer path landed at ENH-008 (#35): the shell now opens
+#     `~/.history/<session>-<ts>.pdxhist` via
+#     `sys_open(O_WRONLY|O_CREAT|O_APPEND)` at startup and drains the
+#     encoded HistoryEntry ring to disk via `sys_write` after every
+#     REPL step. Write cap is narrowed per-session to the invoker's
+#     own history subtree via libpdx-cap's cap_pack_narrowed at
+#     session start; children never receive this cap (the history
+#     subtree is the shell's own state, not a child's). Verified
+#     against src/session.pdx::session_derive_subcap (M2-001), which
+#     only mints KIND_SHELL_SESSION sub-caps with SS_RIGHTS_CHILD
+#     (0x3 = read | write, no mint) and never touches KIND_PDXFS_FILE
+#     of any shape -- the history-write authority is per-shell state,
+#     not per-session state, so the derivation surface does not
+#     propagate it. Runtime persistence proof (reboot-across boundary)
+#     is a paideia-os boot smoke, not a shell repo test.
 #
 # InitCap sidecar note. The R20b.M4-001 loader-side InitCap sidecar
 # (paideia-os src/kernel/core/loader/init_caps.pdx) is not itself a

@@ -1,0 +1,677 @@
+// tests/test_history.pdx -- shell.ENH-008 (paideia-os/shell#35)
+//
+// TestHistory module: fingerprint for the History persistence path.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// ENH-008 (#35) de-stubs history persistence: `history_encode_record`'s
+// wire bytes now reach `~/.history/<session>-<ts>.pdxhist` via
+// `sys_open(O_WRONLY|O_CREAT|O_APPEND) + sys_write + sys_close`. This
+// module covers the OFFLINE surface of the persistence path -- the
+// parts that do NOT require a live sys_open / sys_write / sys_close
+// against a real filesystem:
+//
+//   thi_case_open_path_format   -- verify history_format_path builds
+//                                   the expected NUL-terminated bytes
+//                                   for (session_id=1, ts=42).
+//   thi_case_format_u64_zero    -- verify history_format_u64_dec(0)
+//                                   writes '0' and returns 1.
+//   thi_case_format_u64_multi   -- verify history_format_u64_dec(12345)
+//                                   writes "12345" and returns 5.
+//   thi_case_flush_no_history   -- with _sm_opt_no_history == 1 and a
+//                                   pre-populated ring, verify flush
+//                                   returns HI_OK without invoking
+//                                   sys_write and without touching
+//                                   _sm_hist_used (the ring is preserved
+//                                   for a future flush attempt after
+//                                   the flag is cleared).
+//   thi_case_flush_ring_empty   -- with a clean --no-history flag, an
+//                                   empty ring, and fd=-1, verify flush
+//                                   returns HI_OK on the ring-empty
+//                                   short-circuit (the fd validity
+//                                   check is never reached).
+//   thi_case_flush_fd_invalid   -- with a pre-populated ring and fd=-1,
+//                                   verify flush returns HI_OK on the
+//                                   fd validity short-circuit and does
+//                                   NOT touch _sm_hist_used (the ring
+//                                   is preserved for a future flush
+//                                   attempt after a successful open).
+//   thi_case_close_fd_invalid   -- history_close_file(-1) returns HI_OK
+//                                   without invoking sys_close.
+//
+// =============================================================================
+// WHAT THIS MODULE DOES NOT EXERCISE
+// =============================================================================
+//
+// The runtime write matrix -- an actual sys_open against the persistent
+// home root, a real sys_write drain, and a subsequent sys_close --
+// requires either
+//
+//   (a) a test-only mock-shim mechanism that redirects sys_open /
+//       sys_write / sys_close to fixture-owned counters, or
+//   (b) a live kernel with the persistent-home substrate (paideia-os
+//       R106.M5 / R107.M1 pair) already booted.
+//
+// (a) is out of reach because paideia-as does not carry conditional
+// compilation; a function-pointer indirection would add runtime cost
+// to every syscall on the shell's hot path. This is the same posture
+// tests/test_line_reader.pdx documents for line_reader_read_line's
+// runtime read matrix.
+//
+// (b) is the paideia-os side responsibility. The shell repo cannot
+// boot itself -- persistent-home is a monorepo concern (paideia-os
+// #2228 landed the R106.M1 scaffold; #2345 / R107.M1 landed the
+// persistent-home substrate proof). The QEMU boot smoke asserts the
+// reboot-persistence invariant: run a command, reboot, verify the
+// .pdxhist record persisted. See STATUS.md §"Historical: R49 (Wave 1)
+// -- v1.0.0" for the paired-landing discipline.
+//
+// The partial-write retry test named in the ENH-008 spec
+// (thi_case_partial_write_retry) is also deferred: verifying the
+// retry loop requires mocking sys_write to return a short-write
+// count, which the (a)-blocker above prevents. The retry loop's
+// structural correctness is proved by inspection in the flush's
+// justification block (see history.pdx history_persist_flush); a
+// live-kernel test lands with the boot-time smoke harness.
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFEDAx
+// =============================================================================
+//
+//   0            THI_PASS                       every case passed
+//   0xFFFFEDA0   THI_FAIL_FMT_U64_ZERO_RC       format_u64_dec(0) rc != 1
+//   0xFFFFEDA1   THI_FAIL_FMT_U64_ZERO_BYTE     format_u64_dec(0) byte != '0'
+//   0xFFFFEDA2   THI_FAIL_FMT_U64_MULTI_RC      format_u64_dec(12345) rc != 5
+//   0xFFFFEDA3   THI_FAIL_FMT_U64_MULTI_BYTES   format_u64_dec(12345) bytes != "12345"
+//   0xFFFFEDA4   THI_FAIL_PATH_LEN              history_format_path rc != 93
+//   0xFFFFEDA5   THI_FAIL_PATH_BYTES            history_format_path bytes != expected
+//   0xFFFFEDA6   THI_FAIL_FLUSH_NOHIST_RC       flush --no-history rc != HI_OK
+//   0xFFFFEDA7   THI_FAIL_FLUSH_NOHIST_RESET    flush --no-history reset _sm_hist_used
+//   0xFFFFEDA8   THI_FAIL_FLUSH_EMPTY_RC        flush empty ring rc != HI_OK
+//   0xFFFFEDA9   THI_FAIL_FLUSH_BADFD_RC        flush bad fd rc != HI_OK
+//   0xFFFFEDAA   THI_FAIL_FLUSH_BADFD_RESET     flush bad fd reset _sm_hist_used
+//   0xFFFFEDAB   THI_FAIL_CLOSE_BADFD_RC        close bad fd rc != HI_OK
+//
+// The 0xFFFFEDAx band extends the family:
+//   0xFFFFED0x TestCapsNarrow      0xFFFFED5x TestLexer
+//   0xFFFFED1x TestAuditFirst      0xFFFFED6x TestParser
+//   0xFFFFED2x TestSmokeMatrix     0xFFFFED7x TestBuiltins
+//   0xFFFFED3x TestReleaseManifest 0xFFFFED8x TestShellMain
+//   0xFFFFED4x TestSyscallFloor    0xFFFFED9x TestLineReader
+//                                   0xFFFFEDAx TestHistory  <-- this module
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestHistory`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF; large-imm sentinel
+//     compares stage via `mov r11, imm64; cmp rax, r11`.
+//   - r11 for large-imm staging + .bss reach (`lea r11, [rip + sym]`).
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr + idx * 1]` per #1248.
+//   - Nested-call fixtures use `sub rsp, 8` or a callee-save-push
+//     prologue to keep rsp % 16 == 0 at every SysV call.
+
+module TestHistory = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFEDAx band)
+  // ==========================================================================
+  pub let THI_PASS                     : u64 = 0
+  pub let THI_FAIL_FMT_U64_ZERO_RC     : u64 = 0xFFFFEDA0
+  pub let THI_FAIL_FMT_U64_ZERO_BYTE   : u64 = 0xFFFFEDA1
+  pub let THI_FAIL_FMT_U64_MULTI_RC    : u64 = 0xFFFFEDA2
+  pub let THI_FAIL_FMT_U64_MULTI_BYTES : u64 = 0xFFFFEDA3
+  pub let THI_FAIL_PATH_LEN            : u64 = 0xFFFFEDA4
+  pub let THI_FAIL_PATH_BYTES          : u64 = 0xFFFFEDA5
+  pub let THI_FAIL_FLUSH_NOHIST_RC     : u64 = 0xFFFFEDA6
+  pub let THI_FAIL_FLUSH_NOHIST_RESET  : u64 = 0xFFFFEDA7
+  pub let THI_FAIL_FLUSH_EMPTY_RC      : u64 = 0xFFFFEDA8
+  pub let THI_FAIL_FLUSH_BADFD_RC      : u64 = 0xFFFFEDA9
+  pub let THI_FAIL_FLUSH_BADFD_RESET   : u64 = 0xFFFFEDAA
+  pub let THI_FAIL_CLOSE_BADFD_RC      : u64 = 0xFFFFEDAB
+
+  // ==========================================================================
+  // Fixtures (.bss)
+  //
+  // _thi_path_scratch: 256-byte scratch for history_format_path output.
+  //                    Matches HI_PATH_BUF_CAP so the format helper's
+  //                    own buffer-cap gate is the sole authority on
+  //                    size checks -- the fixture is trivially large
+  //                    enough.
+  // _thi_dec_scratch:  32-byte scratch for the format_u64_dec cases.
+  //                    20 digits max fits with headroom.
+  // ==========================================================================
+  pub let mut _thi_path_scratch : [u8; 256] = uninit @align(16)
+  pub let mut _thi_dec_scratch  : [u8; 32]  = uninit @align(16)
+
+  // ==========================================================================
+  // thi_case_format_u64_zero() -> u64
+  //
+  // Invoke history_format_u64_dec(0, &_thi_dec_scratch) and assert the
+  // return is 1, byte 0 is '0' (0x30).
+  //
+  // Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call.
+  // ==========================================================================
+  pub let thi_case_format_u64_zero : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-008 (#35) offline case A: history_format_u64_dec(0, buf) must write single '0' byte and return 1. The zero-value special case in the format helper bypasses the divide loop entirely, so this test proves the fast path emits the right byte + length. Byte peek via `xor rax, rax; mov_b rax, [ptr]` per #1248. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed thi_fz_.",
+      block: {
+        sub rsp, 8;
+
+        xor rdi, rdi;                        // value = 0
+        lea rsi, [rip + _thi_dec_scratch];
+        call history_format_u64_dec;
+        // rax = 1 on the zero fast path.
+
+        cmp rax, 1;
+        jne thi_fz_fail_rc;
+
+        // Byte 0 must be '0' = 0x30.
+        lea r11, [rip + _thi_dec_scratch];
+        xor rax, rax;
+        mov_b rax, [r11];
+        cmp rax, 0x30;
+        jne thi_fz_fail_byte;
+
+        xor rax, rax;                        // THI_PASS
+        add rsp, 8;
+        ret;
+
+      thi_fz_fail_rc:
+        mov rax, 0xFFFFEDA0;                 // THI_FAIL_FMT_U64_ZERO_RC
+        add rsp, 8;
+        ret;
+
+      thi_fz_fail_byte:
+        mov rax, 0xFFFFEDA1;                 // THI_FAIL_FMT_U64_ZERO_BYTE
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // thi_case_format_u64_multi() -> u64
+  //
+  // Invoke history_format_u64_dec(12345, buf) and assert rc == 5,
+  // bytes 0..5 == "12345".
+  // ==========================================================================
+  pub let thi_case_format_u64_multi : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-008 (#35) offline case B: history_format_u64_dec(12345, buf) must write \"12345\" and return 5. Exercises the divide-by-10 loop path (rest / 10 = 1234 rem 5; 1234/10=123 rem 4; ...; 1/10=0 rem 1) plus the MSB-first copy back to out_buf. Byte peeks via `xor rax, rax; mov_b rax, [ptr + idx * 1]` per #1248 (with explicit *1 scale to dodge U1606). Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed thi_fm_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 12345;
+        lea rsi, [rip + _thi_dec_scratch];
+        call history_format_u64_dec;
+
+        cmp rax, 5;
+        jne thi_fm_fail_rc;
+
+        // Verify each byte in "12345".
+        lea r11, [rip + _thi_dec_scratch];
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x31;                       // '1'
+        jne thi_fm_fail_bytes;
+        xor rax, rax;
+        mov_b rax, [r11 + 1];
+        cmp rax, 0x32;                       // '2'
+        jne thi_fm_fail_bytes;
+        xor rax, rax;
+        mov_b rax, [r11 + 2];
+        cmp rax, 0x33;                       // '3'
+        jne thi_fm_fail_bytes;
+        xor rax, rax;
+        mov_b rax, [r11 + 3];
+        cmp rax, 0x34;                       // '4'
+        jne thi_fm_fail_bytes;
+        xor rax, rax;
+        mov_b rax, [r11 + 4];
+        cmp rax, 0x35;                       // '5'
+        jne thi_fm_fail_bytes;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      thi_fm_fail_rc:
+        mov rax, 0xFFFFEDA2;
+        add rsp, 8;
+        ret;
+
+      thi_fm_fail_bytes:
+        mov rax, 0xFFFFEDA3;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // thi_case_open_path_format() -> u64
+  //
+  // Invoke history_format_path(session_id=1, ts=42, buf, 256) and
+  // assert:
+  //   - rc == 93 (70 home + 10 "/.history/" + 1 "1" + 1 "-" + 2 "42"
+  //     + 8 ".pdxhist" + 1 NUL)
+  //   - buf[0]  = '/'
+  //   - buf[1]  = 'h'
+  //   - buf[5]  = '/'
+  //   - buf[6]  = 'd' (start of "deadbeef")
+  //   - buf[70] = '/' (start of "/.history/")
+  //   - buf[71] = '.'
+  //   - buf[79] = '/'
+  //   - buf[80] = '1' (session_id decimal)
+  //   - buf[81] = '-'
+  //   - buf[82] = '4'
+  //   - buf[83] = '2' (ts decimal)
+  //   - buf[84] = '.' (start of ".pdxhist")
+  //   - buf[85] = 'p'
+  //   - buf[91] = 't' (end of "pdxhist")
+  //   - buf[92] = 0   (NUL terminator)
+  //
+  // The path is not passed to sys_open; only the byte pattern is
+  // verified. Runtime open + write + close are deferred to the
+  // paideia-os boot smoke.
+  // ==========================================================================
+  pub let thi_case_open_path_format : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-008 (#35) offline case C: history_format_path composes the per-session history path bytes without invoking sys_open. Fixture inputs (session_id=1, ts=42) chosen to keep the digit-render footprint minimal (1 char + 2 chars) so the assertion table is exact and readable; a u64-max stress case is not needed for this test because the format_u64_dec helper is exercised separately by thi_case_format_u64_multi. Expected length 93 derives from: 70 (hi_home_path_len) + 10 (hi_history_dir_len) + 1 (session '1') + 1 ('-') + 2 (ts '42') + 8 (hi_ext body \".pdxhist\") + 1 (trailing NUL from hi_ext) = 93. Byte-position assertions verify all region boundaries plus a fingerprint character inside each region. Byte peeks via `xor rax, rax; mov_b rax, [ptr + idx * 1]` per #1248 (with explicit *1 scale). Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call into history_format_path. Labels prefixed thi_pf_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 1;                          // session_id
+        mov rsi, 42;                         // ts
+        lea rdx, [rip + _thi_path_scratch];
+        mov rcx, 256;
+        call history_format_path;
+
+        cmp rax, 93;
+        jne thi_pf_fail_len;
+
+        // Fingerprint bytes across each region.
+        lea r11, [rip + _thi_path_scratch];
+
+        // buf[0] = '/'
+        xor rax, rax;
+        mov_b rax, [r11 + 0];
+        cmp rax, 0x2F;
+        jne thi_pf_fail_bytes;
+
+        // buf[1] = 'h'
+        xor rax, rax;
+        mov_b rax, [r11 + 1];
+        cmp rax, 0x68;
+        jne thi_pf_fail_bytes;
+
+        // buf[5] = '/'  (between "/home" and "deadbeef...")
+        xor rax, rax;
+        mov_b rax, [r11 + 5];
+        cmp rax, 0x2F;
+        jne thi_pf_fail_bytes;
+
+        // buf[6] = 'd'  (start of "deadbeef")
+        xor rax, rax;
+        mov_b rax, [r11 + 6];
+        cmp rax, 0x64;
+        jne thi_pf_fail_bytes;
+
+        // buf[70] = '/'  (start of "/.history/")
+        xor rax, rax;
+        mov_b rax, [r11 + 70];
+        cmp rax, 0x2F;
+        jne thi_pf_fail_bytes;
+
+        // buf[71] = '.'
+        xor rax, rax;
+        mov_b rax, [r11 + 71];
+        cmp rax, 0x2E;
+        jne thi_pf_fail_bytes;
+
+        // buf[79] = '/'  (end of "/.history/")
+        xor rax, rax;
+        mov_b rax, [r11 + 79];
+        cmp rax, 0x2F;
+        jne thi_pf_fail_bytes;
+
+        // buf[80] = '1'  (session_id decimal)
+        xor rax, rax;
+        mov_b rax, [r11 + 80];
+        cmp rax, 0x31;
+        jne thi_pf_fail_bytes;
+
+        // buf[81] = '-'
+        xor rax, rax;
+        mov_b rax, [r11 + 81];
+        cmp rax, 0x2D;
+        jne thi_pf_fail_bytes;
+
+        // buf[82] = '4'  (ts decimal MSD)
+        xor rax, rax;
+        mov_b rax, [r11 + 82];
+        cmp rax, 0x34;
+        jne thi_pf_fail_bytes;
+
+        // buf[83] = '2'
+        xor rax, rax;
+        mov_b rax, [r11 + 83];
+        cmp rax, 0x32;
+        jne thi_pf_fail_bytes;
+
+        // buf[84] = '.'  (start of ".pdxhist")
+        xor rax, rax;
+        mov_b rax, [r11 + 84];
+        cmp rax, 0x2E;
+        jne thi_pf_fail_bytes;
+
+        // buf[85] = 'p'
+        xor rax, rax;
+        mov_b rax, [r11 + 85];
+        cmp rax, 0x70;
+        jne thi_pf_fail_bytes;
+
+        // buf[91] = 't'  (end of "pdxhist")
+        xor rax, rax;
+        mov_b rax, [r11 + 91];
+        cmp rax, 0x74;
+        jne thi_pf_fail_bytes;
+
+        // buf[92] = 0    (NUL terminator)
+        xor rax, rax;
+        mov_b rax, [r11 + 92];
+        cmp rax, 0;
+        jne thi_pf_fail_bytes;
+
+        xor rax, rax;                        // THI_PASS
+        add rsp, 8;
+        ret;
+
+      thi_pf_fail_len:
+        mov rax, 0xFFFFEDA4;                 // THI_FAIL_PATH_LEN
+        add rsp, 8;
+        ret;
+
+      thi_pf_fail_bytes:
+        mov rax, 0xFFFFEDA5;                 // THI_FAIL_PATH_BYTES
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // thi_case_flush_no_history() -> u64
+  //
+  // Set _sm_opt_no_history = 1, pre-populate _sm_hist_used = 32, call
+  // history_persist_flush(fd=-1), assert:
+  //   - rc == HI_OK (0)
+  //   - _sm_hist_used still == 32 (flush did NOT reset the ring; a
+  //     future flush attempt after the flag is cleared may pick up
+  //     the accumulated bytes)
+  //
+  // This test proves the --no-history skip path bypasses BOTH the
+  // ring-empty check and the fd validity check -- neither runs when
+  // the flag is set.
+  // ==========================================================================
+  pub let thi_case_flush_no_history : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35) offline case D: history_persist_flush with _sm_opt_no_history==1 must return HI_OK without touching _sm_hist_used. Test setup writes 1 into _sm_opt_no_history and 32 into _sm_hist_used. Flush is called with fd=-1 (all-ones, invalid) to prove the --no-history skip runs BEFORE the ring-empty and fd validity checks -- if the order were reversed the fd=-1 check would still return HI_OK, but _sm_hist_used would remain 32 either way. To distinguish the --no-history skip from the fd-invalid skip we assert that _sm_hist_used is preserved: both skips preserve the ring, but the fd-invalid skip runs only after the ring-empty check, so with a non-empty ring only the --no-history or fd-invalid skip can produce HI_OK, and both preserve _sm_hist_used. Effect/cap set matches the SUT's own {mem, sysreg} @{fs}. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed thi_fn_.",
+      block: {
+        sub rsp, 8;
+
+        // Setup: --no-history = 1, _sm_hist_used = 32.
+        mov rax, 1;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        mov rax, 32;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+
+        // Invoke flush with fd = -1 (invalid).
+        mov rdi, 0xFFFFFFFFFFFFFFFF;
+        call history_persist_flush;
+
+        // Assert rc == HI_OK.
+        cmp rax, 0;
+        jne thi_fn_fail_rc;
+
+        // Assert _sm_hist_used == 32 (unchanged).
+        lea r11, [rip + _sm_hist_used];
+        mov rax, [r11];
+        cmp rax, 32;
+        jne thi_fn_fail_reset;
+
+        // Cleanup: reset _sm_opt_no_history + _sm_hist_used so
+        // subsequent cases start from a known state.
+        xor rax, rax;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+
+        xor rax, rax;                        // THI_PASS
+        add rsp, 8;
+        ret;
+
+      thi_fn_fail_rc:
+        // Cleanup even on fail.
+        xor rax, rax;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+        mov rax, 0xFFFFEDA6;                 // THI_FAIL_FLUSH_NOHIST_RC
+        add rsp, 8;
+        ret;
+
+      thi_fn_fail_reset:
+        xor rax, rax;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+        mov rax, 0xFFFFEDA7;                 // THI_FAIL_FLUSH_NOHIST_RESET
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // thi_case_flush_ring_empty() -> u64
+  //
+  // Set _sm_opt_no_history = 0, _sm_hist_used = 0, call
+  // history_persist_flush(fd=-1), assert rc == HI_OK.
+  //
+  // Proves the ring-empty short-circuit fires before the fd validity
+  // check -- an empty ring with a bad fd still returns HI_OK cleanly
+  // (no sys_write attempted against the bad fd).
+  // ==========================================================================
+  pub let thi_case_flush_ring_empty : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35) offline case E: history_persist_flush with --no-history==0 and _sm_hist_used==0 must return HI_OK. Test setup zeroes both singletons. fd=-1 (invalid) is passed to prove the ring-empty check runs BEFORE the fd validity check -- else this test would still pass on the fd short-circuit, but there is no way to distinguish which short-circuit fired from a black-box return. The distinguishing test is thi_case_flush_fd_invalid below, which has _sm_hist_used != 0 so a ring-empty short-circuit cannot fire. Effect/cap set matches the SUT. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed thi_fe_.",
+      block: {
+        sub rsp, 8;
+
+        xor rax, rax;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+
+        mov rdi, 0xFFFFFFFFFFFFFFFF;
+        call history_persist_flush;
+
+        cmp rax, 0;
+        jne thi_fe_fail_rc;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      thi_fe_fail_rc:
+        mov rax, 0xFFFFEDA8;                 // THI_FAIL_FLUSH_EMPTY_RC
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // thi_case_flush_fd_invalid() -> u64
+  //
+  // Set _sm_opt_no_history = 0, _sm_hist_used = 64, call
+  // history_persist_flush(fd=-1). Assert:
+  //   - rc == HI_OK (0)
+  //   - _sm_hist_used still == 64 (fd-invalid skip preserves the
+  //     ring so a subsequent flush after a successful re-open can
+  //     drain the accumulated bytes)
+  //
+  // The non-zero _sm_hist_used prevents the ring-empty short-circuit
+  // from firing, so only the fd-invalid check can produce HI_OK.
+  // ==========================================================================
+  pub let thi_case_flush_fd_invalid : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35) offline case F: history_persist_flush with --no-history==0, _sm_hist_used > 0, and fd=-1 (invalid) must return HI_OK and preserve _sm_hist_used. Test setup writes 64 into _sm_hist_used so the ring-empty check cannot fire; only the fd-invalid short-circuit or a successful sys_write cycle can produce HI_OK, and fd=-1 rules out the latter. Preservation of _sm_hist_used matters: the fd-invalid skip is expected to hold the ring intact so a future flush after a re-open (a shell repl that recovers from a transient open failure) can drain the accumulated bytes. Effect/cap set matches the SUT. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed thi_fb_.",
+      block: {
+        sub rsp, 8;
+
+        xor rax, rax;
+        lea r11, [rip + _sm_opt_no_history];
+        mov [r11], rax;
+        mov rax, 64;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+
+        mov rdi, 0xFFFFFFFFFFFFFFFF;
+        call history_persist_flush;
+
+        cmp rax, 0;
+        jne thi_fb_fail_rc;
+
+        lea r11, [rip + _sm_hist_used];
+        mov rax, [r11];
+        cmp rax, 64;
+        jne thi_fb_fail_reset;
+
+        // Cleanup.
+        xor rax, rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      thi_fb_fail_rc:
+        xor rax, rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+        mov rax, 0xFFFFEDA9;                 // THI_FAIL_FLUSH_BADFD_RC
+        add rsp, 8;
+        ret;
+
+      thi_fb_fail_reset:
+        xor rax, rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+        mov rax, 0xFFFFEDAA;                 // THI_FAIL_FLUSH_BADFD_RESET
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // thi_case_close_fd_invalid() -> u64
+  //
+  // Invoke history_close_file(-1), assert rc == HI_OK. Proves the
+  // fd-invalid short-circuit in the close helper: a bad fd is a
+  // silent no-op, not an error, so a shell that never opened the
+  // history file (--no-history) or opened and got HI_ERR_OPEN_FAIL
+  // can still call close on shutdown without polluting the exit
+  // path with a spurious error.
+  // ==========================================================================
+  pub let thi_case_close_fd_invalid : () -> u64 !{sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35) offline case G: history_close_file(-1) must return HI_OK without invoking sys_close. Signed-jl check on fd catches -1 (all-ones has the sign bit set); the SUT returns HI_OK immediately. Effect/cap set matches the SUT's own !{sysreg} @{fs}. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed thi_cb_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 0xFFFFFFFFFFFFFFFF;
+        call history_close_file;
+
+        cmp rax, 0;
+        jne thi_cb_fail_rc;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      thi_cb_fail_rc:
+        mov rax, 0xFFFFEDAB;                 // THI_FAIL_CLOSE_BADFD_RC
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // thi_run_all() -> u64
+  //
+  // Umbrella: run every case in order; first non-zero return short-
+  // circuits and propagates. Same shape as every other tXX_run_all in
+  // tests/. Boot-time smoke harness invokes each umbrella in one loop
+  // with the uniform return-code contract.
+  // ==========================================================================
+  pub let thi_run_all : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-008 (#35) umbrella driver: sequential invocation of thi_case_format_u64_zero, thi_case_format_u64_multi, thi_case_open_path_format, thi_case_flush_no_history, thi_case_flush_ring_empty, thi_case_flush_fd_invalid, thi_case_close_fd_invalid; short-circuit on first non-zero return. Same shape as every other tXX_run_all in tests/ -- a boot-time smoke harness invokes every umbrella in one loop with a uniform return-code contract. Effect/cap set is the union of every callee's set. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV calls. Labels prefixed thi_ra_.",
+      block: {
+        sub rsp, 8;
+
+        call thi_case_format_u64_zero;
+        cmp rax, 0;
+        jne thi_ra_out;
+
+        call thi_case_format_u64_multi;
+        cmp rax, 0;
+        jne thi_ra_out;
+
+        call thi_case_open_path_format;
+        cmp rax, 0;
+        jne thi_ra_out;
+
+        call thi_case_flush_no_history;
+        cmp rax, 0;
+        jne thi_ra_out;
+
+        call thi_case_flush_ring_empty;
+        cmp rax, 0;
+        jne thi_ra_out;
+
+        call thi_case_flush_fd_invalid;
+        cmp rax, 0;
+        jne thi_ra_out;
+
+        call thi_case_close_fd_invalid;
+        cmp rax, 0;
+        jne thi_ra_out;
+
+        xor rax, rax;                        // THI_PASS
+        add rsp, 8;
+        ret;
+
+      thi_ra_out:
+        add rsp, 8;
+        ret
+      }
+    }
+}
