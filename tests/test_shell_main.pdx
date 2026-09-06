@@ -40,11 +40,15 @@
 //     deferral test_builtins.pdx documents for bi_pwd's sys_getcwd path.
 //     The dispatch_line-hit path (tshm_case_repl_cd_noarg) does exercise
 //     the pre-dispatch pipeline (lex + parse + dispatch) end-to-end.
-//   * line_reader_read_line inside the REPL loop. The reader body is
-//     ENH-007 (#34) work; shell_main handles LR_STUB / LR_ERR_EOF / 0
-//     as EOF signals structurally and the driver would need to mock
-//     the reader to exercise that arm, which is out of scope for the
-//     pure-function surface.
+//   * line_reader_read_line inside the REPL loop. The reader body
+//     landed at ENH-007 (#34); shell_main handles 0 / LR_ERR_EOF /
+//     LR_ERR_READ_FAIL / LR_ERR_BAD_BUF (defensive) as EOF signals
+//     structurally and the driver would need to script a stdin byte
+//     source (or mock lr_read_one_byte) to exercise the read loop
+//     directly, which is out of scope for the pure-function surface
+//     -- see tests/test_line_reader.pdx for the ENH-007 offline
+//     input-gate cases and the live-kernel deferral of the read-loop
+//     matrix.
 //
 // =============================================================================
 // FAIL-CODE BAND 0xFFFFED8x

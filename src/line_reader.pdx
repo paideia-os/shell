@@ -1,139 +1,199 @@
-// src/line_reader.pdx -- shell.M1-002 (paideia-os/shell#2)
+// src/line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34)
 //
-// LineReader module: interactive line reader against KIND_TTY (skeleton).
+// LineReader module: interactive line reader against fd 0 (stdin).
 //
 // =============================================================================
 // SCOPE
 // =============================================================================
 //
-// The shell's interactive line reader. At full ripeness (M2) this is
-// the loop that reads one keypress at a time from KIND_TTY(read),
-// dispatches it through the semterm engine's line editor
-// (paideia-os src/kernel/core/semterm/line_editor.pdx, R41.M4-002),
-// echoes the resulting screen state to KIND_TTY(write), and returns
-// the committed line to the shell's exec dispatch when the user
-// presses Enter.
+// The shell's interactive line reader. As of ENH-007 (#34) the M1
+// LR_STUB tail is retired: `line_reader_read_line` now issues real
+// byte-at-a-time reads against fd 0 via the Syscall floor
+// (`sys_read(0, byte_ptr, 1)`), assembling bytes into the caller's
+// buffer until it sees a newline, EOF, buffer-full, or an
+// unrecoverable read error.
 //
-// M1 is the SKELETON. It ships the entry-point signature, the
-// argument-gating (buf non-null, buf_len non-zero), and the
-// counter-bumping so the Shell stats table records every prompt
-// entry / error the way the M2 body will. On the happy path it
-// returns LR_STUB (0xFFFFEC10) -- the "we validated the args, we
-// would render a prompt and read bytes if the KIND_TTY substrate
-// existed, but it doesn't yet" signal. This mirrors
-// libpdx-elevate's ELVC_STUB idiom (see libpdx-elevate/src/
-// elevate_client.pdx §"WHY STUB IS THE HAPPY PATH AT M1"):
-//
-//   * KIND_TTY has not landed in paideia-os at HEAD (2026-08-21);
-//     kind_tty.pdx does not exist. Faking a byte source at M1 would
-//     mean either linking against a canned test buffer (which the
-//     M2 body then has to un-do) or manufacturing bytes the shell
-//     did not actually observe. Neither is defensible under D3
-//     audit-first -- a shell that "reads" a line it didn't read
-//     lies to its own audit journal.
-//
-//   * A skeleton that returns LR_STUB validates every part of the
-//     call graph that is not the substrate boundary: the caller's
-//     buffer, the counter dispatch, the return-code plumbing. M2
-//     flips the KIND_TTY(read) call in one place; every consumer
-//     already spells the entry point correctly.
+// This is the exact byte-source pattern the paideia-os monorepo's
+// `shell_read_line` uses in the live boot today (see
+// `src/user/shell.pdx:29`). The VFS-mediated fd-0 path is what the
+// monorepo shell has been using since R17.M3-002 (#622); porting the
+// same pattern into the shell satellite unblocks every REPL surface
+// that had been treating the LR_STUB return as a synthetic EOF.
 //
 // =============================================================================
-// M2 CALL GRAPH (documented, not yet built)
+// SINGLE SEAM
 // =============================================================================
 //
-// At M2, line_reader_read_line will:
+// Per issue #34, the actual read syscall lives in exactly ONE helper:
+// `lr_read_one_byte(byte_ptr) -> u64`. This is the sole call site of
+// `sys_read` in the LineReader module. When paideia-os#1986 lands the
+// KIND_TTY_OP_READ operation and the shell can invoke a cap-typed
+// KIND_TTY(read) instead of the fd-0 VFS path, that migration is a
+// ONE-SITE change: swap the `sys_read(0, ptr, 1)` inside
+// `lr_read_one_byte` for the cap-typed invoke. Every other call site
+// -- the read loop in `line_reader_read_line`, plus any future line-
+// editing polish (raw mode / backspace / cursor moves / history recall,
+// tracked at #38 / ENH-011 as R66 shell polish tier 1) -- is untouched.
 //
-//   (1) Reset the semterm line editor: `call led_reset` (from
-//       paideia-os semterm/line_editor.pdx). This zeroes the buffer,
-//       clears the kill register, primes the history cursor.
-//   (2) Render the prompt into KIND_TTY(write) using shell's
-//       ShellPromptRecord schema (semantic-pipe emission at M3-001;
-//       plain-text echo for M2).
-//   (3) Loop:
-//         - sys_read one byte from KIND_TTY(read) into a 1-byte
-//           scratch slot on the shell's own stack;
-//         - dispatch by byte:
-//             printable ASCII [0x20, 0x7E] -> led_insert(byte);
-//             '\n' (0x0A)                   -> led_history_push;
-//                                              copy led buffer to
-//                                              caller's buf; return
-//                                              copied length.
-//             '\b' (0x08) / 0x7F (DEL)      -> led_backspace;
-//             Ctrl-D (0x04) on empty line   -> return 0 (EOF);
-//             ESC-[ sequences               -> led_left / led_right /
-//                                              led_home / led_end /
-//                                              led_history_up /
-//                                              led_history_down;
-//             Ctrl-K (0x0B)                 -> led_kill_line;
-//             Ctrl-Y (0x19)                 -> led_yank;
-//             any other control byte        -> silently discarded
-//                                              (M3 lands the
-//                                              CommandCompletion tab
-//                                              dispatch on Tab 0x09).
-//         - after each dispatch, redraw the buffer to KIND_TTY(write)
-//           using led_get_at + led_buf_len (or a diff-emit at M3).
+// The fallback to fd-0 (rather than blocking on #1986) is a documented
+// decision, recorded in design/architecture.md §3.3. Rationale: the
+// stub's original justification cited "KIND_TTY has not landed in the
+// paideia-os kernel at HEAD (2026-08-21)" -- but 921 lines of
+// `src/kernel/core/cap/kind_tty.pdx` exist today and only one gap
+// remains (no KIND_TTY_OP_READ / no raw/cooked toggle), which is
+// already tracked as paideia-os#1986. The right thing to do is ship
+// against the VFS path so the shell can read a line NOW and re-plumb
+// through the cap-typed invoke behind the seam when #1986 lands.
+//
+// =============================================================================
+// RETURN CONTRACT
+// =============================================================================
+//
+// `line_reader_read_line(buf_ptr, buf_cap) -> u64`
+//
+//   - Successful line (newline seen): returns bytes-written INCLUDING
+//     the newline byte. Matches the monorepo `shell_read_line` shape:
+//     the caller sees the terminator in the buffer, which lets a
+//     lexer that wants to skip trailing whitespace do so uniformly
+//     regardless of how the read terminated.
+//   - EOF at start (first `sys_read` returns 0, count == 0): returns
+//     `LR_ERR_EOF` (0xFFFFEC13). `shell_main` treats this and a bare
+//     0 identically as EOF-exit.
+//   - Buffer full without newline: returns bytes-written (== buf_cap).
+//     No LR_ERR_OVERFLOW sentinel: partial-line return lets the
+//     future line-continuation polish (ENH-011 / R66) glue the pieces
+//     without an error round-trip; today the caller (shell_main)
+//     hands the partial line to shell_repl_step just like any other
+//     line.
+//   - Mid-stream EOF (0-byte read after some bytes read): returns
+//     bytes-written-so-far. This is the "Ctrl-D on a non-empty line"
+//     shape POSIX shells expose today.
+//   - Unrecoverable read error (sys_read returns a negative errno):
+//     returns `LR_ERR_READ_FAIL` (0xFFFFEC14 -- new, allocated at
+//     ENH-007). `shell_main` treats this as EOF for now (exit cleanly
+//     rather than spin); a future error-surfacing polish can promote
+//     this to a user-visible "shell: read failed" message.
+//   - buf_ptr == 0 || buf_cap == 0: returns `LR_ERR_BAD_BUF`
+//     (0xFFFFEC11). Fail-fast before any read.
+//
+// =============================================================================
+// COUNTER DISCIPLINE
+// =============================================================================
+//
+// `line_reader_read_line` bumps `SH_ST_PROMPTS` on every entry (a
+// prompt was displayed to the user, regardless of what came back),
+// `SH_ST_LINES` on every successful return (any non-error path with
+// a bytes-written return), and `SH_ST_ERRORS` on any error path
+// (LR_ERR_BAD_BUF, LR_ERR_EOF at start, LR_ERR_READ_FAIL). The
+// difference (PROMPTS - LINES - ERRORS) is always zero over a full
+// session, so a divergence is a live-counter regression.
 //
 // =============================================================================
 // PAIDEIA-AS CONFORMANCE
 // =============================================================================
 //
 //   - Module name PascalCase basename (`LineReader`), no directory prefix.
-//   - No `test` mnemonic.
-//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. M1's compares are
-//     `cmp r12, 0` (buf non-null) and `cmp r13, 0` (buf_len non-zero).
-//   - r11 is scratch; not used in M1 (no .bss reach from this module).
-//   - No byte reads; the `xor rax, rax; mov_b rax, [ptr]` pattern
-//     lands at M2 once the sys_read loop consumes KIND_TTY bytes.
-//   - Two callee-save pushes (r12, r13) preserved through one nested
-//     call (shell_note). `sub rsp, 8` on entry balances rsp % 16 for
-//     the SysV call; matched `add rsp, 8` before pop. Same idiom as
-//     libpdx-elevate elevate_client_lookup_broker.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A
+//     appear as compare immediates in this module).
+//   - r11 is scratch; not used in this module (no large-immediate
+//     compares here).
+//   - Byte read uses the `xor rax, rax; mov_b rax, [ptr]` pattern per
+//     the #1248 mitigation the whole repo observes.
+//   - Three callee-save pushes (r12=buf_ptr walker, r13=buf_cap,
+//     r14=count) = 24 bytes prologue. Entry rsp%16==8 (return addr);
+//     after 3 pushes rsp%16==0 for every nested SysV call
+//     (`shell_note`, `lr_read_one_byte`). No `sub rsp, 8` needed.
+//   - `lr_read_one_byte` is a leaf-modulo-syscall function; one
+//     `sub rsp, 8` prologue keeps rsp%16==0 for the SysV call into
+//     `sys_read`.
 
 module LineReader = structure {
 
   // ==========================================================================
+  // lr_read_one_byte(byte_ptr) -> u64
+  //
+  // SINGLE SEAM: the sole call site of `sys_read` in the LineReader
+  // module. Reads exactly one byte from fd 0 (stdin) into the caller-
+  // owned `byte_ptr` slot. Returns the syscall's rax verbatim:
+  //   - 1 on successful read (one byte at [byte_ptr]).
+  //   - 0 on EOF.
+  //   - negative errno on failure (unwrapped bit-for-bit, treated as
+  //     signed by the caller for the `< 0` check).
+  //
+  // When paideia-os#1986 (KIND_TTY_OP_READ / raw+cooked toggle) lands,
+  // this function's body is the ONE site that changes: `sys_read(0,
+  // byte_ptr, 1)` becomes a cap-typed KIND_TTY(read) invoke. The
+  // caller in `line_reader_read_line` is untouched; every future
+  // line-editing polish (ENH-011 raw mode, backspace, cursor moves,
+  // history recall) reads through this same seam.
+  //
+  // Register plan (leaf modulo the syscall):
+  //   rdi (input): byte_ptr -- caller-owned 1-byte scratch
+  //   rsi/rdx: shuffled into sys_read's arg slots (buf, count)
+  //   rax (output): syscall return
+  //
+  // Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call
+  // into sys_read. Entry rsp%16==8 (return addr from caller's call);
+  // one sub 8 => rsp%16==0.
+  // ==========================================================================
+  pub let lr_read_one_byte : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (byte_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-007 (#34): the SINGLE SEAM between the LineReader and the byte transport. Today this is sys_read(0, byte_ptr, 1) — the VFS-mediated fd-0 read the paideia-os monorepo's own shell_read_line uses (src/user/shell.pdx:29). When paideia-os#1986 lands KIND_TTY_OP_READ, this one function swaps sys_read for a cap-typed KIND_TTY(read) invoke — every other line_reader callsite is untouched. Argument shuffle: byte_ptr arrives in rdi (SysV arg0); sys_read wants fd in rdi, buf in rsi, count in rdx, so mov rsi, rdi; mov rdi, 0; mov rdx, 1 stages the args (order matters: rsi must be set before rdi is overwritten). Effect/cap set matches Syscall.sys_read's own {mem, sysreg} @{fs}. Prologue: sub rsp, 8 aligns rsp%16==0 for the nested SysV call into sys_read (entry rsp%16==8 from the caller's return addr). Leaf modulo the sys_read call; SYSCALL clobbers rcx/r11 (both caller-save, harmless). Labels: none (linear body).",
+      block: {
+        sub rsp, 8;                          // align rsp % 16 for sys_read
+        mov rsi, rdi;                        // buf = byte_ptr (must precede rdi overwrite)
+        mov rdi, 0;                          // fd = stdin
+        mov rdx, 1;                          // count = 1
+        call sys_read;
+        // rax = 1 on success, 0 on EOF, negative errno on failure.
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // line_reader_read_line(buf, buf_len) -> u64
   //
-  // Signature: line_reader_read_line : (u64, u64) -> u64 !{mem} @{}
+  // Signature: line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs}
   // RDI (input): buf     -- caller-owned scratch, at least buf_len bytes
-  // RSI (input): buf_len -- max bytes to write to buf (recommended 256)
-  // RAX (output): bytes written 0..buf_len, or 0 on EOF, or LR_STUB /
-  //               LR_ERR_* on error.
+  // RSI (input): buf_len -- max bytes to write to buf (typically 4096
+  //                          from shell_main's _sm_line_buf)
+  // RAX (output): bytes written 1..buf_len on success (includes newline
+  //                if a newline terminated the read), or an LR_ERR_*
+  //                sentinel from the 0xFFFFEC1x band.
   //
-  // M1 semantics (skeleton):
-  //   buf == 0 || buf_len == 0 -> LR_ERR_BAD_BUF
-  //   else                     -> LR_STUB
+  // See §RETURN CONTRACT in the module header for the full return
+  // matrix.
   //
-  // Bumps SH_ST_PROMPTS on every entry. Bumps SH_ST_ERRORS on any
-  // reject path so the shell's own stats table records the failure
-  // without needing the caller to touch a journal.
+  // Register plan (3 callee-save pushes; rsp%16==0 at every nested
+  // SysV call):
+  //   r12 = current buffer pointer (advances as bytes land)
+  //   r13 = buf_len (invariant across the loop)
+  //   r14 = bytes-read count (drives buffer-full + return-value)
+  //   rdi = argument-staging register for shell_note / lr_read_one_byte
+  //   rax = return-value staging + syscall return
   //
-  // Register plan:
-  //   r12 = buf       (callee-save; preserved through shell_note)
-  //   r13 = buf_len   (callee-save; preserved through shell_note)
-  //   rdi = which     (bumped between calls)
-  //   rax = return value
-  //
-  // Two pushes + `sub rsp, 8` = 24 bytes of prologue; the sub aligns
-  // rsp % 16 == 0 for the shell_note call. Same idiom as
-  // elevate_client_lookup_broker in libpdx-elevate.
+  // Entry rsp%16==8 (return addr); 3 pushes = 24 bytes → rsp%16==0 at
+  // every nested `call` (`shell_note`, `lr_read_one_byte`). No extra
+  // `sub rsp, 8` needed.
   // ==========================================================================
-  pub let line_reader_read_line : (u64, u64) -> u64 !{mem} @{} =
+  pub let line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (buf: u64) (buf_len: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "shell.M1-002 (#2): the line-reader skeleton. Two callee-save pushes (r12=buf, r13=buf_len) preserve the args across three nested shell_note calls at PROMPTS / ERRORS / (M2+) LINES so the argument sources are unambiguous at every fork. `sub rsp, 8` balances rsp % 16 to 0 for the nested SysV call, matching the elevate_client_lookup_broker idiom (libpdx-elevate/src/elevate_client.pdx). The buf == 0 / buf_len == 0 gates use `cmp reg, 0` (paideia-as no-test-mnemonic discipline; small immediate 0 fits imm32 window). LR_STUB (0xFFFFEC10) is the M1 happy-path sentinel -- KIND_TTY has not landed in the paideia-os kernel at HEAD (2026-08-21), and manufacturing bytes we did not actually observe would defeat D3 audit-first (see design/architecture.md §3.2). M2 replaces the LR_STUB tail with the sys_read + led_insert dispatch loop; every consumer already spells the entry point correctly. Labels prefixed lr_rl_.",
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-007 (#34): the LR_STUB tail is retired; line_reader_read_line now reads real bytes byte-at-a-time from fd 0 via the lr_read_one_byte seam. Same shape as the paideia-os monorepo's shell_read_line (src/user/shell.pdx:29). Three callee-save pushes (r12=buf-walker, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 (return addr) + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_one_byte). No `sub rsp, 8` needed. Gate rejects (buf==0 || buf_len==0) fail fast with LR_ERR_BAD_BUF before any read; SH_ST_PROMPTS bumps unconditionally at entry so a caller-side gate reject still records the prompt attempt. Loop: check buffer-full (return count if r14 >= r13), call lr_read_one_byte, dispatch by rax: 0 == EOF (LR_ERR_EOF at start, else return count so far); signed(rax) < 0 == read error (LR_ERR_READ_FAIL); else 1 byte was written, peek [r12] via xor+mov_b per #1248, increment count and pointer, jump back on non-newline, return count on newline (count includes the newline byte). Counter discipline: SH_ST_PROMPTS on entry, SH_ST_LINES on any bytes-written return, SH_ST_ERRORS on every error sentinel — the invariant PROMPTS - LINES - ERRORS == 0 holds over a full session. LR_ERR_READ_FAIL (0xFFFFEC14) is a new sentinel allocated here to distinguish an unrecoverable read failure from an EOF (0) or a start-EOF (LR_ERR_EOF); shell_main treats it as EOF for now (exit cleanly) with room for a future error-surfacing polish. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A appear); byte peek uses `xor rax, rax; mov_b rax, [r12]` per #1248. Labels prefixed lr_rl_.",
       block: {
         push r12;
         push r13;
-        sub rsp, 8;                          // align rsp % 16 for shell_note
+        push r14;
 
-        mov r12, rdi;                        // buf
-        mov r13, rsi;                        // buf_len
+        mov r12, rdi;                        // r12 = current buffer pointer
+        mov r13, rsi;                        // r13 = buf_len
+        xor r14, r14;                        // r14 = bytes-read count = 0
 
-        // Bump SH_ST_PROMPTS unconditionally so the counter records
-        // every ATTEMPT, not every success -- the failed-arg case is
-        // still a prompt entry the shell wants to see in its stats.
+        // SH_ST_PROMPTS bumps on every entry (prompt was displayed;
+        // caller-gate rejects still count as prompt attempts).
         mov rdi, 0;                          // SH_ST_PROMPTS
         call shell_note;
 
@@ -145,10 +205,69 @@ module LineReader = structure {
         cmp r13, 0;
         je  lr_rl_bad_buf;
 
-        // M1 happy path: LR_STUB. M2 replaces this tail with the real
-        // sys_read + led_insert loop.
-        mov rax, 0xFFFFEC10;                 // LR_STUB
-        add rsp, 8;
+      lr_rl_loop:
+        // Buffer-full check: return bytes-so-far if r14 >= r13.
+        cmp r14, r13;
+        jae lr_rl_return_count;
+
+        // Read one byte through the seam. Slot at [r12].
+        mov rdi, r12;
+        call lr_read_one_byte;
+        // rax = 1 on success, 0 on EOF, negative errno on failure.
+
+        // EOF gate: rax == 0.
+        cmp rax, 0;
+        je  lr_rl_eof;
+
+        // Read-error gate: signed(rax) < 0 (negative errno).
+        cmp rax, 0;
+        jl  lr_rl_read_fail;
+
+        // Success: one byte was written to [r12]. Peek + advance.
+        // Byte peek via #1248 pattern: xor + mov_b.
+        xor rax, rax;
+        mov_b rax, [r12];
+
+        add r14, 1;                          // count++
+        add r12, 1;                          // buf-walker++
+
+        // Newline check: return count (includes the newline byte).
+        cmp rax, 0x0A;
+        je  lr_rl_return_count;
+
+        jmp lr_rl_loop;
+
+      lr_rl_eof:
+        // EOF: if count == 0, return LR_ERR_EOF; otherwise return the
+        // bytes read so far (mid-stream EOF = "Ctrl-D on non-empty line").
+        cmp r14, 0;
+        jne lr_rl_return_count;
+
+        // Zero-byte EOF at start -> LR_ERR_EOF.
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC13;                 // LR_ERR_EOF
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      lr_rl_read_fail:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFEC14;                 // LR_ERR_READ_FAIL
+        pop r14;
+        pop r13;
+        pop r12;
+        ret;
+
+      lr_rl_return_count:
+        // Successful line (newline, buffer-full, or mid-stream EOF).
+        // Bump SH_ST_LINES then return the byte count.
+        mov rdi, 1;                          // SH_ST_LINES
+        call shell_note;
+        mov rax, r14;
+        pop r14;
         pop r13;
         pop r12;
         ret;
@@ -157,7 +276,7 @@ module LineReader = structure {
         mov rdi, 4;                          // SH_ST_ERRORS
         call shell_note;
         mov rax, 0xFFFFEC11;                 // LR_ERR_BAD_BUF
-        add rsp, 8;
+        pop r14;
         pop r13;
         pop r12;
         ret

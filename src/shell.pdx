@@ -101,11 +101,20 @@ module Shell = structure {
   // `SH_OK` at their call sites now and get real semantics at M2.
   pub let SH_OK                  : u64 = 0xFFFFEC00
 
-  // LineReader stubs and errors (0xFFFFEC1x)
-  pub let LR_STUB                : u64 = 0xFFFFEC10   // M1: validated, no live read
+  // LineReader errors (0xFFFFEC1x)
+  //
+  // LR_STUB (formerly 0xFFFFEC10) was RETIRED at ENH-007 (#34) when the
+  // M1 stub tail of line_reader_read_line was replaced by the real
+  // sys_read(0, ptr, 1) loop. The value 0xFFFFEC10 is intentionally
+  // left unallocated -- any external decoder that carried the sentinel
+  // in its table now sees the code path as unreachable, which is the
+  // correct outcome: the shell never returns LR_STUB again. Do NOT
+  // reuse the value for a different meaning without a paired external
+  // decoder-refresh sweep.
   pub let LR_ERR_BAD_BUF         : u64 = 0xFFFFEC11   // buf == 0 or buf_len == 0
-  pub let LR_ERR_TTY_UNBOUND     : u64 = 0xFFFFEC12   // M2+: KIND_TTY(read) missing
-  pub let LR_ERR_EOF             : u64 = 0xFFFFEC13   // M2+: sys_read returned 0 unexpectedly
+  pub let LR_ERR_TTY_UNBOUND     : u64 = 0xFFFFEC12   // reserved: cap-typed KIND_TTY(read) missing (paideia-os#1986)
+  pub let LR_ERR_EOF             : u64 = 0xFFFFEC13   // sys_read returned 0 with no bytes read
+  pub let LR_ERR_READ_FAIL       : u64 = 0xFFFFEC14   // ENH-007: sys_read returned negative errno
 
   // Exec stubs and errors (0xFFFFEC2x)
   //
@@ -327,12 +336,12 @@ module Shell = structure {
   //     the initial SysV process stack, mints the session cap, then
   //     enters the interactive REPL (or -c one-shot).
   //
-  // The line-reader body remains ENH-007 (#34) work: line_reader_read_
-  // line still returns LR_STUB on the happy path. shell_main treats
-  // LR_STUB (and LR_ERR_EOF, and a bare 0 return) as a synthetic EOF
-  // for now so the REPL loop always terminates cleanly rather than
-  // spinning. The moment #34 lands, the same code path picks up real
-  // bytes without an edit here.
+  // As of ENH-007 (#34) the line-reader body reads real bytes from
+  // fd 0 via a `sys_read(0, ptr, 1)` byte-at-a-time loop behind a
+  // single seam (`lr_read_one_byte`); the LR_STUB tail is retired.
+  // shell_main treats a bare 0, LR_ERR_EOF, LR_ERR_READ_FAIL, and
+  // LR_ERR_BAD_BUF (defensive) as EOF signals so the REPL terminates
+  // cleanly on any non-line return.
   // ==========================================================================
   pub let SM_OK                     : u64 = 0
   pub let SM_ERR_ARG_FLAG_UNKNOWN   : u64 = 0xFFFFECF0
@@ -822,7 +831,7 @@ module Shell = structure {
   //   6. Otherwise interactive REPL loop:
   //        write prompt -> read line -> shell_repl_step ->
   //        history_encode_record (unless --no-history) -> loop.
-  //   7. EOF / LR_STUB (documented #34 gap) -> newline + sys_exit(0).
+  //   7. EOF / LR_ERR_EOF / LR_ERR_READ_FAIL -> newline + sys_exit(0).
   //
   // shell_main never returns; sys_exit terminates the task on every
   // exit path. The `hlt` after each sys_exit is unreachable-belt-and-
@@ -843,7 +852,7 @@ module Shell = structure {
   pub let shell_main : () -> () !{mem, sysreg} @{sched, mem, fs} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched, mem, fs},
-      justification: "shell.ENH-006 (#33): the shell's ELF entry frame. Reads argc/argv from the SysV initial process stack (argc at [rsp+0], argv qwords at [rsp+8..], argv[argc]==NULL); envp/InitCap follow but are untouched at ENH-006 (D5: no env; sidecar loader-managed). Sequence: shell_reset -> shell_argv_dispatch (unknown flag -> stderr `shell: unknown flag\\n` + sys_exit(1)) -> dispatch_init -> session_mint into _sm_session_cap with SM_SESSION_ID (bad-return -> stderr `shell: session_mint failed\\n` + sys_exit(1)) -> either one shell_repl_step (if -c) then sys_exit(0), or the interactive REPL loop. Interactive loop: `$ ` prompt via sys_write(fd=1, 2), line via line_reader_read_line into _sm_line_buf (cap 4096), shell_repl_step, history_encode_record into _sm_hist_buf ring (unless --no-history), repeat. EOF is signalled by line_reader returning 0, LR_ERR_EOF (0xFFFFEC13), or LR_STUB (0xFFFFEC10; the ENH-007 gap -- until #34 lands, the very first read returns LR_STUB so shell prints a prompt and then exits cleanly with a trailing newline + sys_exit(0), which is the correct behaviour for a shell whose stdin is stubbed). LR_ERR_BAD_BUF is also treated as EOF defensively -- the alternative is a spin on a misbehaving line reader. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (large-imm sentinels 0xFFFFEC1x stage via `mov r11, imm64; cmp rax, r11`). r15/r14 hold argc/argv_base across nested calls; every callee that uses those regs preserves them per SysV (verified: dispatch_line, exec_spawn_and_wait, lexer_tokenize, parser_parse, session_mint, line_reader_read_line, dispatch_init, shell_reset -- none clobber r14/r15 without a matching push+pop). r13 holds the interactive line length across shell_repl_step + history_encode_record; both push r13 in their prologues so the value survives. @no_frame: this function is the ELF entry point (manifest.pdxproj `entry = Shell::shell_main`), so no push/pop parity is set up; rsp % 16 == 0 at process entry (SysV) and remains so at every nested `call` since no local stack activity happens in this body. History ring append: dst = _sm_hist_buf + _sm_hist_used; skips when _sm_hist_used >= 8192 (ring full or would-underflow the remaining-capacity compute) or when the remaining capacity is < 32 bytes (smallest useful record is 24-byte header + 1 byte + 7 bytes pad = 32). Labels prefixed sm_. Never returns; sys_exit terminates the task on every exit path.",
+      justification: "shell.ENH-006 (#33) + ENH-007 (#34): the shell's ELF entry frame. Reads argc/argv from the SysV initial process stack (argc at [rsp+0], argv qwords at [rsp+8..], argv[argc]==NULL); envp/InitCap follow but are untouched at ENH-006 (D5: no env; sidecar loader-managed). Sequence: shell_reset -> shell_argv_dispatch (unknown flag -> stderr `shell: unknown flag\\n` + sys_exit(1)) -> dispatch_init -> session_mint into _sm_session_cap with SM_SESSION_ID (bad-return -> stderr `shell: session_mint failed\\n` + sys_exit(1)) -> either one shell_repl_step (if -c) then sys_exit(0), or the interactive REPL loop. Interactive loop: `$ ` prompt via sys_write(fd=1, 2), line via line_reader_read_line into _sm_line_buf (cap 4096), shell_repl_step, history_encode_record into _sm_hist_buf ring (unless --no-history), repeat. EOF is signalled by line_reader returning 0 (mid-stream EOF caught nowhere else -- shouldn't happen after ENH-007 since 0-byte-at-start returns LR_ERR_EOF, but preserved defensively), LR_ERR_EOF (0xFFFFEC13; 0-byte read at start), or LR_ERR_READ_FAIL (0xFFFFEC14; unrecoverable read errno). LR_ERR_BAD_BUF (0xFFFFEC11) is also treated as EOF defensively -- the alternative is a spin on a misbehaving line reader. LR_STUB is RETIRED at ENH-007 and no longer handled here. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (large-imm sentinels 0xFFFFEC1x stage via `mov r11, imm64; cmp rax, r11`). r15/r14 hold argc/argv_base across nested calls; every callee that uses those regs preserves them per SysV (verified: dispatch_line, exec_spawn_and_wait, lexer_tokenize, parser_parse, session_mint, line_reader_read_line, dispatch_init, shell_reset -- none clobber r14/r15 without a matching push+pop). r13 holds the interactive line length across shell_repl_step + history_encode_record; both push r13 in their prologues so the value survives. @no_frame: this function is the ELF entry point (manifest.pdxproj `entry = Shell::shell_main`), so no push/pop parity is set up; rsp % 16 == 0 at process entry (SysV) and remains so at every nested `call` since no local stack activity happens in this body. History ring append: dst = _sm_hist_buf + _sm_hist_used; skips when _sm_hist_used >= 8192 (ring full or would-underflow the remaining-capacity compute) or when the remaining capacity is < 32 bytes (smallest useful record is 24-byte header + 1 byte + 7 bytes pad = 32). Labels prefixed sm_. Never returns; sys_exit terminates the task on every exit path.",
       block: {
         // Read argc / argv from initial stack.
         mov r15, [rsp + 0];                  // argc
@@ -897,15 +906,16 @@ module Shell = structure {
         mov rsi, 4096;
         call line_reader_read_line;
 
-        // EOF sentinels: rax == 0, LR_ERR_EOF (0xFFFFEC13), LR_STUB
-        // (0xFFFFEC10; #34 gap), or LR_ERR_BAD_BUF (0xFFFFEC11,
-        // defensive) all route to a clean exit.
+        // EOF sentinels: rax == 0, LR_ERR_EOF (0xFFFFEC13),
+        // LR_ERR_READ_FAIL (0xFFFFEC14), or LR_ERR_BAD_BUF
+        // (0xFFFFEC11, defensive) all route to a clean exit.
+        // LR_STUB was retired at ENH-007 (#34) and is no longer checked.
         cmp rax, 0;
         je  sm_eof;
-        mov r11, 0xFFFFEC10;                 // LR_STUB
+        mov r11, 0xFFFFEC13;                 // LR_ERR_EOF
         cmp rax, r11;
         je  sm_eof;
-        mov r11, 0xFFFFEC13;                 // LR_ERR_EOF
+        mov r11, 0xFFFFEC14;                 // LR_ERR_READ_FAIL
         cmp rax, r11;
         je  sm_eof;
         mov r11, 0xFFFFEC11;                 // LR_ERR_BAD_BUF (defensive)

@@ -12,11 +12,17 @@
 > `shell_repl_step` that runs one line through lex -> parse ->
 > dispatch -> exec.
 >
-> Two runtime gaps remain and are documented deferrals rather than
-> walk-backs on this landing: ENH-007 (#34) puts real bytes into
-> `line_reader_read_line` (today it still returns `LR_STUB` on the
-> happy path; shell_main treats that as EOF and exits cleanly) and
-> ENH-008 (#35) persists the in-memory history ring to
+> **ENH-007 (#34) landed: the shell can read a line.** The M1 stub
+> tail (`line_reader_read_line` returning `LR_STUB = 0xFFFFEC10`)
+> is retired; the reader now calls `sys_read(0, ptr, 1)` byte-at-a-
+> time behind a single seam (`lr_read_one_byte`), assembling bytes
+> into the caller's buffer until it sees a newline, EOF, buffer-full,
+> or an unrecoverable read error. The cap-typed `KIND_TTY(read)`
+> invoke is deferred behind the same seam until paideia-os#1986
+> lands `KIND_TTY_OP_READ`; see `design/architecture.md` §3.3.
+>
+> One runtime gap remains as a documented deferral rather than a
+> walk-back: ENH-008 (#35) persists the in-memory history ring to
 > `~/.history/<session>-<ts>.pdxhist` (today `shell_main` appends the
 > encoded HistoryEntry bytes to a `.bss` staging ring). The
 > paideia-os side needs a paired landing (add the `shell` satellite
@@ -71,10 +77,13 @@ breakdown.
 - `design/architecture.md` (issue #1): full M1 spec covering all three
   modules plus the 0xFFFFECxx band, the paideia-as conformance
   checklist, and the M4 test matrix.
-- `src/line_reader.pdx` (issue #2): `LineReader` module — the
-  interactive line-reader skeleton. `line_reader_read_line(buf,
-  buf_len)` gates the buffer and returns `LR_STUB` (0xFFFFEC10) on
-  the happy path; `LR_ERR_BAD_BUF` on argv reject.
+- `src/line_reader.pdx` (issue #2 skeleton, real read at ENH-007
+  #34): `LineReader` module. `line_reader_read_line(buf, buf_len)`
+  reads real bytes from fd 0 via a byte-at-a-time `sys_read` loop
+  behind a single seam (`lr_read_one_byte`); returns bytes-written
+  (includes trailing newline), or `LR_ERR_BAD_BUF` /
+  `LR_ERR_EOF` (0-byte read at start) / `LR_ERR_READ_FAIL`
+  (negative errno). `LR_STUB` retired at ENH-007.
 - `src/exec.pdx` (issue #3): `Exec` module — the exec-path skeleton.
   `exec_spawn_and_wait(argv, argv_count)` gates argv and returns
   `EX_STUB` (0xFFFFEC20) on the happy path; `EX_ERR_BAD_ARGV` on
@@ -206,10 +215,11 @@ reading a test-run log distinguishes "SUT rejected input" from
 | Code       | Name              | Meaning                                                    |
 |------------|-------------------|------------------------------------------------------------|
 | 0xFFFFEC00 | SH_OK             | General success (unused at M1)                             |
-| 0xFFFFEC10 | LR_STUB           | LineReader.M1: validated, no live read yet                 |
+| 0xFFFFEC10 | (retired)         | was LR_STUB; retired at ENH-007 (#34); value unallocated   |
 | 0xFFFFEC11 | LR_ERR_BAD_BUF    | buf == 0 or buf_len == 0                                   |
-| 0xFFFFEC12 | LR_ERR_TTY_UNBOUND| M2+: KIND_TTY(read) missing from caller                    |
-| 0xFFFFEC13 | LR_ERR_EOF        | M2+: sys_read on TTY returned 0 unexpectedly               |
+| 0xFFFFEC12 | LR_ERR_TTY_UNBOUND| reserved: cap-typed KIND_TTY(read) missing (paideia-os#1986) |
+| 0xFFFFEC13 | LR_ERR_EOF        | LineReader.ENH-007: sys_read returned 0 with no bytes read |
+| 0xFFFFEC14 | LR_ERR_READ_FAIL  | LineReader.ENH-007: sys_read returned a negative errno     |
 | 0xFFFFEC20 | EX_STUB           | Exec.M1 (retired at ENH-005): validated, no live spawn     |
 | 0xFFFFEC21 | EX_ERR_BAD_ARGV   | Exec: pool == 0, argv_bytes == 0, or argc == 0 (ENH-005)   |
 | 0xFFFFEC22 | EX_ERR_EXECVE_FAIL| Exec.ENH-005: sys_execve returned (never returns on success) |
@@ -269,7 +279,7 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFECE6 | BI_ERR_EXPORT_POOL_FULL   | Builtins.ENH-004: name+value would exceed 4096-byte env pool |
 | 0xFFFFECE7 | BI_ERR_PWD_TOO_LONG       | Builtins.ENH-004: sys_getcwd returned negative errno |
 | 0xFFFFECF0 | SM_ERR_ARG_FLAG_UNKNOWN   | shell_main.ENH-006: unknown CLI flag (`--foo`, or `-c` without command) |
-| 0xFFFFECF1 | SM_ERR_LINE_TOO_LONG      | shell_main.ENH-006: reserved for read overflow (ENH-007 will use) |
+| 0xFFFFECF1 | SM_ERR_LINE_TOO_LONG      | shell_main.ENH-006: reserved for future explicit read-overflow surface (ENH-007 chose partial-line return instead) |
 | 0xFFFFECF2 | SM_ERR_SESSION_MINT_FAIL  | shell_main.ENH-006: session_mint refused at startup |
 | 0xFFFFECF3 | SM_ERR_DISPATCH_INIT_FAIL | shell_main.ENH-006: reserved (dispatch_init returns () today) |
 | 0xFFFFECF8 | SR_EOF                    | shell_repl_step.ENH-006: reserved for future explicit EOF signal |
@@ -412,10 +422,11 @@ ENH-005 (#32), and now ENH-006 (#33) invalidate every bullet:
   (ENH-006, #33). **LANDED at #33 (this commit): src/shell.pdx
   defines shell_main + shell_repl_step + shell_argv_dispatch;
   manifest.pdxproj `kind` flips back to `tool`.**
-- `line_reader_read_line` still returns `LR_STUB` (ENH-007, #34);
+- `line_reader_read_line` now reads real bytes from fd 0 behind
+  the `lr_read_one_byte` seam (ENH-007, #34) **LANDED at #34**;
   `history_encode_record`'s bytes are never written to disk
   (ENH-008, #35); the M3-002 tab-completion encoder has no registry
-  walk or tab-key binding behind it. **#34 and #35 remain open.**
+  walk or tab-key binding behind it. **#35 remains open.**
 - Cross-repo linkage (shell → libpdx-cap / libpdx-semantic-pipe /
   libpdx-audit symbols) — no build pulls all sides together yet.
   **Still open.**
@@ -436,11 +447,12 @@ milestones are open concurrently today:
   execute a command for the first time. Critical path: ENH-001
   syscall floor (#28) → ENH-002 lexer (#29) → ENH-003 parser (#30) →
   ENH-004/ENH-005 builtins + real exec (#31/#32) → **ENH-006
-  `Shell::shell_main` + REPL (#33) LANDED**. ENH-007..009 (#34-#36)
-  de-stub the line reader, history persistence, and libpdx-elevate
-  behind that path. ENH-010 (#37, this walk-back) and ENH-011 (#38,
-  correcting the R66/R73 issue bodies) carry no dependencies and
-  land independently.
+  `Shell::shell_main` + REPL (#33) LANDED → ENH-007 line reader
+  real bytes (#34) LANDED**. ENH-008/009 (#35-#36) de-stub the
+  history persistence and libpdx-elevate behind that path.
+  ENH-010 (#37, this walk-back) and ENH-011 (#38, correcting the
+  R66/R73 issue bodies + the line-editing polish tier tracked at
+  #17-#21) carry no dependencies and land independently.
 
 The M5-001 encoder half + M5-002 doc source + design contracts remain
 what the release-time lint (once paideia-as reaches v0.33-crypto-kdf

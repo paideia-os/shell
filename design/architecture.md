@@ -26,15 +26,14 @@ ELF entry (`Shell::shell_main`, per `manifest.pdxproj`) calls in order:
   REPL step `shell_repl_step`, and the byte-string helpers (`sm_strlen`,
   `sm_streq_lit`, `sm_str_prefix`) the walker consumes.
 - `LineReader` (`src/line_reader.pdx`) — the interactive line reader.
-  Wraps the semterm engine's line editor
-  (paideia-os `src/kernel/core/semterm/line_editor.pdx`, R41.M4-002)
-  from userspace, exposing `line_reader_read_line(buf, buf_len) → u64`.
-  M1 ships the SKELETON: prompt-render + buffer wiring returns
-  `LR_STUB`; the actual byte-source binding to KIND_TTY(read) and the
-  echo-back to KIND_TTY(write) land at ENH-007 (#34) once the
-  KIND_TTY substrate in the paideia-os kernel is ready to service
-  userspace. `shell_main` treats `LR_STUB` / `LR_ERR_EOF` / a bare 0
-  as EOF signals structurally so the REPL always terminates cleanly.
+  Exposes `line_reader_read_line(buf, buf_len) → u64`; internally
+  reads one byte at a time from fd 0 via `sys_read(0, ptr, 1)` behind
+  a single seam (`lr_read_one_byte`). Real at ENH-007 (#34); the LR_STUB
+  M1 tail is retired. The cap-typed KIND_TTY(read) invoke is deferred
+  behind the same seam until paideia-os#1986 lands KIND_TTY_OP_READ
+  (see §3.3 below for the rationale). `shell_main` treats a bare 0,
+  `LR_ERR_EOF`, `LR_ERR_READ_FAIL`, and `LR_ERR_BAD_BUF` (defensive)
+  as EOF signals so the REPL terminates cleanly on any non-line return.
 - `Exec` (`src/exec.pdx`) — the exec path. `exec_spawn_and_wait(pool,
   bytes, argc) → u64` marshals argv from the parser's pool slice,
   narrows the child's cap set against the parent's, opens an audit
@@ -60,7 +59,7 @@ via `shell_argv_dispatch`, runs `dispatch_init` + `session_mint`
 loop:
     sys_write(1, "$ ", 2)                          // prompt
     let n = LineReader::line_reader_read_line(_sm_line_buf, 4096)
-    if n in { 0, LR_STUB, LR_ERR_EOF, LR_ERR_BAD_BUF }:
+    if n in { 0, LR_ERR_EOF, LR_ERR_READ_FAIL, LR_ERR_BAD_BUF }:
         sys_write(1, "\n", 1); sys_exit(0)         // EOF path
     if n > 4096: sys_exit(0)                       // defensive
     let rc = Shell::shell_repl_step(_sm_line_buf, n)
@@ -690,41 +689,104 @@ boot-time smoke harness invokes all eight drivers uniformly.
 
 ```
 line_reader_read_line(buf: u64, buf_len: u64) -> u64
+lr_read_one_byte(byte_ptr: u64) -> u64
 ```
 
-- Read one line from the shell's stdin (bound to KIND_TTY at M2) into
-  `buf`, echo bytes back to KIND_TTY as the user types.
-- Returns the number of bytes written on success (0..buf_len).
-- Returns 0 on EOF (`Ctrl-D` on an empty line).
-- Returns an `LR_ERR_*` code (0xFFFFECxx band) on error.
+`line_reader_read_line` reads one line from fd 0 (stdin) into `buf`,
+one byte at a time. Return matrix (ENH-007, #34):
 
-### 3.2 M1 skeleton
+- Successful line (newline seen): bytes-written INCLUDING the
+  terminating `\n`. Matches the monorepo `shell_read_line` shape
+  (`src/user/shell.pdx:29`).
+- EOF at start (first read returns 0, count == 0): `LR_ERR_EOF`
+  (0xFFFFEC13).
+- Mid-stream EOF (0-byte read after some bytes read): bytes-written-
+  so-far (this is the "Ctrl-D on non-empty line" shape).
+- Buffer full without newline: bytes-written (== buf_len). No
+  overflow sentinel; the caller receives a partial line and future
+  line-continuation polish (ENH-011 / R66) can glue pieces without
+  an error round-trip.
+- Unrecoverable read error (negative errno from `sys_read`):
+  `LR_ERR_READ_FAIL` (0xFFFFEC14).
+- `buf == 0 || buf_len == 0`: `LR_ERR_BAD_BUF` (0xFFFFEC11).
 
-M1 ships the wrapper shape and refuses `buf == 0 || buf_len == 0` with
-`LR_ERR_BAD_BUF`. On the happy path it returns `LR_STUB`
-(0xFFFFEC10) — the "we validated the args, we would render a prompt
-and read bytes if the KIND_TTY substrate existed, but it doesn't yet"
-signal. This mirrors libpdx-elevate's `ELVC_STUB` idiom: the request
-is validated up to the substrate boundary, no fake bytes are
-manufactured, and the caller learns unambiguously that M1 stopped
-one step short of a real read.
+`lr_read_one_byte` is the SINGLE SEAM between the LineReader and the
+byte transport; see §3.3.
 
-`line_reader_read_line` bumps `SH_ST_PROMPTS` on every entry and
-`SH_ST_ERRORS` on every reject path so the shell's own stats table
-records the failure without needing the caller to touch a journal.
+### 3.2 ENH-007 implementation
 
-### 3.3 Interaction with the semterm engine
+The M1 body returned `LR_STUB = 0xFFFFEC10` on the happy path because
+no `syscall` instruction existed anywhere in the shell tree (that
+absence tracked at ENH-001 / #28). ENH-001 landed the syscall floor
+and ENH-007 (#34) retires `LR_STUB`: `line_reader_read_line` now
+issues real reads.
 
-At M2, `line_reader_read_line` will call into the semterm line editor
-(paideia-os `src/kernel/core/semterm/line_editor.pdx`, R41.M4-002)
-one keypress at a time: `led_reset` at line start; `led_insert(ch)`
-for each printable byte; `led_backspace` / `led_delete` /
-`led_left` / `led_right` / `led_home` / `led_end` for cursor motion
-keys; `led_history_up` / `led_history_down` for history browsing;
-`led_kill_line` / `led_yank` for the kill register. On `\n` (0x0A),
-`led_history_push` snapshots the buffer and the line is returned to
-the caller. The M1 skeleton predates the KIND_TTY wire that carries
-those keypresses, so the call graph is documented but not yet built.
+Register plan (3 callee-save pushes, rsp%16==0 at every nested call):
+- `r12` — current buffer pointer (advances one byte per read)
+- `r13` — `buf_len` (invariant)
+- `r14` — bytes-read count (drives buffer-full check and return value)
+
+Loop shape (matches the monorepo `shell_read_line` at
+`src/user/shell.pdx:29`):
+
+```
+push r12; push r13; push r14
+r12 = buf; r13 = buf_len; r14 = 0
+shell_note(SH_ST_PROMPTS)
+gate: buf non-null; buf_len non-zero  → else LR_ERR_BAD_BUF
+loop:
+    if r14 >= r13:  → return count (buffer full)
+    lr_read_one_byte(r12)
+    if rax == 0:    → EOF (LR_ERR_EOF if count==0 else return count)
+    if signed(rax) < 0: → LR_ERR_READ_FAIL
+    // rax == 1: one byte was written to [r12]
+    peek [r12] via xor+mov_b
+    r14++; r12++
+    if byte == 0x0A: → return count (includes newline)
+    jmp loop
+```
+
+Counter discipline (see `_shell_stats` layout in §5): `SH_ST_PROMPTS`
+bumps on every entry, `SH_ST_LINES` on every bytes-written return,
+`SH_ST_ERRORS` on every error sentinel. The invariant
+`PROMPTS - LINES - ERRORS == 0` holds across a full session; a
+divergence is a live-counter regression.
+
+### 3.3 Cap-typed `KIND_TTY(read)` deferral
+
+The read syscall lives in exactly one helper — `lr_read_one_byte` —
+so the transport can be swapped at ONE site without touching the
+read loop or any future line-editing polish (raw mode, backspace,
+cursor moves, history recall — tracked at ENH-011 / #38 as R66 shell
+polish tier 1).
+
+Today the seam calls `sys_read(0, byte_ptr, 1)` — the VFS-mediated
+fd-0 path the paideia-os monorepo's own shell has used since
+R17.M3-002 (#622). The cap-typed alternative — a `KIND_TTY(read)`
+invoke that would let userspace bypass the VFS layer and negotiate
+raw / cooked mode explicitly — requires kernel work already tracked
+at paideia-os#1986 (add `KIND_TTY_OP_READ` op alongside the extant
+921-line `src/kernel/core/cap/kind_tty.pdx`). We deliberately do NOT
+block ENH-007 on #1986:
+
+- The stub's original justification cited "KIND_TTY has not landed
+  in the paideia-os kernel at HEAD (2026-08-21)", but 921 lines of
+  `kind_tty.pdx` exist today; only the read op is missing.
+- The fd-0 fallback works TODAY and is the exact pattern the monorepo
+  shell uses. Blocking the shell's ability to read a line on a
+  kernel-side improvement would leave the REPL loop non-functional
+  for the entire time #1986 sits open.
+- The single-seam design means the migration is a ONE-SITE change
+  inside `lr_read_one_byte` when #1986 lands: swap the `sys_read`
+  call for a `cap_invoke(tty_cap, TTY_OP_READ, byte_ptr, 1)`. Every
+  caller in the loop and every future line-editor polish sits behind
+  the seam untouched.
+
+Future line-editing polish (ENH-011 / #38, tracking issues #17-#21
+under R66 shell polish tier 1: raw mode, backspace erase, history
+ring recall, cursor movement) reads through this same seam. Those
+issues become startable only after ENH-007 lands, since the byte
+loop they extend did not exist until this change.
 
 ## 3a. `Session` module (src/session.pdx) — M2-001
 
@@ -1265,10 +1327,11 @@ the smoke matrix pulls both sides into one build.
 
 ```
 0xFFFFEC00  SH_OK               general success sentinel (unused at M1)
-0xFFFFEC10  LR_STUB             LineReader.M1: validated, no live read yet
+0xFFFFEC10  (retired)           was LR_STUB; retired at ENH-007 (#34); value unallocated
 0xFFFFEC11  LR_ERR_BAD_BUF      buf == 0 or buf_len == 0
-0xFFFFEC12  LR_ERR_TTY_UNBOUND  M2+: KIND_TTY(read) missing from caller
-0xFFFFEC13  LR_ERR_EOF          M2+: sys_read on TTY returned 0 unexpectedly
+0xFFFFEC12  LR_ERR_TTY_UNBOUND  reserved: cap-typed KIND_TTY(read) missing (paideia-os#1986)
+0xFFFFEC13  LR_ERR_EOF          sys_read returned 0 with no bytes read (EOF at start)
+0xFFFFEC14  LR_ERR_READ_FAIL    ENH-007: sys_read returned a negative errno
 0xFFFFEC20  EX_STUB             Exec.M1: validated, no live spawn yet
 0xFFFFEC21  EX_ERR_BAD_ARGV     argv == 0 or argv_count == 0
 0xFFFFEC22  EX_ERR_EXECVE_FAIL  M2+: sys_execve refused the child

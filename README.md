@@ -10,10 +10,12 @@ REPL.
 > `--no-history` / `--no-cap:<KIND>` / positional `<script.pds>`, and
 > the one-line REPL (`shell_repl_step`) that runs lex -> parse ->
 > dispatch -> exec. `manifest.pdxproj` `kind` flips back to `tool`.
-> Two runtime gaps remain and are documented deferrals: ENH-007 (#34)
-> puts real bytes into `line_reader_read_line` (today it still
-> returns `LR_STUB`; shell_main treats that as EOF and exits cleanly)
-> and ENH-008 (#35) persists the in-memory history ring to
+> ENH-007 (#34) lands the real bytes into `line_reader_read_line`
+> (byte-at-a-time `sys_read` from fd 0 behind a single seam
+> `lr_read_one_byte`; the cap-typed `KIND_TTY(read)` invoke is
+> deferred behind that same seam until paideia-os#1986 lands
+> `KIND_TTY_OP_READ`). One runtime gap remains as a documented
+> deferral: ENH-008 (#35) persists the in-memory history ring to
 > `~/.history/`. See
 > [`design/enhancement-plan.md`](design/enhancement-plan.md) §1 for
 > the grep-verified audit and §6 for why the release that first
@@ -42,16 +44,16 @@ Any other flag returns `SM_ERR_ARG_FLAG_UNKNOWN` (0xFFFFECF0), which
 The exec substrate is live (ENH-001 syscall floor, ENH-002 lexer,
 ENH-003 parser, ENH-004 builtins + dispatcher, ENH-005 real
 sys_execve + audit-first ShellCommandRecord, ENH-006 shell_main +
-REPL). The `line_reader_read_line` body remains an ENH-007 (#34)
-deferral -- today the reader returns `LR_STUB` on the happy path,
-which `shell_main` treats as EOF. This means an interactive prompt
-today prints `$ ` then exits cleanly; the moment #34 lands, the
-existing REPL body picks up real bytes without an edit. History
-persistence to `~/.history/` remains ENH-008 (#35) work; today the
-encoded HistoryEntry bytes are appended to an in-memory `.bss` ring
-so the encoder is exercised end-to-end from the REPL. Cross-repo
-linkage (shell → libpdx-cap / libpdx-audit / libpdx-semantic-pipe
-symbols) is ENH-009 (#36) work.
+REPL, ENH-007 real line-reader bytes). `line_reader_read_line` now
+issues real `sys_read(0, ptr, 1)` byte-at-a-time reads behind a
+single seam (`lr_read_one_byte`); the cap-typed `KIND_TTY(read)`
+invoke is deferred behind that seam until paideia-os#1986 lands.
+See `design/architecture.md` §3.3 for the deferral rationale.
+History persistence to `~/.history/` remains ENH-008 (#35) work;
+today the encoded HistoryEntry bytes are appended to an in-memory
+`.bss` ring so the encoder is exercised end-to-end from the REPL.
+Cross-repo linkage (shell → libpdx-cap / libpdx-audit /
+libpdx-semantic-pipe symbols) is ENH-009 (#36) work.
 
 ## Status
 

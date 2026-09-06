@@ -1,0 +1,209 @@
+// tests/test_line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34)
+//
+// TestLineReader module: fingerprint for the LineReader input gates.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Two OFFLINE input-gate cases exercise the fast-fail paths of
+// `LineReader::line_reader_read_line` at ENH-007 landing time:
+//
+//   tlr_case_bad_buf_null      -- buf == 0 -> LR_ERR_BAD_BUF
+//   tlr_case_bad_buf_len_zero  -- buf_len == 0 -> LR_ERR_BAD_BUF
+//
+// Both cases return before any read syscall issues (the gate check
+// precedes the loop entry), so they compile-clean and pass on any
+// paideia-as build without needing a live kernel.
+//
+// =============================================================================
+// WHAT THIS MODULE DOES NOT EXERCISE
+// =============================================================================
+//
+// The runtime read-loop matrix -- newline-terminated line, EOF-at-
+// start, buffer-full-without-newline, mid-stream EOF, unrecoverable
+// read error -- is documented as a live-kernel deferral. Reason:
+// exercising the sys_read loop requires either
+//
+//   (a) a test-only mock-shim mechanism that redirects `lr_read_one_
+//       byte` to return canned bytes from a fixture buffer, or
+//   (b) a live kernel with a scripted stdin byte source.
+//
+// (a) is out of reach because paideia-as does not carry conditional
+// compilation; a mock-inject function-pointer indirection would add
+// runtime cost to every real read (the shell's hot path is a byte-at-
+// a-time syscall loop where an extra indirection is measurable). The
+// single-seam design at ENH-007 is intended for the paideia-os#1986
+// migration, not for test-mock injection.
+//
+// (b) is the same deferral test_syscall_floor.pdx uses for its
+// `sys_getcwd` + `sys_write` runtime cases: build against a live
+// kernel invocation and let the boot-time smoke harness drive the
+// full matrix once the shell satellite is wired into paideia-os as
+// a submodule. Runtime read tests here would follow the same shape
+// and are tracked as a follow-on when that wiring lands.
+//
+// The gate cases exercised here are the FULL offline surface of
+// `line_reader_read_line`: every non-gate path involves at least one
+// `sys_read` invocation.
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFED9x
+// =============================================================================
+//
+//   0            TLR_PASS                       both cases passed
+//   0xFFFFED90   TLR_FAIL_BAD_BUF_NULL          buf==0 did not return LR_ERR_BAD_BUF
+//   0xFFFFED91   TLR_FAIL_BAD_BUF_LEN_ZERO      buf_len==0 did not return LR_ERR_BAD_BUF
+//
+// The 0xFFFFED9x band extends the family:
+//   0xFFFFED0x TestCapsNarrow      0xFFFFED5x TestLexer
+//   0xFFFFED1x TestAuditFirst      0xFFFFED6x TestParser
+//   0xFFFFED2x TestSmokeMatrix     0xFFFFED7x TestBuiltins
+//   0xFFFFED3x TestReleaseManifest 0xFFFFED8x TestShellMain
+//   0xFFFFED4x TestSyscallFloor    0xFFFFED9x TestLineReader  <-- this module
+//
+// so an operator reading a boot-time smoke log can distinguish which
+// test module refused the invariant by the high two bytes of the
+// return.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestLineReader`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF; large-imm sentinel
+//     compares stage via `mov r11, imm64; cmp rax, r11`.
+//   - r11 scratch for the large-imm sentinel compare (LR_ERR_BAD_BUF).
+//   - No byte reads in this driver; the gate checks return sentinels
+//     the driver compares as qwords.
+//   - Each case: `sub rsp, 8` prologue (no callee-save pushes; the
+//     args and return value ride through the caller-save registers).
+//     Entry rsp%16==8 (return addr from parent's call); sub 8 gives
+//     rsp%16==0 for the nested line_reader_read_line call. Matched
+//     `add rsp, 8` at every return.
+
+module TestLineReader = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED9x band)
+  // ==========================================================================
+  pub let TLR_PASS                       : u64 = 0
+  pub let TLR_FAIL_BAD_BUF_NULL          : u64 = 0xFFFFED90
+  pub let TLR_FAIL_BAD_BUF_LEN_ZERO      : u64 = 0xFFFFED91
+
+  // ==========================================================================
+  // Fixture (.bss)
+  //
+  // _tlr_scratch -- 32 qwords = 256 bytes; a plausibly-sized line
+  // buffer that gets passed as a non-null buf on the buf_len==0 gate
+  // case. Never actually written on any offline path (both gate cases
+  // return before the read loop). Aligned @16 to match the alignment
+  // discipline the shell's own _sm_line_buf uses.
+  // ==========================================================================
+  pub let mut _tlr_scratch : [u64; 32] = uninit @align(16)
+
+  // ==========================================================================
+  // tlr_case_bad_buf_null() -> u64
+  //
+  // Invoke line_reader_read_line(0, 256) and assert the return is
+  // LR_ERR_BAD_BUF (0xFFFFEC11). Any other return is a gate regression.
+  //
+  // Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call.
+  // No callee-save pushes -- rax/rdi/rsi/r11 are all caller-save.
+  // ==========================================================================
+  pub let tlr_case_bad_buf_null : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-007 (#34) offline gate case A: line_reader_read_line(0, 256) must return LR_ERR_BAD_BUF -- the fast-fail gate rejects a null buf BEFORE any sys_read issues. Effect/cap set matches the SUT's own {mem, sysreg} @{fs} (the SUT declares them because a real read path exists; this case does not reach the read but the type-level effect set is a compile-time property of the callee's signature). Large-imm sentinel compare against LR_ERR_BAD_BUF (0xFFFFEC11) stages via `mov r11, imm64; cmp rax, r11` per paideia-as imm32 discipline. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call (entry rsp%16==8 from parent's return addr). Labels prefixed tlr_bbn_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16
+
+        xor rdi, rdi;                        // buf = 0 (NULL)
+        mov rsi, 256;                        // buf_len = 256
+        call line_reader_read_line;
+        // rax = LR_ERR_BAD_BUF on the gate reject.
+
+        // Assert rax == 0xFFFFEC11 via r11 staging.
+        mov r11, 0xFFFFEC11;                 // LR_ERR_BAD_BUF
+        cmp rax, r11;
+        jne tlr_bbn_fail;
+
+        xor rax, rax;                        // TLR_PASS
+        add rsp, 8;
+        ret;
+
+      tlr_bbn_fail:
+        mov rax, 0xFFFFED90;                 // TLR_FAIL_BAD_BUF_NULL
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_case_bad_buf_len_zero() -> u64
+  //
+  // Invoke line_reader_read_line(&_tlr_scratch, 0) and assert the
+  // return is LR_ERR_BAD_BUF. Non-null buf with zero cap must still
+  // fail-fast BEFORE the read loop.
+  // ==========================================================================
+  pub let tlr_case_bad_buf_len_zero : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-007 (#34) offline gate case B: line_reader_read_line(&_tlr_scratch, 0) must return LR_ERR_BAD_BUF -- a non-null buffer with zero capacity is still refused before any sys_read issues. Effect/cap set matches the SUT. Large-imm sentinel compare against LR_ERR_BAD_BUF stages via `mov r11, imm64; cmp rax, r11`. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV call. Labels prefixed tlr_bbz_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16
+
+        lea rdi, [rip + _tlr_scratch];       // buf = valid pointer
+        xor rsi, rsi;                        // buf_len = 0
+        call line_reader_read_line;
+        // rax = LR_ERR_BAD_BUF on the gate reject.
+
+        mov r11, 0xFFFFEC11;                 // LR_ERR_BAD_BUF
+        cmp rax, r11;
+        jne tlr_bbz_fail;
+
+        xor rax, rax;                        // TLR_PASS
+        add rsp, 8;
+        ret;
+
+      tlr_bbz_fail:
+        mov rax, 0xFFFFED91;                 // TLR_FAIL_BAD_BUF_LEN_ZERO
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_run_all() -> u64
+  //
+  // Umbrella: run both cases in order; first non-zero return short-
+  // circuits and propagates. Same shape as tcn_run_all / taf_run_all
+  // / tsm_run_all / trm_run_all / tsf_run_all / tlx_run_all /
+  // tpr_run_all / tbi_run_all / tex_run_all / tshm_run_all.
+  // ==========================================================================
+  pub let tlr_run_all : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.ENH-007 (#34) umbrella driver: sequential invocation of tlr_case_bad_buf_null then tlr_case_bad_buf_len_zero; short-circuit on first non-zero return. Same shape as every other tXX_run_all in tests/ -- a boot-time smoke harness invokes every umbrella in one loop with a uniform return-code contract. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV calls. Labels prefixed tlr_ra_.",
+      block: {
+        sub rsp, 8;                          // align rsp % 16
+
+        call tlr_case_bad_buf_null;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_bad_buf_len_zero;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        xor rax, rax;                        // TLR_PASS
+        add rsp, 8;
+        ret;
+
+      tlr_ra_out:
+        add rsp, 8;
+        ret
+      }
+    }
+}

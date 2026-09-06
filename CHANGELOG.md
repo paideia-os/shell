@@ -4,6 +4,107 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-007: line reader real bytes (#34)
+
+The `LR_STUB = 0xFFFFEC10` tail of `line_reader_read_line` is retired.
+The reader now issues real byte-at-a-time reads from fd 0 via
+`sys_read(0, ptr, 1)`, assembling bytes into the caller's buffer
+until it sees a newline, EOF, buffer-full, or an unrecoverable read
+error. **The shell can read a line.**
+
+The stub's original justification cited "KIND_TTY has not landed
+in the paideia-os kernel at HEAD (2026-08-21)"; but 921 lines of
+`src/kernel/core/cap/kind_tty.pdx` exist today and only one gap
+remains (no `KIND_TTY_OP_READ`, no raw/cooked toggle), which is
+already tracked as paideia-os#1986. Rather than block ENH-007 on
+that kernel-side improvement, this landing ships against the VFS
+fd-0 path — the exact byte-source pattern the paideia-os monorepo's
+own `shell_read_line` uses today (`src/user/shell.pdx:29`) — behind
+a single seam so the cap-typed migration is a ONE-SITE change when
+#1986 lands. See `design/architecture.md` §3.3 for the recorded
+deferral rationale.
+
+### Added
+
+- `src/line_reader.pdx` `lr_read_one_byte(byte_ptr) -> u64` — the
+  SINGLE SEAM between the LineReader and the byte transport. Sole
+  call site of `sys_read` in the module. When paideia-os#1986 lands
+  `KIND_TTY_OP_READ`, this one function's body swaps `sys_read`
+  for a cap-typed `KIND_TTY(read)` invoke; every other caller (the
+  read loop and every future line-editing polish under ENH-011)
+  is untouched.
+- `src/shell.pdx` `LR_ERR_READ_FAIL = 0xFFFFEC14` — new sentinel
+  distinguishing an unrecoverable read error (negative errno from
+  `sys_read`) from a clean EOF. `shell_main` treats it as EOF for
+  now (exit cleanly rather than spin); a future error-surfacing
+  polish can promote this to a user-visible message.
+- `tests/test_line_reader.pdx` `TestLineReader` module. Two offline
+  input-gate cases in the `0xFFFFED9x` fail band:
+  `tlr_case_bad_buf_null` (buf==0 → LR_ERR_BAD_BUF) and
+  `tlr_case_bad_buf_len_zero` (buf_len==0 → LR_ERR_BAD_BUF). The
+  runtime read-loop matrix (newline-terminated, EOF-at-start,
+  buffer-full, mid-stream EOF, read-error) is documented in the
+  module header as a deferral to live-kernel invocation: without a
+  test-only mock-shim mechanism (paideia-as does not carry
+  conditional compilation), the read loop's substrate half exercises
+  only under a live kernel with a scripted stdin source, the way
+  `test_syscall_floor.pdx` handles `sys_getcwd` / `sys_write`.
+  Umbrella `tlr_run_all`.
+- `manifest.pdxproj` — registered `tests/test_line_reader.pdx`.
+
+### Changed
+
+- `src/line_reader.pdx` `line_reader_read_line` — body replaced.
+  The three-callee-save-push prologue (r12=buf-walker, r13=buf_len,
+  r14=count) preserves state across the shell_note + lr_read_one_byte
+  nested calls. Loop dispatches by `sys_read` return: 0 == EOF
+  (`LR_ERR_EOF` at start; otherwise return count-so-far); signed(rax)
+  < 0 == read error (`LR_ERR_READ_FAIL`); else 1 byte was written
+  and the loop peeks + advances, jumping back on non-newline. Return
+  count INCLUDES the terminating newline (matches the monorepo
+  `shell_read_line` shape).
+- `src/line_reader.pdx` effect / capability set — widened from
+  `!{mem} @{}` to `!{mem, sysreg} @{fs}` covering `sys_read`.
+- `src/shell.pdx` `LR_STUB` — REMOVED. The value `0xFFFFEC10` is
+  intentionally left unallocated so any external decoder that
+  carried the sentinel keeps decoding correctly (the code path is
+  simply unreachable in the shell now). Do NOT reuse the value for
+  a different meaning without a paired external decoder-refresh
+  sweep.
+- `src/shell.pdx` `LR_ERR_TTY_UNBOUND` — comment reframed from
+  "M2+: KIND_TTY(read) missing" to "reserved: cap-typed
+  KIND_TTY(read) missing (paideia-os#1986)". The sentinel remains
+  allocated for the cap-typed path that lands when #1986 lands.
+- `src/shell.pdx` `shell_main` — EOF-classification branch removes
+  the LR_STUB check and adds an LR_ERR_READ_FAIL check. EOF
+  sentinel set: `{ 0, LR_ERR_EOF, LR_ERR_READ_FAIL, LR_ERR_BAD_BUF
+  (defensive) }`.
+- `design/architecture.md` §3 — rewritten to reflect ENH-007. §3.1
+  contract enumerates the full return matrix; §3.2 documents the
+  ENH-007 implementation loop shape; new §3.3 records the cap-typed
+  `KIND_TTY(read)` deferral rationale. §5 return-code band table
+  updates the 0xFFFFEC10..0xFFFFEC14 rows.
+- `STATUS.md` — walk-back "shell cannot read a line" retired. #34
+  moved from open to LANDED.
+
+### Deferred (documented in `design/architecture.md` §3.3)
+
+- Cap-typed `KIND_TTY(read)` invoke inside `lr_read_one_byte`.
+  Requires paideia-os#1986 (add `KIND_TTY_OP_READ` op + raw/cooked
+  toggle to `src/kernel/core/cap/kind_tty.pdx`). Fallback fd-0
+  `sys_read` is behind the same seam so migration is a ONE-SITE
+  change; do NOT refile paideia-os#1986.
+- Line-editing polish (raw mode, backspace erase, history ring
+  recall, cursor movement — R66 shell polish tier 1, issues
+  #17-#21, tracked at ENH-011 / #38). Those issues became startable
+  only after this landing, since the byte loop they extend did not
+  exist until ENH-007.
+- Runtime read-loop test matrix (newline-terminated, EOF-at-start,
+  buffer-full, mid-stream EOF, read-error). Requires either a
+  test-only mock-shim mechanism (not available in paideia-as) or a
+  live kernel with a scripted stdin source. Same deferral pattern
+  as `test_syscall_floor.pdx`.
+
 ## Unreleased — ENH-005: real exec path (#32)
 
 The `EX_STUB = 0xFFFFEC20` tail of `exec_spawn_and_wait` is retired.
