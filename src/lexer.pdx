@@ -1,0 +1,602 @@
+// src/lexer.pdx -- shell.ENH-002 (paideia-os/shell#29)
+//
+// Lexer module: tokenize a shell command line.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// The v1.0.0 audit (`design/enhancement-plan.md` §4 Stage 1) found
+// that the shell repository contained no lexer whatsoever -- nothing
+// in `src/` split a byte string on whitespace. `src/pds.pdx` parses
+// `.pds` HEADERS (shebang plus `#`-pragma lines) and explicitly does
+// NOT materialise string values (§4a.4 architecture); it never sees a
+// command line. `src/pipeline.pdx::pipeline_plan` presupposes a
+// stages_count but has no way to reach one from the raw bytes a
+// caller typed.
+//
+// ENH-002 lands the missing byte-level split: given a caller-owned
+// input buffer (input_ptr, input_len), produce a token stream in the
+// module's own `.bss` singleton table. Each token is a fixed 24-byte
+// record: (offset_in_source, length, kind). The token TABLE lives in
+// this module (caller-visible via `_lx_tokens`); the token COUNT lives
+// in `_lx_token_count` -- both singletons following the same shape
+// libpdx-cap uses for its unpacked_* slots and Pds uses for its
+// PdsHeader singleton.
+//
+// The lexer recognises exactly the surface every downstream encoder
+// already presupposes at v1.0:
+//
+//   words          runs of non-whitespace, non-operator bytes; may
+//                  include quoted or backslash-escaped bytes that
+//                  logically belong to the same word.
+//   `|`  0x7C      pipe operator; single-byte token per occurrence.
+//                  Pipeline.pdx::pipeline_plan counts these to size
+//                  the sidecar; the lexer emits the token, the
+//                  planner counts.
+//   `<`  0x3C      redirection-in operator; single-byte token.
+//   `>`  0x3E      redirection-out operator; single-byte token.
+//   `;`  0x3B      command separator; single-byte token.
+//   `&`  0x26      background / async-fork marker; single-byte token.
+//
+// Grouping (mirrors POSIX shell semantics, but ONLY at the lexical
+// level -- expansion is a later concern):
+//
+//   '...'          single-quoted string. Bytes between the quotes are
+//                  literal; nothing inside is expanded. The token
+//                  spans the raw source INCLUDING the two `'` bytes
+//                  so a consumer can decide whether to strip them.
+//                  A missing closing `'` returns
+//                  LX_ERR_UNTERMINATED_QUOTE.
+//
+//   "..."          double-quoted string. Bytes are literal except for
+//                  `\<char>` which yields the literal <char>. Missing
+//                  closing `"` returns LX_ERR_UNTERMINATED_QUOTE. A
+//                  `\` at the end of the buffer inside the quotes
+//                  returns LX_ERR_INVALID_ESCAPE.
+//
+//   \<char>        backslash escape outside quotes. The `\` and the
+//                  following byte both belong to the current word.
+//                  Trailing `\` at end-of-input returns
+//                  LX_ERR_INVALID_ESCAPE.
+//
+// Adjacent quoted / escaped fragments join into ONE word:
+// `hello"a b"world` is a single WORD token spanning all 15 bytes.
+// `echo 'a b'` tokenizes as WORD("echo") WORD("'a b'") -- two words,
+// because the space between them is unquoted.
+//
+// =============================================================================
+// STORAGE
+// =============================================================================
+//
+// One TokenTable singleton lives in `.bss` (same singleton pattern
+// libpdx-cap uses for its caps_decl parser, Pds uses for its
+// PdsHeader, and libpdx-argv uses for its ParsedArgs). One command
+// line per shell iteration is enough for M2's consumers, and the
+// singleton pattern lets the caller advance its cursors without a
+// second-return-value calling convention.
+//
+//   _lx_tokens        [u64; 384]  = 128 tokens x 3 qwords each
+//                                   (byte offset i*24 = token i)
+//                                   qword0: offset_in_source_buffer
+//                                   qword1: length
+//                                   qword2: kind discriminator
+//   _lx_token_count   u64         = number of tokens populated
+//                                   (0..TOK_MAX_PER_LINE)
+//
+// The count is written to `_lx_token_count` ONLY on the LX_OK success
+// path; on any error path the count is left untouched (the return
+// code is the authoritative signal, and the tokens buffer may hold
+// partial state that the caller must not read). This mirrors
+// pipeline_plan's discipline: `pipeline_entries_written` is set only
+// on success.
+//
+// The 128-token ceiling is a soft cap chosen for interactive shell
+// lines: a real command line rarely reaches even 32 tokens, and 128
+// leaves headroom for tab-completed candidate lists in the M3
+// completion pipeline without another re-layout. A stress test that
+// exceeds the cap returns LX_ERR_OVERFLOW and the caller can
+// either split the input or grow the ceiling. Fits imm <= 0x7FFFFFFF
+// by a wide margin.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Lexer`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Largest is
+//     TOK_MAX_PER_LINE = 128 for the overflow gate; ASCII byte
+//     compares (0x20 ' ', 0x7C '|', 0x22 '"', etc.) fit trivially.
+//   - r11 reserved as .bss LEA scratch for `_lx_tokens` /
+//     `_lx_token_count`. Not touched between load and store within
+//     each emit sequence.
+//   - Byte loads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - Non-leaf function: nested `call shell_note` on entry + reject
+//     paths. Five callee-save pushes (rbx cursor, r12 input_ptr,
+//     r13 input_len, r14 end pointer, r15 token count) + `sub rsp,
+//     8` = 48 bytes prologue -- same shape as Pipeline.pipeline_plan.
+//   - Labels prefixed `lx_tok_` per issue directive.
+
+module Lexer = structure {
+
+  // ==========================================================================
+  // Storage caps
+  // ==========================================================================
+
+  // Maximum tokens in one command line. 128 is well above the working
+  // set for interactive lines and leaves headroom for tab-completed
+  // candidate lists. Fits imm <= 0x7FFFFFFF by wide margin.
+  pub let TOK_MAX_PER_LINE : u64 = 128
+
+  // Bytes per token record (offset + length + kind, three qwords).
+  pub let TOK_RECORD_SIZE  : u64 = 24
+
+  // ==========================================================================
+  // Token kind discriminators
+  //
+  // TOK_WORD is the general case for any non-operator, non-whitespace
+  // byte run (possibly containing quoted or escaped sub-runs). The
+  // five single-byte operators map to their own discriminators so a
+  // downstream parser can dispatch on kind without re-reading the
+  // source byte. TOK_EOF is defined for symmetry with parser
+  // vocabularies that expect one; the lexer NEVER emits it (the
+  // caller reads _lx_token_count for the end).
+  // ==========================================================================
+  pub let TOK_WORD       : u64 = 1
+  pub let TOK_PIPE       : u64 = 2   // '|'
+  pub let TOK_REDIR_IN   : u64 = 3   // '<'
+  pub let TOK_REDIR_OUT  : u64 = 4   // '>'
+  pub let TOK_SEMI       : u64 = 5   // ';'
+  pub let TOK_AMP        : u64 = 6   // '&'
+  pub let TOK_EOF        : u64 = 7   // reserved; never emitted
+
+  // ==========================================================================
+  // Return-code band 0xFFFFECCx (Lexer module)
+  //
+  // Fresh sub-band; disjoint from every existing shell 0xFFFFECxx
+  // allocation:
+  //   0xFFFFEC0x  SH_OK
+  //   0xFFFFEC1x  LineReader
+  //   0xFFFFEC2x  Exec
+  //   0xFFFFEC3x  Session
+  //   0xFFFFEC4x  Pipeline
+  //   0xFFFFEC5x  Pds
+  //   0xFFFFEC6x  History
+  //   0xFFFFEC7x  PipePassthrough
+  //   0xFFFFEC8x  Completion
+  //   0xFFFFEC9x  CommandRecord
+  //   0xFFFFECAx  ReleaseManifest
+  //   0xFFFFECBx  BrokerBind
+  //   0xFFFFECCx  Lexer               <-- this module
+  //
+  // The issue's suggestion of 0xFFFFEC5x collides with Pds; the next
+  // unused sub-band above the last existing allocation is 0xFFFFECCx.
+  // The Shell module's SH_* aggregate table in design/architecture.md
+  // §5 gains a Lexer row when this module lands.
+  // ==========================================================================
+
+  pub let LX_OK                     : u64 = 0
+  pub let LX_ERR_OVERFLOW           : u64 = 0xFFFFECC0  // >TOK_MAX_PER_LINE
+  pub let LX_ERR_UNTERMINATED_QUOTE : u64 = 0xFFFFECC1  // '..' or ".." not closed
+  pub let LX_ERR_INVALID_ESCAPE     : u64 = 0xFFFFECC2  // `\` at end of input
+  pub let LX_ERR_BAD_ARGS           : u64 = 0xFFFFECC3  // input_ptr==0 && len>0
+
+  // ==========================================================================
+  // Singleton token table (.bss)
+  //
+  // Layout: 128 tokens x 3 qwords each = 384 qwords = 3072 bytes.
+  // Byte offset for token i:  i * 24
+  //   [i*24 +  0]  qword0 = offset_in_source_buffer
+  //   [i*24 +  8]  qword1 = length in bytes
+  //   [i*24 + 16]  qword2 = kind (TOK_WORD | TOK_PIPE | ...)
+  //
+  // @align(16) so cache-line-friendly and matches the 16-byte
+  // fixture buffers in the test modules.
+  // ==========================================================================
+  pub let mut _lx_tokens      : [u64; 384] = uninit @align(16)
+  pub let mut _lx_token_count : u64        = uninit @align(8)
+
+  // ==========================================================================
+  // lexer_reset()
+  //
+  // Signature: lexer_reset : () -> () !{mem} @{}
+  //
+  // Zero the _lx_token_count slot. The _lx_tokens array itself is not
+  // zeroed -- callers only read entries [0..count), so stale bytes
+  // past `count` are unobservable. This mirrors pipeline_reset's
+  // discipline: only the count singleton needs a clean baseline.
+  // Leaf function; r11 as .bss scratch.
+  // ==========================================================================
+  pub let lexer_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): zero the _lx_token_count slot so a subsequent lexer_tokenize starts from a known-empty count. Only the count needs zeroing -- the _lx_tokens array holds record slots that are only read up to `count`; stale bytes past that boundary are unobservable. xor rax, rax produces the zero; one lea + one mov write it. r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + _lx_token_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lexer_tokenize(input_ptr, input_len) -> u64
+  //
+  // Signature: lexer_tokenize : (u64, u64) -> u64 !{mem} @{}
+  // RDI (input): input_ptr -- VA of the caller-owned byte buffer
+  // RSI (input): input_len -- length in bytes (0 is a valid empty line
+  //                            and returns LX_OK with 0 tokens)
+  // RAX (output): LX_OK on success (count in _lx_token_count),
+  //               else LX_ERR_OVERFLOW | LX_ERR_UNTERMINATED_QUOTE |
+  //               LX_ERR_INVALID_ESCAPE | LX_ERR_BAD_ARGS.
+  //
+  // Algorithm (a byte-at-a-time single pass):
+  //
+  //   cursor = input_ptr
+  //   token_count = 0
+  //   while cursor < end:
+  //     b = *cursor
+  //     if is_whitespace(b): cursor++, continue
+  //     if is_operator(b):   emit(op_kind, cursor - input_ptr, 1),
+  //                          cursor++, continue
+  //     # otherwise -- start of a WORD
+  //     word_start = cursor
+  //     while cursor < end and byte NOT delim:
+  //       if b == '\\':    consume '\\' + next byte (or ERR_INVALID_ESCAPE)
+  //       elif b == '\'':  consume through matching '\'' (or ERR_UNTERMINATED)
+  //       elif b == '"':   consume through matching '"' with '\\' escapes
+  //       else:            cursor++
+  //     emit(WORD, word_start - input_ptr, cursor - word_start)
+  //
+  // Bumps SH_ST_LINES (slot 1) on every entry -- the lexer is the
+  // shell's own consumer of buffered lines, analogous to how pds_parse
+  // treats a script buffer. Bumps SH_ST_ERRORS on every reject path.
+  //
+  // The token count is written to _lx_token_count ONLY on the LX_OK
+  // path. On any error the slot is left untouched -- the return code
+  // is the authoritative signal, and the partial tokens table must
+  // not be read.
+  //
+  // Register plan:
+  //   r12 = input_ptr        (callee-save)
+  //   r13 = input_len        (callee-save)
+  //   r14 = end = r12 + r13  (callee-save)
+  //   r15 = token count      (callee-save; also the emit index)
+  //   rbx = cursor           (callee-save)
+  //   rcx = word_start scratch (set + used within word-emit; caller-save)
+  //   rax = byte load / return value / temporary
+  //   rdx = kind discriminator scratch (operator dispatch)
+  //   r10 = arithmetic scratch (index-byte compute)
+  //   r11 = .bss LEA scratch
+  //
+  // Prologue: 5 pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` =
+  // 48 bytes -- same shape as Pipeline.pipeline_plan. Matched
+  // epilogue at every return.
+  // ==========================================================================
+  pub let lexer_tokenize : (u64, u64) -> u64 !{mem} @{} =
+    fn (input_ptr: u64) (input_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): the missing byte-level split. Single-pass byte-at-a-time tokenizer that recognises words, five single-byte operators (|<>;&), single-quote, double-quote, and backslash escape. Emits fixed 24-byte records (offset, length, kind) into the _lx_tokens .bss singleton; count into _lx_token_count. All byte reads use the #1248 pattern (xor rax, rax; mov_b rax, [rbx]). All large immediates (0xFFFFECC0..0xFFFFECC3 error sentinels) go through mov rax, imm32. Operator dispatch inline via `cmp rax, imm8; je op_label` -- no jump table, no function call per byte. Word walker sub-machine handles quote/escape state transitions inline: single-quote skips-until-quote, double-quote skips-until-quote-honoring-backslash, bare-backslash consumes-two-bytes. 5 callee-save pushes (rbx cursor, r12 input_ptr, r13 input_len, r14 end, r15 token count) + `sub rsp, 8` = 48 bytes prologue; matches Pipeline.pipeline_plan shape for the nested shell_note call at prologue and every error path. Empty input (len==0) is a valid case per issue fingerprint: returns LX_OK with 0 tokens without ever peeking at input_ptr. len>0 with input_ptr==0 returns LX_ERR_BAD_ARGS (defensive; not in the issue's minimal set but avoids a null-deref that would corrupt the return code semantics). r11 reserved for .bss LEA scratch. Labels prefixed lx_tok_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // input_ptr
+        mov r13, rsi;                        // input_len
+
+        // Bump SH_ST_LINES (slot 1) -- lexer is a buffered-line consumer.
+        mov rdi, 1;
+        call shell_note;
+
+        // Gate: empty input is a valid case -- returns 0 tokens LX_OK
+        // regardless of input_ptr. The fingerprint for `empty line`
+        // and `whitespace-only line` both hit this branch (empty via
+        // len==0, whitespace-only via a normal walk that never emits).
+        cmp r13, 0;
+        je  lx_tok_done_empty;
+
+        // Gate: len > 0 with input_ptr == 0 is malformed.
+        cmp r12, 0;
+        je  lx_tok_bad_args;
+
+        // Init: token count = 0, end = input_ptr + input_len,
+        // cursor = input_ptr.
+        xor r15, r15;
+        mov r14, r12;
+        add r14, r13;
+        mov rbx, r12;
+
+      lx_tok_outer:
+        // End of input?
+        cmp rbx, r14;
+        jae lx_tok_finish;
+
+        // Peek byte at cursor.
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        // is_whitespace(b): { ' ', '\t', '\n', '\r' }
+        cmp rax, 0x20;
+        je  lx_tok_skip_ws;
+        cmp rax, 0x09;
+        je  lx_tok_skip_ws;
+        cmp rax, 0x0A;
+        je  lx_tok_skip_ws;
+        cmp rax, 0x0D;
+        je  lx_tok_skip_ws;
+
+        // is_operator(b): { '|', '<', '>', ';', '&' }
+        cmp rax, 0x7C;                       // '|'
+        je  lx_tok_op_pipe;
+        cmp rax, 0x3C;                       // '<'
+        je  lx_tok_op_redir_in;
+        cmp rax, 0x3E;                       // '>'
+        je  lx_tok_op_redir_out;
+        cmp rax, 0x3B;                       // ';'
+        je  lx_tok_op_semi;
+        cmp rax, 0x26;                       // '&'
+        je  lx_tok_op_amp;
+
+        // Otherwise: enter word body.
+        jmp lx_tok_word_start;
+
+      lx_tok_skip_ws:
+        add rbx, 1;
+        jmp lx_tok_outer;
+
+        // ------------------------------------------------------------
+        // Operator emit. rdx <- kind, then jmp to shared emit.
+        // ------------------------------------------------------------
+      lx_tok_op_pipe:
+        mov rdx, 2;                          // TOK_PIPE
+        jmp lx_tok_emit_op;
+      lx_tok_op_redir_in:
+        mov rdx, 3;                          // TOK_REDIR_IN
+        jmp lx_tok_emit_op;
+      lx_tok_op_redir_out:
+        mov rdx, 4;                          // TOK_REDIR_OUT
+        jmp lx_tok_emit_op;
+      lx_tok_op_semi:
+        mov rdx, 5;                          // TOK_SEMI
+        jmp lx_tok_emit_op;
+      lx_tok_op_amp:
+        mov rdx, 6;                          // TOK_AMP
+        jmp lx_tok_emit_op;
+
+      lx_tok_emit_op:
+        // Overflow gate.
+        cmp r15, 128;                        // TOK_MAX_PER_LINE
+        jae lx_tok_overflow;
+
+        // Byte offset in table = r15 * 24. Compute via r15*3 << 3
+        // (avoids 2-op imul r,imm pitfall from feedback_pdx_encoder_pitfalls).
+        mov r10, r15;
+        shl r10, 1;                          // r10 = r15 * 2
+        add r10, r15;                        // r10 = r15 * 3
+        shl r10, 3;                          // r10 = r15 * 24
+
+        lea r11, [rip + _lx_tokens];
+        // qword0 = source offset = rbx - r12
+        mov rax, rbx;
+        sub rax, r12;
+        mov [r11 + r10 * 1 + 0], rax;
+        // qword1 = length = 1
+        mov rax, 1;
+        mov [r11 + r10 * 1 + 8], rax;
+        // qword2 = kind (in rdx)
+        mov [r11 + r10 * 1 + 16], rdx;
+
+        add r15, 1;                          // token count++
+        add rbx, 1;                          // cursor past operator
+        jmp lx_tok_outer;
+
+        // ------------------------------------------------------------
+        // Word body. rcx = word_start; advance rbx to end-of-word.
+        // ------------------------------------------------------------
+      lx_tok_word_start:
+        mov rcx, rbx;                        // word_start
+
+      lx_tok_word_body:
+        cmp rbx, r14;
+        jae lx_tok_emit_word;
+
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        // Whitespace or operator ends the word.
+        cmp rax, 0x20;
+        je  lx_tok_emit_word;
+        cmp rax, 0x09;
+        je  lx_tok_emit_word;
+        cmp rax, 0x0A;
+        je  lx_tok_emit_word;
+        cmp rax, 0x0D;
+        je  lx_tok_emit_word;
+        cmp rax, 0x7C;
+        je  lx_tok_emit_word;
+        cmp rax, 0x3C;
+        je  lx_tok_emit_word;
+        cmp rax, 0x3E;
+        je  lx_tok_emit_word;
+        cmp rax, 0x3B;
+        je  lx_tok_emit_word;
+        cmp rax, 0x26;
+        je  lx_tok_emit_word;
+
+        // Backslash: consume the '\' + the following byte.
+        cmp rax, 0x5C;                       // '\'
+        je  lx_tok_word_esc;
+
+        // Single quote: consume through matching '\''.
+        cmp rax, 0x27;                       // '\''
+        je  lx_tok_word_sq;
+
+        // Double quote: consume through matching '"' honoring '\'.
+        cmp rax, 0x22;                       // '"'
+        je  lx_tok_word_dq;
+
+        // Normal in-word byte.
+        add rbx, 1;
+        jmp lx_tok_word_body;
+
+      lx_tok_word_esc:
+        // rbx points at '\'. Advance past it, then require a
+        // following byte and advance past that too.
+        add rbx, 1;
+        cmp rbx, r14;
+        jae lx_tok_invalid_escape;
+        add rbx, 1;
+        jmp lx_tok_word_body;
+
+      lx_tok_word_sq:
+        add rbx, 1;                          // past opening '\''
+      lx_tok_word_sq_scan:
+        cmp rbx, r14;
+        jae lx_tok_unterminated_quote;
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x27;                       // '\''
+        je  lx_tok_word_sq_end;
+        add rbx, 1;
+        jmp lx_tok_word_sq_scan;
+      lx_tok_word_sq_end:
+        add rbx, 1;                          // past closing '\''
+        jmp lx_tok_word_body;
+
+      lx_tok_word_dq:
+        add rbx, 1;                          // past opening '"'
+      lx_tok_word_dq_scan:
+        cmp rbx, r14;
+        jae lx_tok_unterminated_quote;
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0x22;                       // '"' closes
+        je  lx_tok_word_dq_end;
+        cmp rax, 0x5C;                       // '\' escapes
+        je  lx_tok_word_dq_esc;
+        add rbx, 1;
+        jmp lx_tok_word_dq_scan;
+      lx_tok_word_dq_esc:
+        // rbx at '\'. Advance past '\' and require another byte
+        // (else it's an invalid trailing escape inside the string).
+        add rbx, 1;
+        cmp rbx, r14;
+        jae lx_tok_invalid_escape;
+        add rbx, 1;
+        jmp lx_tok_word_dq_scan;
+      lx_tok_word_dq_end:
+        add rbx, 1;                          // past closing '"'
+        jmp lx_tok_word_body;
+
+      lx_tok_emit_word:
+        // Overflow gate.
+        cmp r15, 128;
+        jae lx_tok_overflow;
+
+        // Byte offset in table = r15 * 24.
+        mov r10, r15;
+        shl r10, 1;
+        add r10, r15;
+        shl r10, 3;
+
+        lea r11, [rip + _lx_tokens];
+        // qword0 = source offset = rcx (word_start) - r12
+        mov rax, rcx;
+        sub rax, r12;
+        mov [r11 + r10 * 1 + 0], rax;
+        // qword1 = length = rbx (cursor) - rcx (word_start)
+        mov rax, rbx;
+        sub rax, rcx;
+        mov [r11 + r10 * 1 + 8], rax;
+        // qword2 = kind = TOK_WORD
+        mov rax, 1;
+        mov [r11 + r10 * 1 + 16], rax;
+
+        add r15, 1;
+        jmp lx_tok_outer;
+
+        // ------------------------------------------------------------
+        // Success / failure epilogues.
+        // ------------------------------------------------------------
+      lx_tok_finish:
+        // Publish token count and return LX_OK.
+        lea r11, [rip + _lx_token_count];
+        mov [r11], r15;
+        xor rax, rax;                        // LX_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lx_tok_done_empty:
+        // len == 0 -- valid empty line, 0 tokens.
+        xor rax, rax;
+        lea r11, [rip + _lx_token_count];
+        mov [r11], rax;
+        xor rax, rax;                        // LX_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lx_tok_bad_args:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECC3;                 // LX_ERR_BAD_ARGS
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lx_tok_overflow:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECC0;                 // LX_ERR_OVERFLOW
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lx_tok_unterminated_quote:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECC1;                 // LX_ERR_UNTERMINATED_QUOTE
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lx_tok_invalid_escape:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECC2;                 // LX_ERR_INVALID_ESCAPE
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

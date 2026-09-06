@@ -4,6 +4,54 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-002: lexer (#29)
+
+The v1.0.0 audit found no lexer in the tree; ENH-002 lands one. `Lexer`
+turns a caller-owned byte buffer into a token stream in a `.bss`
+singleton table. Recognises words, five single-byte operators
+(`|<>;&`), single- and double-quoted strings, and backslash escape.
+Pure-function; no substrate touch.
+
+### Added
+
+- `src/lexer.pdx` — `Lexer` module. `lexer_tokenize(input_ptr,
+  input_len) → u64` populates the `.bss` singletons `_lx_tokens` (128
+  × 24-byte records) and `_lx_token_count`. Token vocabulary:
+  `TOK_WORD`, `TOK_PIPE`, `TOK_REDIR_IN`, `TOK_REDIR_OUT`, `TOK_SEMI`,
+  `TOK_AMP`, `TOK_EOF` (reserved). Fresh return-code sub-band
+  `0xFFFFECCx` (LX_ERR_OVERFLOW, LX_ERR_UNTERMINATED_QUOTE,
+  LX_ERR_INVALID_ESCAPE, LX_ERR_BAD_ARGS) — the issue's suggested
+  `0xFFFFEC5x` collides with the existing Pds allocation.
+- `tests/test_lexer.pdx` — `TestLexer` module. Seven golden-fingerprint
+  cases (bare `ls`, `ls -l`, `ls | cat`, `ls | cat > /tmp/f`,
+  `echo 'a b'`, empty line, whitespace-only line) + umbrella
+  `tlx_run_all`, in the `0xFFFFED5x` fail-code band. Matches the
+  `tsf_run_all` driver family shape.
+- `design/architecture.md` §2b — Lexer module documentation
+  (contract, token vocabulary, grouping rules, error codes,
+  fingerprint) matching the §2a shape ENH-001 established.
+- `design/architecture.md` §5 and §7.4 — return-code table extended
+  with the `0xFFFFECCx` Lexer row and the `0xFFFFED5x` TestLexer row.
+
+### Changed
+
+- `src/shell.pdx` — mirrored `SH_LX_*` constants in the
+  `0xFFFFECCx` band alongside the existing `LR_*` / `EX_*` mirrors,
+  so a Shell-level caller can spell every lexer sentinel without an
+  explicit Lexer import.
+- `manifest.pdxproj` — `src/lexer.pdx` registered after
+  `src/shell.pdx` and before `src/line_reader.pdx` (logical order:
+  lexer is a lower-level primitive the line reader will feed at
+  ENH-006); `tests/test_lexer.pdx` appended to the test list.
+
+### Unblocks
+
+`#30` parser (consumes the token stream), `#31` builtin dispatch
+(dispatches on `TOK_WORD[0]`), `#32` real exec (needs the argv
+token stream), `#33` `shell_main` REPL (assembles the read → lex →
+parse → exec pipeline). The critical path from ENH-002 through
+ENH-006 is now open at the tokenizer boundary.
+
 ## Unreleased — ENH-001: syscall floor (#28)
 
 First `syscall` instructions land in the tree. The v1.0.0 audit

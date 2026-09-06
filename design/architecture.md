@@ -213,6 +213,112 @@ local guarantee at build time; the substrate-half verification lives
 in the paideia-os v2.0 smoke loop that will invoke `tsf_run_all` after
 a shell binary lands.
 
+## 2b. `Lexer` module (src/lexer.pdx) — ENH-002 (#29)
+
+### 2b.1 Purpose
+
+The missing byte-level split. At `v1.0.0` (and through ENH-001) the
+shell repository had no lexer — nothing in `src/` turned a byte buffer
+into a token stream. `src/pds.pdx` parses `.pds` HEADERS but never
+sees a command line; `src/pipeline.pdx::pipeline_plan` presupposes a
+`stages_count` but has no way to derive one from raw bytes. ENH-002
+lands the tokenizer every downstream consumer (parser at ENH-003,
+builtin dispatch at ENH-004, real exec at ENH-005, REPL at ENH-006)
+consumes.
+
+### 2b.2 Contract
+
+```
+lexer_tokenize(input_ptr: u64, input_len: u64) -> u64
+lexer_reset() -> ()
+```
+
+Given a caller-owned byte buffer, produce a token stream in the
+module's `.bss` singletons:
+
+- `_lx_tokens : [u64; 384]` — 128 tokens × 3 qwords each (byte offset
+  `i*24` = token `i`). Layout per token: qword0 = offset in source
+  buffer, qword1 = length in bytes, qword2 = kind discriminator.
+- `_lx_token_count : u64` — number of tokens populated on success.
+  Written only on the `LX_OK` path; on any error the count is left
+  untouched (return code is the authoritative signal).
+
+### 2b.3 Token vocabulary
+
+Fixed set at ENH-002 (extending is a schema-version bump):
+
+- `TOK_WORD      = 1` — a run of non-whitespace, non-operator bytes,
+  possibly including quoted or escaped sub-runs that logically belong
+  to the same word.
+- `TOK_PIPE      = 2` — `|` (0x7C). Pipeline.pipeline_plan consumes.
+- `TOK_REDIR_IN  = 3` — `<` (0x3C).
+- `TOK_REDIR_OUT = 4` — `>` (0x3E).
+- `TOK_SEMI      = 5` — `;` (0x3B).
+- `TOK_AMP       = 6` — `&` (0x26).
+- `TOK_EOF       = 7` — reserved; never emitted. Caller reads
+  `_lx_token_count` for the end.
+
+### 2b.4 Grouping rules
+
+- **Single-quote `'…'`** — bytes between the quotes are literal; no
+  expansion, no backslash escape. Missing closing quote →
+  `LX_ERR_UNTERMINATED_QUOTE`.
+- **Double-quote `"…"`** — bytes are literal except for `\<char>`
+  which yields the literal `<char>`. Missing closing quote →
+  `LX_ERR_UNTERMINATED_QUOTE`. Trailing `\` inside the quoted region
+  → `LX_ERR_INVALID_ESCAPE`.
+- **Backslash `\<char>` outside quotes** — the `\` and the following
+  byte both belong to the current word. Trailing `\` at end-of-input
+  → `LX_ERR_INVALID_ESCAPE`.
+- **Adjacency** — quoted / escaped fragments join into ONE word:
+  `hello"a b"world` is one WORD token spanning all 15 bytes. `echo
+  'a b'` tokenizes as WORD("echo") WORD("'a b'") — two words, because
+  the space between them is unquoted. The token's (offset, length)
+  span includes the quote bytes themselves; the caller decides
+  whether to strip them at expansion time.
+
+### 2b.5 Error codes
+
+- `LX_ERR_OVERFLOW = 0xFFFFECC0` — more than `TOK_MAX_PER_LINE` (128)
+  tokens.
+- `LX_ERR_UNTERMINATED_QUOTE = 0xFFFFECC1` — `'…` or `"…` never closed.
+- `LX_ERR_INVALID_ESCAPE = 0xFFFFECC2` — `\` at end of input (or at
+  end of a double-quoted region).
+- `LX_ERR_BAD_ARGS = 0xFFFFECC3` — `input_ptr == 0 && input_len > 0`.
+  `input_len == 0` is always a valid empty-line case yielding 0
+  tokens without ever loading `input_ptr`.
+
+The band `0xFFFFECCx` is the first unused sub-band above BrokerBind
+(`0xFFFFECBx`); the issue's suggested `0xFFFFEC5x` collides with the
+existing Pds allocation.
+
+### 2b.6 Substrate deferral
+
+None. The lexer is a pure-function transformer over caller-owned
+bytes; it makes no syscall and touches no substrate. This is what
+lets it land BEFORE any of ENH-003 through ENH-006 (parser through
+REPL) that will consume its output.
+
+### 2b.7 Fingerprint (`tests/test_lexer.pdx`)
+
+Seven cases in the `0xFFFFED5x` fail-code band cover the tokenization
+surface:
+
+- `tlx_case_bare_ls` — `ls` → 1 WORD(0, 2).
+- `tlx_case_ls_l` — `ls -l` → WORD(0, 2) WORD(3, 2).
+- `tlx_case_pipe` — `ls | cat` → WORD PIPE WORD.
+- `tlx_case_pipe_redir` — `ls | cat > /tmp/f` → WORD PIPE WORD
+  REDIR_OUT WORD.
+- `tlx_case_quoted` — `echo 'a b'` → WORD(0, 4) WORD(5, 5) — the
+  quoted region including its quote bytes is ONE word.
+- `tlx_case_empty` — `len == 0` → 0 tokens, LX_OK.
+- `tlx_case_ws_only` — `"   "` → 0 tokens, LX_OK.
+
+The umbrella driver `tlx_run_all` matches the
+`tsf_run_all` / `tsm_run_all` / `trm_run_all` / `tcn_run_all` /
+`taf_run_all` shape so the future boot-time smoke harness invokes
+all six drivers in one loop with a uniform return-code contract.
+
 ## 3. `LineReader` module (src/line_reader.pdx)
 
 ### 3.1 Contract
@@ -754,7 +860,15 @@ the smoke matrix pulls both sides into one build.
 0xFFFFEC91  CMDR_ERR_TOO_LONG   CommandRecord.M3: argv_bytes > CMDR_ARGV_MAX
 0xFFFFEC92  CMDR_ERR_TRUNCATED  CommandRecord.M3: dst_len < required
 0xFFFFEC93  CMDR_ERR_BAD_EXIT   CommandRecord.M3: exit_code > 255 (close)
+0xFFFFECC0  LX_ERR_OVERFLOW           Lexer.ENH-002: >TOK_MAX_PER_LINE tokens
+0xFFFFECC1  LX_ERR_UNTERMINATED_QUOTE Lexer.ENH-002: '...' or "..." not closed
+0xFFFFECC2  LX_ERR_INVALID_ESCAPE     Lexer.ENH-002: `\` at end of input
+0xFFFFECC3  LX_ERR_BAD_ARGS           Lexer.ENH-002: input_ptr==0 && len>0
 ```
+
+(Sub-bands `0xFFFFECAx` (ReleaseManifest) and `0xFFFFECBx` (BrokerBind)
+sit between CMDR and LX; see the M5 sections above for their full
+tables.)
 
 The band sits below libpdx-elevate's `0xFFFFEA00..0xFFFFEA0F` and
 above libpdx-cap's `0xFFFFFFxx` so a downstream consumer can tell
@@ -863,6 +977,7 @@ golden bytes don't match, there's no point booting the guest.
 - `0xFFFFED2x` — TestSmokeMatrix (M4-003).
 - `0xFFFFED3x` — TestReleaseManifest (M5-001).
 - `0xFFFFED4x` — TestSyscallFloor (ENH-001, #28).
+- `0xFFFFED5x` — TestLexer (ENH-002, #29).
 
 These are disjoint from the shell's own `0xFFFFECxx` band so an
 operator reading a test-run log can tell "SUT rejected input" from

@@ -113,6 +113,19 @@ module Shell = structure {
   pub let EX_ERR_EXECVE_FAIL     : u64 = 0xFFFFEC22   // M2+: sys_execve refused
   pub let EX_ERR_WAIT_FAIL       : u64 = 0xFFFFEC23   // M2+: sys_wait4 refused
 
+  // Lexer errors (0xFFFFECCx) -- ENH-002 (#29). Authoritative
+  // definitions in src/lexer.pdx; mirrored here for the same reason
+  // the KIND ordinals are mirrored (shell.pdx is the single point
+  // where a downstream consumer can spell every 0xFFFFECxx sentinel
+  // without linking every module). Kept in the SH_LX_* namespace so
+  // a Shell-level caller can spell them without an explicit Lexer
+  // module import.
+  pub let SH_LX_OK                      : u64 = 0            // == LX_OK
+  pub let SH_LX_ERR_OVERFLOW            : u64 = 0xFFFFECC0
+  pub let SH_LX_ERR_UNTERMINATED_QUOTE  : u64 = 0xFFFFECC1
+  pub let SH_LX_ERR_INVALID_ESCAPE      : u64 = 0xFFFFECC2
+  pub let SH_LX_ERR_BAD_ARGS            : u64 = 0xFFFFECC3
+
   // ==========================================================================
   // Session-level stats -- sixteen u64 slots, cache-line aligned.
   //

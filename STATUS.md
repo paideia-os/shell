@@ -230,6 +230,10 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFECB1 | BB_ERR_BAD_ARGS   | BrokerBind.M5: dst/endpoint/name null or name_len == 0     |
 | 0xFFFFECB2 | BB_ERR_NAME_TOO_LONG | BrokerBind.M5: name_len > 256 (BB_NAME_MAX)             |
 | 0xFFFFECB3 | BB_ERR_TRUNCATED  | BrokerBind.M5: dst_len < required record size              |
+| 0xFFFFECC0 | LX_ERR_OVERFLOW           | Lexer.ENH-002: > 128 tokens (TOK_MAX_PER_LINE)     |
+| 0xFFFFECC1 | LX_ERR_UNTERMINATED_QUOTE | Lexer.ENH-002: `'..'` or `".."` not closed         |
+| 0xFFFFECC2 | LX_ERR_INVALID_ESCAPE     | Lexer.ENH-002: trailing `\` at end of input        |
+| 0xFFFFECC3 | LX_ERR_BAD_ARGS           | Lexer.ENH-002: input_ptr == 0 && input_len > 0     |
 
 ## Milestone rollup
 

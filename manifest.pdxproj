@@ -34,6 +34,7 @@ caps_decl   = caps.decl
 sources:
   - src/syscall.pdx               # ENH-001 (#28): SC+ sysno constants + wrappers
   - src/shell.pdx                 # M1-001: top-level scaffold + stats
+  - src/lexer.pdx                 # ENH-002 (#29): command-line tokenizer
   - src/line_reader.pdx           # M1-002: LineReader skeleton
   - src/exec.pdx                  # M1-003 + M2-003: Exec skeleton + narrow-caps
   - src/session.pdx               # M2-001: KIND_SHELL_SESSION mint + derive
@@ -75,6 +76,7 @@ tests:
   - tests/test_smoke_matrix.pdx    # M4-003: encoder-half QEMU smoke fixtures
   - tests/test_release_manifest.pdx # M5-001: release-manifest encoder goldens
   - tests/test_syscall_floor.pdx   # ENH-001 (#28): SC+ shim runtime fingerprint
+  - tests/test_lexer.pdx           # ENH-002 (#29): lexer golden-fingerprint matrix
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

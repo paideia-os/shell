@@ -1,0 +1,761 @@
+// tests/test_lexer.pdx -- shell.ENH-002 (paideia-os/shell#29)
+//
+// TestLexer module: golden-fingerprint driver for Lexer.lexer_tokenize.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Seven cases exhaust the tokenization surface the issue's fingerprint
+// clause names:
+//
+//   tlx_case_bare_ls        "ls"            -> 1 WORD (0,2)
+//   tlx_case_ls_l           "ls -l"         -> 2 WORDs at (0,2) (3,2)
+//   tlx_case_pipe           "ls | cat"      -> WORD PIPE WORD
+//   tlx_case_pipe_redir     "ls | cat > /tmp/f"
+//                                           -> WORD PIPE WORD REDIR_OUT WORD
+//   tlx_case_quoted         "echo 'a b'"    -> WORD(0,4) WORD(5,5)
+//                                              (quoted 'a b' is ONE word)
+//   tlx_case_empty          len=0           -> 0 tokens, LX_OK
+//   tlx_case_ws_only        "   "           -> 0 tokens, LX_OK
+//
+// Each case is a pure-function driver: populate a byte fixture in
+// .bss via mov_b writes, call lexer_tokenize, verify _lx_token_count
+// and the (offset, length, kind) triples for each expected token.
+// Any mismatch returns a TLX_FAIL_* sentinel in the 0xFFFFED5x band.
+// The umbrella driver `tlx_run_all` matches the tsf_run_all shape
+// from ENH-001 so the boot-time smoke harness can invoke it alongside
+// the existing five drivers in one loop.
+//
+// =============================================================================
+// WHY BYTE-WRITE FIXTURES (not string literals)
+// =============================================================================
+//
+// The fingerprint inputs contain '|', '<', '>', '\'', and '"' -- bytes
+// whose behaviour inside a paideia-as string literal is under-
+// documented in the repo (no existing .pdx string literal in this
+// tree contains any of them). tsm_reset in tests/test_smoke_matrix.pdx
+// establishes the byte-write pattern for the same reason (its "ls |
+// cat" fixture is populated one byte at a time), so this module
+// follows suit. All fixtures live in `[u8; N] uninit @align(8)` .bss
+// slots that tlx_reset fills from mov_b constants before every case
+// -- deterministic per case, no rodata string-literal parsing
+// dependency.
+//
+// =============================================================================
+// FAIL-CODE BAND
+// =============================================================================
+//
+//   0            TLX_PASS               all cases passed
+//   0xFFFFED51   TLX_FAIL_LS            "ls" case failed
+//   0xFFFFED52   TLX_FAIL_LS_L          "ls -l" case failed
+//   0xFFFFED53   TLX_FAIL_PIPE          "ls | cat" case failed
+//   0xFFFFED54   TLX_FAIL_PIPE_REDIR    "ls | cat > /tmp/f" case failed
+//   0xFFFFED55   TLX_FAIL_QUOTED        "echo 'a b'" case failed
+//   0xFFFFED56   TLX_FAIL_EMPTY         empty-input case failed
+//   0xFFFFED57   TLX_FAIL_WS_ONLY       "   " case failed
+//
+// The 0xFFFFED5x band extends the family
+//   0xFFFFED0x  TestCapsNarrow
+//   0xFFFFED1x  TestAuditFirst
+//   0xFFFFED2x  TestSmokeMatrix
+//   0xFFFFED3x  TestReleaseManifest
+//   0xFFFFED4x  TestSyscallFloor
+//   0xFFFFED5x  TestLexer               <-- this module
+// so a boot-time smoke log distinguishes which test module refused an
+// invariant by the high two bytes of the return alone.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`TestLexer`).
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (small counts +
+//     ASCII byte literals; largest is 17 for the "/tmp/f" tail
+//     length). No large-imm compares -- no r11 staging needed for
+//     compares.
+//   - r11 scratch for .bss reach.
+//   - Byte writes to fixtures use mov_b (destination-write side of
+//     #1248 pattern).
+//   - Case entries push rbx + r12 + `sub rsp, 8` = 24 bytes prologue
+//     for the nested lexer_tokenize call; matched pop sequence at
+//     every return.
+
+module TestLexer = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFED5x band)
+  // ==========================================================================
+  pub let TLX_PASS             : u64 = 0
+  pub let TLX_FAIL_LS          : u64 = 0xFFFFED51
+  pub let TLX_FAIL_LS_L        : u64 = 0xFFFFED52
+  pub let TLX_FAIL_PIPE        : u64 = 0xFFFFED53
+  pub let TLX_FAIL_PIPE_REDIR  : u64 = 0xFFFFED54
+  pub let TLX_FAIL_QUOTED      : u64 = 0xFFFFED55
+  pub let TLX_FAIL_EMPTY       : u64 = 0xFFFFED56
+  pub let TLX_FAIL_WS_ONLY     : u64 = 0xFFFFED57
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  // Each buffer is sized to the maximum expected input length rounded
+  // up to a qword multiple, with a trailing NUL byte for safety (the
+  // lexer honours the explicit length parameter and never reads past
+  // it, but a NUL sentinel makes debugger inspection easier).
+  //
+  //   _tlx_in_ls          "ls"                  2 bytes
+  //   _tlx_in_ls_l        "ls -l"               5 bytes
+  //   _tlx_in_pipe        "ls | cat"            8 bytes
+  //   _tlx_in_pipe_redir  "ls | cat > /tmp/f"  17 bytes
+  //   _tlx_in_quoted      "echo 'a b'"         10 bytes
+  //   _tlx_in_ws          "   "                 3 bytes
+  // ==========================================================================
+  pub let mut _tlx_in_ls          : [u8; 8]  = uninit @align(8)
+  pub let mut _tlx_in_ls_l        : [u8; 8]  = uninit @align(8)
+  pub let mut _tlx_in_pipe        : [u8; 16] = uninit @align(8)
+  pub let mut _tlx_in_pipe_redir  : [u8; 24] = uninit @align(8)
+  pub let mut _tlx_in_quoted      : [u8; 16] = uninit @align(8)
+  pub let mut _tlx_in_ws          : [u8; 8]  = uninit @align(8)
+
+  // ==========================================================================
+  // tlx_reset() -> ()
+  //
+  // Zero every fixture qword and then populate the six input buffers
+  // byte-by-byte with the fingerprint literals. Leaf function; r10
+  // base, rcx loop index, rax byte constant.
+  //
+  // Followed by lexer_reset (implicit call from each case, not here)
+  // to zero the shared _lx_token_count -- this reset only prepares
+  // input-side fixtures.
+  // ==========================================================================
+  pub let tlx_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): zero all 6 fixture buffers and populate them with the fingerprint literals via mov_b. Each populate sequence writes one byte per instruction using the same idiom tsm_reset established in test_smoke_matrix.pdx for its 'ls | cat' fixture. Loop bounds are byte-count / 8 (1..3 iterations per buffer); all fit imm <= 0x7FFFFFFF. Leaf function -- no push/pop parity. Labels prefixed tlx_rs_.",
+      block: {
+        // Zero _tlx_in_ls (1 qword).
+        xor rax, rax;
+        lea r10, [rip + _tlx_in_ls];
+        mov [r10 + 0], rax;
+
+        // Zero _tlx_in_ls_l (1 qword).
+        lea r10, [rip + _tlx_in_ls_l];
+        mov [r10 + 0], rax;
+
+        // Zero _tlx_in_pipe (2 qwords).
+        lea r10, [rip + _tlx_in_pipe];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // Zero _tlx_in_pipe_redir (3 qwords).
+        lea r10, [rip + _tlx_in_pipe_redir];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        mov [r10 + 16], rax;
+
+        // Zero _tlx_in_quoted (2 qwords).
+        lea r10, [rip + _tlx_in_quoted];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // Zero _tlx_in_ws (1 qword).
+        lea r10, [rip + _tlx_in_ws];
+        mov [r10 + 0], rax;
+
+        // Populate _tlx_in_ls: "ls" (2 bytes).
+        lea r10, [rip + _tlx_in_ls];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+
+        // Populate _tlx_in_ls_l: "ls -l" (5 bytes).
+        lea r10, [rip + _tlx_in_ls_l];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+        mov rax, 0x20; mov_b [r10 + 2], rax;    // ' '
+        mov rax, 0x2d; mov_b [r10 + 3], rax;    // '-'
+        mov rax, 0x6c; mov_b [r10 + 4], rax;    // 'l'
+
+        // Populate _tlx_in_pipe: "ls | cat" (8 bytes).
+        lea r10, [rip + _tlx_in_pipe];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+        mov rax, 0x20; mov_b [r10 + 2], rax;    // ' '
+        mov rax, 0x7c; mov_b [r10 + 3], rax;    // '|'
+        mov rax, 0x20; mov_b [r10 + 4], rax;    // ' '
+        mov rax, 0x63; mov_b [r10 + 5], rax;    // 'c'
+        mov rax, 0x61; mov_b [r10 + 6], rax;    // 'a'
+        mov rax, 0x74; mov_b [r10 + 7], rax;    // 't'
+
+        // Populate _tlx_in_pipe_redir: "ls | cat > /tmp/f" (17 bytes).
+        lea r10, [rip + _tlx_in_pipe_redir];
+        mov rax, 0x6c; mov_b [r10 +  0], rax;   // 'l'
+        mov rax, 0x73; mov_b [r10 +  1], rax;   // 's'
+        mov rax, 0x20; mov_b [r10 +  2], rax;   // ' '
+        mov rax, 0x7c; mov_b [r10 +  3], rax;   // '|'
+        mov rax, 0x20; mov_b [r10 +  4], rax;   // ' '
+        mov rax, 0x63; mov_b [r10 +  5], rax;   // 'c'
+        mov rax, 0x61; mov_b [r10 +  6], rax;   // 'a'
+        mov rax, 0x74; mov_b [r10 +  7], rax;   // 't'
+        mov rax, 0x20; mov_b [r10 +  8], rax;   // ' '
+        mov rax, 0x3e; mov_b [r10 +  9], rax;   // '>'
+        mov rax, 0x20; mov_b [r10 + 10], rax;   // ' '
+        mov rax, 0x2f; mov_b [r10 + 11], rax;   // '/'
+        mov rax, 0x74; mov_b [r10 + 12], rax;   // 't'
+        mov rax, 0x6d; mov_b [r10 + 13], rax;   // 'm'
+        mov rax, 0x70; mov_b [r10 + 14], rax;   // 'p'
+        mov rax, 0x2f; mov_b [r10 + 15], rax;   // '/'
+        mov rax, 0x66; mov_b [r10 + 16], rax;   // 'f'
+
+        // Populate _tlx_in_quoted: "echo 'a b'" (10 bytes).
+        // Byte layout:
+        //   0 'e'   1 'c'   2 'h'   3 'o'   4 ' '
+        //   5 '\''  6 'a'   7 ' '   8 'b'   9 '\''
+        lea r10, [rip + _tlx_in_quoted];
+        mov rax, 0x65; mov_b [r10 + 0], rax;    // 'e'
+        mov rax, 0x63; mov_b [r10 + 1], rax;    // 'c'
+        mov rax, 0x68; mov_b [r10 + 2], rax;    // 'h'
+        mov rax, 0x6f; mov_b [r10 + 3], rax;    // 'o'
+        mov rax, 0x20; mov_b [r10 + 4], rax;    // ' '
+        mov rax, 0x27; mov_b [r10 + 5], rax;    // '\''
+        mov rax, 0x61; mov_b [r10 + 6], rax;    // 'a'
+        mov rax, 0x20; mov_b [r10 + 7], rax;    // ' '
+        mov rax, 0x62; mov_b [r10 + 8], rax;    // 'b'
+        mov rax, 0x27; mov_b [r10 + 9], rax;    // '\''
+
+        // Populate _tlx_in_ws: "   " (3 spaces).
+        lea r10, [rip + _tlx_in_ws];
+        mov rax, 0x20; mov_b [r10 + 0], rax;
+        mov rax, 0x20; mov_b [r10 + 1], rax;
+        mov rax, 0x20; mov_b [r10 + 2], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_case_bare_ls() -> u64
+  //
+  // Input: "ls" (2 bytes). Expected: 1 TOK_WORD at (offset=0, len=2).
+  //
+  // Prologue: 2 pushes (rbx, r12) + `sub rsp, 8` = 24 bytes; rsp % 16
+  // aligned for the nested lexer_tokenize call.
+  // ==========================================================================
+  pub let tlx_case_bare_ls : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): the bare-command case. 'ls' contains no whitespace and no operators, so the lexer walks two bytes into the word body then emits one TOK_WORD at (offset=0, length=2, kind=1). Any deviation in count or triple returns TLX_FAIL_LS. 2 pushes prologue + sub rsp 8; labels prefixed tlx_ls_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tlx_reset;
+
+        lea rdi, [rip + _tlx_in_ls];
+        mov rsi, 2;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tlx_ls_fail;
+
+        // Verify token count == 1.
+        lea r10, [rip + _lx_token_count];
+        mov rax, [r10];
+        cmp rax, 1;
+        jne tlx_ls_fail;
+
+        // Verify token[0] = (offset=0, length=2, kind=1).
+        lea r12, [rip + _lx_tokens];
+        mov rax, [r12 + 0];                  // offset
+        cmp rax, 0;
+        jne tlx_ls_fail;
+        mov rax, [r12 + 8];                  // length
+        cmp rax, 2;
+        jne tlx_ls_fail;
+        mov rax, [r12 + 16];                 // kind
+        cmp rax, 1;                          // TOK_WORD
+        jne tlx_ls_fail;
+
+        xor rax, rax;                        // TLX_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tlx_ls_fail:
+        mov rax, 0xFFFFED51;                 // TLX_FAIL_LS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_case_ls_l() -> u64
+  //
+  // Input: "ls -l" (5 bytes). Expected: 2 TOK_WORDs at
+  //   token[0] = (0, 2, WORD)  -- "ls"
+  //   token[1] = (3, 2, WORD)  -- "-l"
+  // ==========================================================================
+  pub let tlx_case_ls_l : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): flag-argument case. Whitespace between 'ls' and '-l' terminates the first word and skips ws; the second word starts at offset 3, spans '-l', length 2. Confirms the word-terminator loop honors whitespace as a boundary. 2 pushes prologue; labels prefixed tlx_ll_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tlx_reset;
+
+        lea rdi, [rip + _tlx_in_ls_l];
+        mov rsi, 5;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tlx_ll_fail;
+
+        lea r10, [rip + _lx_token_count];
+        mov rax, [r10];
+        cmp rax, 2;
+        jne tlx_ll_fail;
+
+        lea r12, [rip + _lx_tokens];
+
+        // token[0] = (0, 2, WORD).
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne tlx_ll_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 2;
+        jne tlx_ll_fail;
+        mov rax, [r12 + 16];
+        cmp rax, 1;
+        jne tlx_ll_fail;
+
+        // token[1] = (3, 2, WORD).  Byte offset = 24.
+        mov rax, [r12 + 24];
+        cmp rax, 3;
+        jne tlx_ll_fail;
+        mov rax, [r12 + 32];
+        cmp rax, 2;
+        jne tlx_ll_fail;
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne tlx_ll_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tlx_ll_fail:
+        mov rax, 0xFFFFED52;                 // TLX_FAIL_LS_L
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_case_pipe() -> u64
+  //
+  // Input: "ls | cat" (8 bytes). Expected: 3 tokens
+  //   token[0] = (0, 2, WORD)   -- "ls"
+  //   token[1] = (3, 1, PIPE)   -- "|"
+  //   token[2] = (5, 3, WORD)   -- "cat"
+  //
+  // Load-bearing: this is the token stream Pipeline.pipeline_plan
+  // consumes at stages_count=2 in the ls|cat smoke matrix. If the
+  // TOK_PIPE emit misses a pipe, the smoke would silently under-plan
+  // the sidecar.
+  // ==========================================================================
+  pub let tlx_case_pipe : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): pipe operator case. The `|` at offset 3 must become a standalone TOK_PIPE (kind=2, length=1); the two adjacent words 'ls' and 'cat' must each become a TOK_WORD. This is the encoder side of the ls|cat smoke -- the token stream Pipeline.pipeline_plan will consume at stages_count=2 once ENH-005 wires the tokenizer output into exec dispatch. 2 pushes prologue; labels prefixed tlx_pi_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tlx_reset;
+
+        lea rdi, [rip + _tlx_in_pipe];
+        mov rsi, 8;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tlx_pi_fail;
+
+        lea r10, [rip + _lx_token_count];
+        mov rax, [r10];
+        cmp rax, 3;
+        jne tlx_pi_fail;
+
+        lea r12, [rip + _lx_tokens];
+
+        // token[0] = (0, 2, WORD).
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne tlx_pi_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 2;
+        jne tlx_pi_fail;
+        mov rax, [r12 + 16];
+        cmp rax, 1;
+        jne tlx_pi_fail;
+
+        // token[1] = (3, 1, PIPE).  Byte offset = 24.
+        mov rax, [r12 + 24];
+        cmp rax, 3;
+        jne tlx_pi_fail;
+        mov rax, [r12 + 32];
+        cmp rax, 1;
+        jne tlx_pi_fail;
+        mov rax, [r12 + 40];
+        cmp rax, 2;                          // TOK_PIPE
+        jne tlx_pi_fail;
+
+        // token[2] = (5, 3, WORD).  Byte offset = 48.
+        mov rax, [r12 + 48];
+        cmp rax, 5;
+        jne tlx_pi_fail;
+        mov rax, [r12 + 56];
+        cmp rax, 3;
+        jne tlx_pi_fail;
+        mov rax, [r12 + 64];
+        cmp rax, 1;
+        jne tlx_pi_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tlx_pi_fail:
+        mov rax, 0xFFFFED53;                 // TLX_FAIL_PIPE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_case_pipe_redir() -> u64
+  //
+  // Input: "ls | cat > /tmp/f" (17 bytes). Expected: 5 tokens
+  //   token[0] = ( 0, 2, WORD)       -- "ls"
+  //   token[1] = ( 3, 1, PIPE)       -- "|"
+  //   token[2] = ( 5, 3, WORD)       -- "cat"
+  //   token[3] = ( 9, 1, REDIR_OUT)  -- ">"
+  //   token[4] = (11, 6, WORD)       -- "/tmp/f"
+  //
+  // Load-bearing: exercises the redir_out operator dispatch AND the
+  // '/' character inside a word (must not terminate the word).
+  // ==========================================================================
+  pub let tlx_case_pipe_redir : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): combined pipe + output-redirect case. Adds TOK_REDIR_OUT (kind=4) to the coverage and exercises the '/' character inside a word (path bytes are just word bytes -- '/' is neither an operator nor a special-cased character). The final word '/tmp/f' spans offset 11 through 16, length 6. 2 pushes prologue; labels prefixed tlx_pr_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tlx_reset;
+
+        lea rdi, [rip + _tlx_in_pipe_redir];
+        mov rsi, 17;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tlx_pr_fail;
+
+        lea r10, [rip + _lx_token_count];
+        mov rax, [r10];
+        cmp rax, 5;
+        jne tlx_pr_fail;
+
+        lea r12, [rip + _lx_tokens];
+
+        // token[0] = (0, 2, WORD).
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 2;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 16];
+        cmp rax, 1;
+        jne tlx_pr_fail;
+
+        // token[1] = (3, 1, PIPE).
+        mov rax, [r12 + 24];
+        cmp rax, 3;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 32];
+        cmp rax, 1;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 40];
+        cmp rax, 2;
+        jne tlx_pr_fail;
+
+        // token[2] = (5, 3, WORD).
+        mov rax, [r12 + 48];
+        cmp rax, 5;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 56];
+        cmp rax, 3;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 64];
+        cmp rax, 1;
+        jne tlx_pr_fail;
+
+        // token[3] = (9, 1, REDIR_OUT).  Byte offset = 72.
+        mov rax, [r12 + 72];
+        cmp rax, 9;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 80];
+        cmp rax, 1;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 88];
+        cmp rax, 4;                          // TOK_REDIR_OUT
+        jne tlx_pr_fail;
+
+        // token[4] = (11, 6, WORD).  Byte offset = 96.
+        mov rax, [r12 + 96];
+        cmp rax, 11;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 104];
+        cmp rax, 6;
+        jne tlx_pr_fail;
+        mov rax, [r12 + 112];
+        cmp rax, 1;
+        jne tlx_pr_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tlx_pr_fail:
+        mov rax, 0xFFFFED54;                 // TLX_FAIL_PIPE_REDIR
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_case_quoted() -> u64
+  //
+  // Input: "echo 'a b'" (10 bytes). Expected: 2 TOK_WORDs
+  //   token[0] = (0, 4, WORD)  -- "echo"
+  //   token[1] = (5, 5, WORD)  -- "'a b'"
+  //
+  // Load-bearing: the space between 'a' and 'b' is inside single
+  // quotes, so it does NOT terminate the second word; the single
+  // quotes themselves are part of the word span (the caller decides
+  // whether to strip them at expansion time).
+  // ==========================================================================
+  pub let tlx_case_quoted : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): the load-bearing quote case. The space at offset 7 is INSIDE the single-quoted region and MUST NOT terminate the second word. The lexer's word walker enters the single-quote sub-machine when it sees `'` at offset 5, scans through 'a', ' ', 'b' until the closing `'` at offset 9, then returns to the word body which finds no more input and emits WORD(5, 5). Any lexer that would emit 3 words for this input (splitting 'a' and 'b' at the interior space) is broken -- POSIX shell semantics require the quoted region be one word. 2 pushes prologue; labels prefixed tlx_qu_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tlx_reset;
+
+        lea rdi, [rip + _tlx_in_quoted];
+        mov rsi, 10;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tlx_qu_fail;
+
+        lea r10, [rip + _lx_token_count];
+        mov rax, [r10];
+        cmp rax, 2;
+        jne tlx_qu_fail;
+
+        lea r12, [rip + _lx_tokens];
+
+        // token[0] = (0, 4, WORD).
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne tlx_qu_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 4;
+        jne tlx_qu_fail;
+        mov rax, [r12 + 16];
+        cmp rax, 1;
+        jne tlx_qu_fail;
+
+        // token[1] = (5, 5, WORD).
+        mov rax, [r12 + 24];
+        cmp rax, 5;
+        jne tlx_qu_fail;
+        mov rax, [r12 + 32];
+        cmp rax, 5;
+        jne tlx_qu_fail;
+        mov rax, [r12 + 40];
+        cmp rax, 1;
+        jne tlx_qu_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tlx_qu_fail:
+        mov rax, 0xFFFFED55;                 // TLX_FAIL_QUOTED
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_case_empty() -> u64
+  //
+  // Input: len=0. Expected: LX_OK with 0 tokens. The lexer must NOT
+  // deref the input pointer when len==0.
+  // ==========================================================================
+  pub let tlx_case_empty : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): the empty-line case. An empty line is a valid shell input (the user pressed enter with no text) that produces zero tokens. The lexer's fast path checks len==0 BEFORE loading input_ptr so a caller passing a null pointer with zero length succeeds. This test uses _tlx_in_ls as the pointer (a valid buffer) but passes rsi=0 so the null-safety property is exercised by the empty-buffer contract, not by a null pointer. 2 pushes prologue; labels prefixed tlx_em_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tlx_reset;
+
+        lea rdi, [rip + _tlx_in_ls];         // pointer irrelevant when len==0
+        mov rsi, 0;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tlx_em_fail;
+
+        lea r10, [rip + _lx_token_count];
+        mov rax, [r10];
+        cmp rax, 0;
+        jne tlx_em_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tlx_em_fail:
+        mov rax, 0xFFFFED56;                 // TLX_FAIL_EMPTY
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_case_ws_only() -> u64
+  //
+  // Input: "   " (3 spaces). Expected: LX_OK with 0 tokens (the walker
+  // consumes all whitespace and emits nothing).
+  // ==========================================================================
+  pub let tlx_case_ws_only : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): the whitespace-only case. Three spaces trigger the ws-skip branch three times; the outer loop then hits end-of-input without ever entering the word path, and lx_tok_finish publishes count=0 and returns LX_OK. Distinct from tlx_case_empty because it exercises the walk path (not the len==0 fast-path). 2 pushes prologue; labels prefixed tlx_ws_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tlx_reset;
+
+        lea rdi, [rip + _tlx_in_ws];
+        mov rsi, 3;
+        call lexer_tokenize;
+        cmp rax, 0;
+        jne tlx_ws_fail;
+
+        lea r10, [rip + _lx_token_count];
+        mov rax, [r10];
+        cmp rax, 0;
+        jne tlx_ws_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tlx_ws_fail:
+        mov rax, 0xFFFFED57;                 // TLX_FAIL_WS_ONLY
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlx_run_all() -> u64
+  //
+  // Umbrella: drive all 7 cases in fingerprint order. Short-circuit on
+  // first non-zero. Same shape as tsf_run_all / tsm_run_all etc.
+  //
+  // Prologue: 1 push (rbx) + `sub rsp, 8` = 16 bytes; rsp % 16 == 0
+  // convention for the nested SysV calls.
+  // ==========================================================================
+  pub let tlx_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell.ENH-002 (#29): drive all 7 tokenizer fingerprint cases in issue order (bare_ls, ls_l, pipe, pipe_redir, quoted, empty, ws_only). Short-circuit on first non-zero return -- the umbrella returns the failing case's sentinel, matching the tsf_run_all / tsm_run_all / trm_run_all family shape so the boot-time smoke harness can invoke all six drivers in one loop with a uniform return-code contract. 1 push (rbx) + sub rsp 8 prologue; labels prefixed tlx_ra_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        call tlx_case_bare_ls;
+        cmp rax, 0;
+        jne tlx_ra_out;
+
+        call tlx_case_ls_l;
+        cmp rax, 0;
+        jne tlx_ra_out;
+
+        call tlx_case_pipe;
+        cmp rax, 0;
+        jne tlx_ra_out;
+
+        call tlx_case_pipe_redir;
+        cmp rax, 0;
+        jne tlx_ra_out;
+
+        call tlx_case_quoted;
+        cmp rax, 0;
+        jne tlx_ra_out;
+
+        call tlx_case_empty;
+        cmp rax, 0;
+        jne tlx_ra_out;
+
+        call tlx_case_ws_only;
+
+      tlx_ra_out:
+        add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+}
