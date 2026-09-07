@@ -1,0 +1,376 @@
+// src/tokenizer.pdx -- R106.M1 (paideia-os/shell#2341)
+//
+// Tokenizer module: whitespace-separated argv-shape tokenization with
+// basic single-quote and double-quote handling. Caller-owned output
+// buffer (no .bss singleton) so this M1 landing site is safe to
+// invoke from any dispatch harness without a shared-state contract.
+//
+// =============================================================================
+// SCOPE (R106.M1)
+// =============================================================================
+//
+// M1 lands the tokenizer half of the R106 shell satellite reboot.
+// This is a fresh clean start against a wave-new sysno set
+// (R106-CROSS-001 landed) -- the v1.0 Lexer/Shell modules at
+// src/lexer.pdx / src/shell.pdx are the prior-art reference but not
+// a copy-paste base. R106.M1 is deliberately minimal:
+//
+//   * WORD tokens only. No operator kinds (no `|`, `<`, `>`, `;`, `&`).
+//     Pipelines and redirects land at M2+ once the R106 IPC substrate
+//     is wired.
+//   * Whitespace-only separation: 0x20 (space), 0x09 (tab), 0x0A (LF),
+//     0x0D (CR). Every other byte belongs to a WORD.
+//   * Basic quoting:
+//       '...'  single-quoted; bytes inside are literal, no escapes.
+//       "..."  double-quoted; bytes inside are literal except that
+//              a backslash (0x5C) consumes the next byte as literal.
+//       \x     bare backslash outside quotes; the backslash and the
+//              next byte both belong to the current word.
+//     Adjacent fragments join: `hello"a b"world` is ONE WORD spanning
+//     all 15 source bytes (the quotes belong to the span).
+//   * Token span INCLUDES enclosing quotes and escapes; the consumer
+//     strips as needed. For M1 the paired dispatcher (src/main.pdx)
+//     echos the raw line back unmodified on the fallthrough path, so
+//     no stripping is required at this layer.
+//
+// =============================================================================
+// SIGNATURE
+// =============================================================================
+//
+//   tokenize(line_ptr, line_len, tokens_out_ptr, tokens_out_cap) -> u64
+//
+// Args (SysV):
+//   rdi = line_ptr        VA of the input byte buffer (caller-owned)
+//   rsi = line_len        length in bytes (0 is a valid empty line)
+//   rdx = tokens_out_ptr  VA of the caller-owned output record array
+//   rcx = tokens_out_cap  max number of records the output can hold
+//
+// Return (rax):
+//   0..tokens_out_cap     token count on success
+//   0xFFFFEB01+           error sentinel (see TOK_ERR_* below)
+//
+// Success and error codomains are disjoint by construction: a valid
+// count is small (bounded by the caller's cap, typically <= 128 for
+// interactive lines), and every error sentinel is >= 0xFFFFEB01 --
+// far above any plausible cap. A downstream consumer can dispatch on
+// the high two bytes (0xFFFFEB) without ambiguity.
+//
+// Output record layout: 16 bytes at [tokens_out_ptr + i * 16]:
+//   qword0 = offset_in_source  (byte offset from line_ptr)
+//   qword1 = length            (bytes; INCLUDES enclosing quotes/escapes)
+//
+// A caller that needs a stripped payload walks the byte range
+// [line_ptr + offset .. line_ptr + offset + length) and drops any
+// leading/trailing quote pair (single or double); backslash escapes
+// inside a double-quoted or bare fragment likewise need the leading
+// 0x5C stripped. For R106.M1 no caller needs this -- the dispatcher
+// echos the raw line, and the `exit` builtin matches against the
+// bare 4-byte token span.
+//
+// The output array is caller-owned to keep this landing site free of
+// any .bss singleton contract; a downstream reboot at M2+ can wire a
+// pooled tokens buffer as a KIND_ handle without changing this
+// signature.
+//
+// =============================================================================
+// RETURN-CODE BAND 0xFFFFEB0x (R106 tokenizer)
+// =============================================================================
+//
+// Fresh sub-band; disjoint from every existing shell band
+// (0xFFFFECxx is the v1.0 shell layer; 0xFFFFEAxx / 0xFFFFE5Exx are
+// libpdx-elevate; 0xFFFFFFxx is libpdx-cap). The high two bytes
+// (0xFFFFEB) identify the R106 tokenizer to a downstream decoder.
+//
+//   TOK_ERR_BAD_ARGS           0xFFFFEB01  line_ptr == 0 with line_len > 0,
+//                                          or tokens_out_ptr == 0 with cap > 0
+//   TOK_ERR_UNTERMINATED_QUOTE 0xFFFFEB02  '..' or ".." not closed before EOL
+//   TOK_ERR_INVALID_ESCAPE     0xFFFFEB03  trailing '\' at end-of-input
+//                                          (bare-escape or inside "..")
+//   TOK_ERR_OVERFLOW           0xFFFFEB04  token count would reach or exceed
+//                                          tokens_out_cap on the next emit
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module basename PascalCase (`Tokenizer`), matches file basename.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The only compares
+//     are byte-value equality (0x20, 0x09, 0x0A, 0x0D, 0x22, 0x27,
+//     0x5C) and pointer/count register-register compares; large-
+//     immediate error sentinels are `mov rax, imm32` emissions, not
+//     compares.
+//   - No 2-op `imul r, imm`. Token-record byte offset is
+//     token_index * 16, computed as `shl r10, 4` (record size is a
+//     power of two -- single shift, no imul).
+//   - Byte loads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - Leaf function; no `call`, no push/pop alignment concern.
+//   - r11 is paideia-as reserved scratch; unused here (no .bss reach
+//     -- all storage is caller-owned via arg pointers).
+//   - Labels prefixed `tk_` per reserved-keyword discipline.
+
+module Tokenizer = structure {
+
+  // ==========================================================================
+  // Record layout constant
+  //
+  // 16 bytes per record: qword0 = offset in source buffer, qword1 =
+  // length. Kept as a power of two so the byte-offset compute is a
+  // single `shl r10, 4` (no imul needed).
+  // ==========================================================================
+  pub let TOK_RECORD_SIZE : u64 = 16
+
+  // ==========================================================================
+  // Return-code band 0xFFFFEB0x (R106 Tokenizer)
+  // ==========================================================================
+  pub let TOK_ERR_BAD_ARGS           : u64 = 0xFFFFEB01
+  pub let TOK_ERR_UNTERMINATED_QUOTE : u64 = 0xFFFFEB02
+  pub let TOK_ERR_INVALID_ESCAPE     : u64 = 0xFFFFEB03
+  pub let TOK_ERR_OVERFLOW           : u64 = 0xFFFFEB04
+
+  // ==========================================================================
+  // tokenize(line_ptr, line_len, tokens_out_ptr, tokens_out_cap) -> u64
+  //
+  // See module header for the surface, quoting rules, and error
+  // taxonomy. Register plan (leaf function):
+  //
+  //   r12 = line_ptr        (callee-save; base for offset compute)
+  //   r13 = line_end        (callee-save; line_ptr + line_len)
+  //   r14 = tokens_out_ptr  (callee-save)
+  //   r15 = tokens_out_cap  (callee-save)
+  //   rbx = cursor          (callee-save)
+  //   rbp = token count     (callee-save; also the emit index)
+  //   rax = byte load / return value scratch
+  //   rcx = word_start scratch (caller-save; safe in a leaf)
+  //   rdx = quote-body byte scratch (caller-save)
+  //   r10 = byte-offset compute scratch (token_index * 16)
+  //   r11 = paideia-as reserved (unused in this body)
+  //
+  // 6 callee-save pushes = 48 bytes. No inner call, so alignment is
+  // uninteresting; push/pop parity is the only stack discipline.
+  // ==========================================================================
+  pub let tokenize : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (line_ptr: u64) (line_len: u64) (tokens_out_ptr: u64) (tokens_out_cap: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.M1 (paideia-os/shell#2341): whitespace-separated tokenizer with basic '..' and \"..\" quoting. Single-pass byte-at-a-time walker: for each non-whitespace byte begins a WORD, extends it through adjacent quoted or bare-escaped fragments, closes on the next whitespace or end-of-buffer. Each token is a 16-byte record (offset, length) written to the caller-owned tokens_out array at [tokens_out_ptr + i*16]; count returned in rax. Whitespace = { 0x20, 0x09, 0x0A, 0x0D }. Single-quote body is literal (no escapes, terminates on the next 0x27). Double-quote body is literal EXCEPT that a 0x5C ('\\') consumes the next byte as literal (or reports TOK_ERR_INVALID_ESCAPE if it is the last byte in the buffer -- distinct from an unterminated quote so a decoder can tell them apart). Bare backslash outside quotes consumes '\\' + next byte (same INVALID_ESCAPE rule at EOL). Missing closing quote returns TOK_ERR_UNTERMINATED_QUOTE. Token count that would reach tokens_out_cap returns TOK_ERR_OVERFLOW at emit time (before the record write). TOK_ERR_BAD_ARGS covers line_ptr==0 with len>0 and tokens_out_ptr==0 with cap>0 (empty inputs succeed with count=0 without dereferencing either pointer). Register plan: r12=line_ptr, r13=line_end, r14=tokens_out_ptr, r15=tokens_out_cap (all callee-save), rbx=cursor, rbp=token count (also emit index). Token-record byte offset = token_index * 16 computed via `shl r10, 4` (record size is a power of two -- no imul needed, avoids the 2-op imul r,imm pitfall). All byte loads use the #1248 pattern (xor rax, rax; mov_b rax, [rbx]). All large-immediate error sentinels (0xFFFFEB01..0xFFFFEB04) go through mov rax, imm32. Leaf function: 6 callee-save pushes, no inner call, no push/pop alignment concern. Labels prefixed tk_ per reserved-keyword discipline (avoids `loop`/`if`/`word`/etc.).",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // r12 = line_ptr
+        mov r13, rsi;                        // r13 = line_len (in transit; overwritten below)
+        mov r14, rdx;                        // r14 = tokens_out_ptr
+        mov r15, rcx;                        // r15 = tokens_out_cap
+
+        // r13 = line_end = line_ptr + line_len (in place).
+        add r13, r12;
+
+        // token count = 0.
+        xor rbp, rbp;
+
+        // Empty-input gate: line_end == line_ptr means line_len == 0.
+        // Returns 0 tokens LX-style regardless of any pointer nullity.
+        cmp r13, r12;
+        je  tk_done_empty;
+
+        // Non-empty input with line_ptr == 0 is malformed.
+        cmp r12, 0;
+        je  tk_bad_args;
+
+        // Non-zero cap requires a non-null output buffer. cap == 0
+        // with non-empty input is not caught here -- it fails
+        // naturally at the first emit's overflow gate.
+        cmp r15, 0;
+        je  tk_cap_ok;
+        cmp r14, 0;
+        je  tk_bad_args;
+      tk_cap_ok:
+
+        // cursor = line_ptr.
+        mov rbx, r12;
+
+      tk_outer:
+        // End of input? Finish.
+        cmp rbx, r13;
+        jae tk_finish;
+
+        // Peek byte at cursor.
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        // Whitespace: skip and continue the outer walk.
+        cmp rax, 0x20;
+        je  tk_skip_ws;
+        cmp rax, 0x09;
+        je  tk_skip_ws;
+        cmp rax, 0x0A;
+        je  tk_skip_ws;
+        cmp rax, 0x0D;
+        je  tk_skip_ws;
+
+        // Non-whitespace: this is the start of a WORD. Gate emit
+        // count first so a full output buffer refuses BEFORE we
+        // spend cycles walking the word body.
+        cmp rbp, r15;
+        jae tk_overflow;
+
+        // word_start = cursor.
+        mov rcx, rbx;
+
+      tk_word:
+        // End of input closes the word.
+        cmp rbx, r13;
+        jae tk_word_emit;
+
+        xor rax, rax;
+        mov_b rax, [rbx];
+
+        // Whitespace closes the word.
+        cmp rax, 0x20;
+        je  tk_word_emit;
+        cmp rax, 0x09;
+        je  tk_word_emit;
+        cmp rax, 0x0A;
+        je  tk_word_emit;
+        cmp rax, 0x0D;
+        je  tk_word_emit;
+
+        // Single-quote fragment inside the word.
+        cmp rax, 0x27;
+        je  tk_single;
+
+        // Double-quote fragment inside the word.
+        cmp rax, 0x22;
+        je  tk_double;
+
+        // Bare backslash escape outside quotes.
+        cmp rax, 0x5C;
+        je  tk_bare_escape;
+
+        // Ordinary byte: advance one and continue.
+        add rbx, 1;
+        jmp tk_word;
+
+        // ------------------------------------------------------------
+        // Single-quote body: literal bytes until the next 0x27.
+        // ------------------------------------------------------------
+      tk_single:
+        add rbx, 1;                          // consume opening quote
+      tk_single_loop:
+        cmp rbx, r13;
+        jae tk_unterminated;
+        xor rdx, rdx;
+        mov_b rdx, [rbx];
+        cmp rdx, 0x27;
+        je  tk_single_close;
+        add rbx, 1;
+        jmp tk_single_loop;
+      tk_single_close:
+        add rbx, 1;                          // consume closing quote
+        jmp tk_word;
+
+        // ------------------------------------------------------------
+        // Double-quote body: literal bytes until the next 0x22, with
+        // `\<any>` consuming both bytes.
+        // ------------------------------------------------------------
+      tk_double:
+        add rbx, 1;                          // consume opening quote
+      tk_double_loop:
+        cmp rbx, r13;
+        jae tk_unterminated;
+        xor rdx, rdx;
+        mov_b rdx, [rbx];
+        cmp rdx, 0x22;
+        je  tk_double_close;
+        cmp rdx, 0x5C;
+        je  tk_double_escape;
+        add rbx, 1;
+        jmp tk_double_loop;
+      tk_double_escape:
+        add rbx, 1;                          // consume '\\'
+        cmp rbx, r13;
+        jae tk_invalid_escape;
+        add rbx, 1;                          // consume the escaped byte
+        jmp tk_double_loop;
+      tk_double_close:
+        add rbx, 1;                          // consume closing quote
+        jmp tk_word;
+
+        // ------------------------------------------------------------
+        // Bare backslash outside quotes: consume '\' + next byte.
+        // ------------------------------------------------------------
+      tk_bare_escape:
+        add rbx, 1;                          // consume '\\'
+        cmp rbx, r13;
+        jae tk_invalid_escape;
+        add rbx, 1;                          // consume the escaped byte
+        jmp tk_word;
+
+        // ------------------------------------------------------------
+        // Emit one WORD record: (word_start - line_ptr, cursor - word_start).
+        // Byte offset in output table = token_index * 16 = rbp << 4.
+        // ------------------------------------------------------------
+      tk_word_emit:
+        mov r10, rbp;
+        shl r10, 4;
+
+        // qword0 = offset in source (rcx = word_start).
+        mov rax, rcx;
+        sub rax, r12;
+        mov [r14 + r10 * 1 + 0], rax;
+
+        // qword1 = length in bytes.
+        mov rax, rbx;
+        sub rax, rcx;
+        mov [r14 + r10 * 1 + 8], rax;
+
+        add rbp, 1;                          // token count++
+        jmp tk_outer;
+
+      tk_skip_ws:
+        add rbx, 1;
+        jmp tk_outer;
+
+        // ------------------------------------------------------------
+        // Return points. Each jumps to the shared epilogue so the
+        // pop sequence is emitted exactly once.
+        // ------------------------------------------------------------
+      tk_finish:
+        mov rax, rbp;
+        jmp tk_epilogue;
+
+      tk_done_empty:
+        xor rax, rax;
+        jmp tk_epilogue;
+
+      tk_bad_args:
+        mov rax, 0xFFFFEB01;
+        jmp tk_epilogue;
+
+      tk_unterminated:
+        mov rax, 0xFFFFEB02;
+        jmp tk_epilogue;
+
+      tk_invalid_escape:
+        mov rax, 0xFFFFEB03;
+        jmp tk_epilogue;
+
+      tk_overflow:
+        mov rax, 0xFFFFEB04;
+        jmp tk_epilogue;
+
+      tk_epilogue:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
+        pop rbx;
+        ret
+      }
+    }
+}

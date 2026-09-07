@@ -1,0 +1,375 @@
+// src/main.pdx -- R106.M1 (paideia-os/shell#2341)
+//
+// Main module: R106 shell satellite _start entry + dispatch landing site.
+//
+// =============================================================================
+// SCOPE (R106.M1)
+// =============================================================================
+//
+// M1 lands the dispatch half of the R106 shell satellite reboot,
+// paired with Tokenizer (src/tokenizer.pdx). The dispatch table is
+// deliberately stub-shaped for this landing:
+//
+//   * `exit` (4-byte exact match against argv[0]) -- terminates the
+//     shell via sys_exit(0).
+//   * everything else -- echos the raw input line back to fd 1
+//     unmodified, as an M1 witness that the tokenizer + dispatch
+//     loop are wired end-to-end.
+//
+// PATH-search + fork/execve dispatch, history persistence, tab
+// completion, and pipeline lowering are ALL out of scope for M1.
+// They land at M2+ once the R106 IPC and PdxFS substrates are wired.
+//
+// =============================================================================
+// SYSCALL SUBSTRATE
+// =============================================================================
+//
+// R106-CROSS-001 (assumed landed) provides the SC+ sysno floor. To
+// keep this M1 landing site self-contained -- and independent of the
+// v1.0 Syscall module at src/syscall.pdx which still targets the
+// pre-R106 sysno mapping -- Main inlines the three SC+ ids the
+// dispatch loop needs at the point of use:
+//
+//   SC+ 0   read   (line reader, byte-at-a-time)
+//   SC+ 1   write  (prompt + echo-back)
+//   SC+ 60  exit   (`exit` builtin, EOF terminate)
+//
+// All three follow the SysV -> SYSCALL passthrough convention
+// (arity <= 3, no rcx->r10 shuffle needed). Each is wrapped in a
+// local leaf function so the SC+ id appears at ONE emission site
+// per syscall -- drift against the frozen SC+ table is caught at a
+// single point.
+//
+// =============================================================================
+// STORAGE
+// =============================================================================
+//
+//   _mn_line_buf     [u8; 256]   stdin line buffer (.bss)
+//   _mn_tokens_buf   [u64; 128]  64 records * 2 qwords each = 1024 bytes
+//                                (.bss); layout matches Tokenizer's
+//                                16-byte (offset, length) record shape
+//
+// The `_mn_` prefix keeps a linker collision with the v1.0 shell
+// singletons (`line_buf`, `argv_buf`, etc.) impossible even if a
+// future manifest revision links both module sets into one ELF for
+// side-by-side comparison.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module basename PascalCase (`Main`), matches file basename.
+//   - No `test` mnemonic; zero-checks use `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. The only compares
+//     are byte-value equality (0x0A, small ASCII), token count
+//     against 0, and length against 4.
+//   - r11 reserved as .bss / rodata LEA scratch.
+//   - Byte loads use `xor rax, rax; mov_b rax, [ptr]` per #1248.
+//   - _start never returns (every tail is sys_exit); no push/pop
+//     parity concern for the entry frame.
+//   - The three helper leaves (mn_read_line, mn_write, mn_exit,
+//     mn_token_is_exit) each maintain their own callee-save
+//     discipline; see per-function headers.
+//   - Labels prefixed `mn_` per reserved-keyword discipline.
+
+module Main = structure {
+
+  // ==========================================================================
+  // Rodata: prompt + `exit` builtin literal
+  //
+  // Trailing NUL is storage-only; the `_len` constants below give the
+  // count of significant bytes for the write / compare paths.
+  // ==========================================================================
+  pub let mn_prompt_msg : [u8; 3] = "$ \0"
+  pub let mn_prompt_len : u64 = 2
+
+  pub let mn_exit_name  : [u8; 5] = "exit\0"
+  pub let mn_exit_len   : u64 = 4
+
+  // ==========================================================================
+  // Bss singletons
+  // ==========================================================================
+  pub let mut _mn_line_buf   : [u8; 256]  = uninit @align(8)
+  pub let mut _mn_tokens_buf : [u64; 128] = uninit @align(8)
+
+  // Documentation-only mirror of the capacity constants used at the
+  // call sites below. Values are hardcoded as immediates in the
+  // emissions (matching the monorepo convention -- see e.g.
+  // src/user/shell.pdx's use of `mov rsi, 12;` alongside its
+  // `shell_start_len : u64 = 12` decorative constant).
+  pub let MN_LINE_CAP   : u64 = 255
+  pub let MN_TOKENS_CAP : u64 = 64
+
+  // ==========================================================================
+  // mn_read_line(buf, cap) -> bytes_read
+  //
+  // Read up to `cap` bytes from fd 0, one byte at a time via SC+
+  // sys_read. Stops on the FIRST LF (0x0A -- INCLUDED in the
+  // returned length), sys_read returning 0 (EOF), sys_read returning
+  // a negative errno, or the buffer filling to `cap`. Returns the
+  // byte count in rax.
+  //
+  // Register plan (callee-save discipline; #722 precedent):
+  //   r12 = buf         (survives every sys_read)
+  //   r13 = cap
+  //   r14 = bytes_read
+  //   r15 = current write pointer (buf + bytes_read)
+  //
+  // r8/r9 as SysV arg registers are caller-save AND the SC+ entry
+  // path shuffles r8 in from r10, so keeping loop state there would
+  // corrupt on the first syscall (the #722 fix in
+  // src/user/shell.pdx::shell_read_line). Callee-save r12..r15
+  // survives untouched across the kernel round-trip.
+  // ==========================================================================
+  pub let mn_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "R106.M1 (paideia-os/shell#2341): reads a line from fd 0 byte-at-a-time via inline sys_read (SC+ 0). Stops on LF (INCLUDED in returned length), sys_read returning 0 (EOF), a negative sys_read return (treated as end-of-input), or buffer full. Callee-save r12..r15 hold buf/cap/bytes_read/write_ptr across each sys_read call -- r8/r9 are caller-save under SysV AND the SC+ entry path shuffles r8 in from r10, so keeping loop state there would corrupt on the first syscall (the #722 fix in src/user/shell.pdx::shell_read_line). Byte-value cmp against 0x0A uses the #1248 pattern (xor rax, rax; mov_b rax, [ptr]) reading the byte the syscall just wrote -- explicit re-read keeps the compare correct even if a future SMP variant reorders the syscall's memory writes relative to its rax return. Labels prefixed mn_ per reserved-keyword discipline. Leaf syscall-issuer -- syscall clobbers rcx and r11 (both SysV caller-save, harmless).",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov r12, rdi;                        // buf
+        mov r13, rsi;                        // cap
+        xor r14, r14;                        // bytes_read = 0
+        mov r15, r12;                        // write_ptr = buf
+
+      mn_read_next:
+        // Buffer full?
+        cmp r14, r13;
+        jae mn_read_done;
+
+        // sys_read(0, write_ptr, 1)
+        xor rdi, rdi;                        // fd = 0
+        mov rsi, r15;                        // buf = write_ptr
+        mov rdx, 1;                          // count = 1
+        mov rax, 0;                          // SC+ sys_read
+        syscall;
+
+        // rax <= 0: EOF or error -- stop.
+        cmp rax, 0;
+        jle mn_read_done;
+
+        // Advance counter.
+        add r14, 1;
+
+        // Peek the byte just written at [write_ptr].
+        xor rax, rax;
+        mov_b rax, [r15];
+        add r15, 1;
+
+        // LF terminates the line.
+        cmp rax, 0x0A;
+        je  mn_read_done;
+
+        jmp mn_read_next;
+
+      mn_read_done:
+        mov rax, r14;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mn_write(fd, buf, count) -> bytes_written
+  //
+  // Thin sys_write (SC+ 1) wrapper. Kept as its own leaf so the
+  // prompt and echo-back sites share one emission of the SC+ id --
+  // drift against the frozen table is caught at a single point.
+  // ==========================================================================
+  pub let mn_write : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (buf: u64) (count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "R106.M1 (paideia-os/shell#2341): thin sys_write (SC+ 1) wrapper. Arity 3, no rcx->r10 shuffle. Kept as a shared call target so the prompt-emit and echo-back sites in _start share ONE emission of the SC+ id -- any drift against the frozen SC+ table is caught at a single point. Leaf function; syscall clobbers rcx and r11 (both SysV caller-save, harmless).",
+      block: {
+        mov rax, 1;                          // SC+ sys_write
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mn_exit(status) -> u64
+  //
+  // Never returns (sys_exit, SC+ 60). The return type is `u64` for
+  // signature uniformity with the other wrappers; the `ret` after
+  // the syscall is unreachable at runtime and exists only to satisfy
+  // paideia-as's function-shape checker (every function body must
+  // terminate in a return-shaped tail).
+  // ==========================================================================
+  pub let mn_exit : (u64) -> u64 !{sysreg} @{sched} =
+    fn (status: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {sched},
+      justification: "R106.M1 (paideia-os/shell#2341): sys_exit (SC+ 60) wrapper. Arity 1, no shuffle. Never returns on the CPU side -- the kernel tears the task down and the `ret` here is unreachable at runtime, present only to satisfy paideia-as's function-shape checker (every function body must end in a return-shaped terminator). Effect drops `mem` relative to sys_read/write (no user-memory touch); sysreg + @{sched} match src/syscall.pdx's v1.0 sys_exit wrapper.",
+      block: {
+        mov rax, 60;                         // SC+ sys_exit
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // mn_token_is_exit(off, len) -> u64
+  //
+  // Tests whether the token at [_mn_line_buf + off .. + off + len)
+  // equals the ASCII literal `exit`. Returns 1 on match, 0 otherwise.
+  //
+  // Length-first fast-refuse (a token whose length is not exactly 4
+  // cannot be `exit`), then a four-iteration byte-at-a-time compare
+  // between _mn_line_buf[off + i] and mn_exit_name[i]. Byte loads on
+  // both sides follow the #1248 pattern.
+  //
+  // Register plan (leaf):
+  //   rdi = off        (input; consumed into a base pointer)
+  //   rsi = len        (input; compared to 4)
+  //   r11 = .bss / rodata LEA scratch  (paideia-as reserved)
+  //   r10 = source-base pointer  (_mn_line_buf + off)
+  //   r8  = literal-base pointer (mn_exit_name)
+  //   rcx = compare index (0..3)
+  //   rax = candidate byte load
+  //   rdx = literal byte load
+  //
+  // Leaf: no push/pop needed (rcx/r8/r10/r11 all caller-save; rdi/rsi
+  // are inputs whose caller does not preserve).
+  // ==========================================================================
+  pub let mn_token_is_exit : (u64, u64) -> u64 !{mem} @{} =
+    fn (off: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.M1 (paideia-os/shell#2341): tests whether the token at (off, len) inside _mn_line_buf equals the ASCII literal 'exit'. Length-first fast-refuse (a token whose length is not exactly 4 cannot be `exit`), then a four-iteration byte-at-a-time compare between _mn_line_buf[off + i] and mn_exit_name[i]. Byte loads on both sides use the #1248 pattern (xor rax, rax; mov_b rax, [ptr]). r11 reserved for the .bss/rodata LEA reach (two reaches: _mn_line_buf and mn_exit_name -- each is loaded into r10/r8 respectively via r11 so the compare loop only touches r10/r8). Small-immediate cmp discipline: only compares are length against 4 and per-byte inequality between two byte-loaded registers. Leaf function; no call, no push/pop.",
+      block: {
+        // Length gate.
+        cmp rsi, 4;
+        jne mn_texit_no;
+
+        // Source base = _mn_line_buf + off.
+        lea r11, [rip + _mn_line_buf];
+        mov r10, r11;
+        add r10, rdi;
+
+        // Literal base = mn_exit_name.
+        lea r11, [rip + mn_exit_name];
+        mov r8, r11;
+
+        xor rcx, rcx;
+
+      mn_texit_next:
+        cmp rcx, 4;
+        jae mn_texit_yes;
+
+        xor rax, rax;
+        mov_b rax, [r10 + rcx * 1];
+        xor rdx, rdx;
+        mov_b rdx, [r8 + rcx * 1];
+        cmp rax, rdx;
+        jne mn_texit_no;
+
+        add rcx, 1;
+        jmp mn_texit_next;
+
+      mn_texit_yes:
+        mov rax, 1;
+        ret
+
+      mn_texit_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _start entry point
+  //
+  // Main loop:
+  //   (1) prompt -> mn_write(1, mn_prompt_msg, 2)
+  //   (2) read line into _mn_line_buf -> mn_read_line(buf, 255)
+  //   (3) 0-byte read (Ctrl-D) -> mn_exit(0)
+  //   (4) tokenize -> Tokenizer::tokenize(buf, bytes_read, tokens_buf, 64)
+  //   (5) 0 tokens (empty / whitespace-only) -> re-prompt
+  //   (6) load token 0's (offset, length) from _mn_tokens_buf
+  //   (7) mn_token_is_exit -> if match, mn_exit(0)
+  //   (8) otherwise echo the raw line via mn_write(1, buf, bytes_read)
+  //   (9) loop
+  //
+  // On EOF (Ctrl-D at the prompt) the shell exits(0) -- same
+  // terminate path as the `exit` builtin. This matches the monorepo
+  // shell's exit_on_eof branch (src/user/shell.pdx:232).
+  //
+  // Register discipline: r12 holds bytes_read across the tokenize
+  // call so the echo-back path can spell the write length without
+  // a second syscall. Every other register in the loop body is
+  // scratch. r11 reserved for .bss / rodata LEA reach.
+  // ==========================================================================
+  pub let _start : () -> () !{mem, sysreg} @{fs, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, sched},
+      justification: "R106.M1 (paideia-os/shell#2341): shell satellite entry point + dispatch landing site. Main loop: (1) write prompt via mn_write(1, mn_prompt_msg, 2); (2) read a line into _mn_line_buf via mn_read_line up to 255 bytes (byte-at-a-time on fd 0, stops at LF or EOF or buffer full); (3) on 0-byte read (Ctrl-D at the prompt) mn_exit(0) as the EOF-is-terminate path (matches src/user/shell.pdx:232 exit_on_eof); (4) tokenize via Tokenizer::tokenize with _mn_tokens_buf (128 qwords = 64 records of 16 bytes) as the caller-owned output; (5) if 0 tokens (empty or whitespace-only line), skip dispatch and re-prompt; (6) load token 0's (offset, length) from _mn_tokens_buf[0] and [8]; (7) mn_token_is_exit tests the 4-byte span -- if match, mn_exit(0); (8) otherwise echo the raw line back via mn_write(1, _mn_line_buf, bytes_read). Callee-save r12 holds bytes_read across the tokenize call -- rax is clobbered by the token-count return and the echo-back path needs the read count. Never returns: both dispatch tails (exit-builtin match and EOF) invoke mn_exit. r11 reserved for .bss / rodata LEA reach. Tokenize error sentinels (0xFFFFEB01..0xFFFFEB04) fall through the `cmp rax, 0; je re-prompt` gate untouched -- they are far above any plausible token count so they will NOT hit the re-prompt branch; instead they proceed to token[0] load + is_exit compare + echo. For a legitimate error path (e.g. an unterminated quote) this echoes the raw line, which matches M1's `echo everything on the fallthrough` contract. A future M dispatches the sentinel to an error-message emitter. Labels prefixed mn_ per reserved-keyword discipline.",
+      block: {
+      mn_loop:
+        // (1) emit prompt.
+        mov rdi, 1;                          // fd = 1
+        lea r11, [rip + mn_prompt_msg];
+        mov rsi, r11;
+        mov rdx, 2;                          // significant bytes (excl. NUL)
+        call mn_write;
+
+        // (2) read a line into _mn_line_buf, cap 255.
+        lea r11, [rip + _mn_line_buf];
+        mov rdi, r11;
+        mov rsi, 255;                        // MN_LINE_CAP
+        call mn_read_line;
+
+        // (3) EOF -> exit(0).
+        cmp rax, 0;
+        je  mn_do_exit;
+
+        // Stash bytes_read in callee-save r12 -- survives the
+        // tokenize call so the echo-back path can spell the count.
+        mov r12, rax;
+
+        // (4) tokenize(line_buf, bytes_read, tokens_buf, TOKENS_CAP).
+        lea r11, [rip + _mn_line_buf];
+        mov rdi, r11;
+        mov rsi, r12;                        // bytes_read
+        lea r11, [rip + _mn_tokens_buf];
+        mov rdx, r11;
+        mov rcx, 64;                         // MN_TOKENS_CAP
+        call tokenize;
+
+        // (5) 0 tokens (empty or whitespace-only) -> re-prompt.
+        cmp rax, 0;
+        je  mn_loop;
+
+        // (6) Load token 0's (offset, length).
+        lea r11, [rip + _mn_tokens_buf];
+        mov rdi, [r11 + 0];                  // off
+        mov rsi, [r11 + 8];                  // len
+
+        // (7) `exit` builtin match?
+        call mn_token_is_exit;
+        cmp rax, 0;
+        jne mn_do_exit;
+
+        // (8) fallthrough: echo the raw line back to fd 1.
+        mov rdi, 1;                          // fd = 1
+        lea r11, [rip + _mn_line_buf];
+        mov rsi, r11;
+        mov rdx, r12;                        // bytes_read
+        call mn_write;
+
+        jmp mn_loop;
+
+      mn_do_exit:
+        xor rdi, rdi;                        // status = 0
+        call mn_exit;
+        // Unreachable -- mn_exit does not return. Present to satisfy
+        // paideia-as's function-shape checker.
+        ret
+      }
+    }
+}
