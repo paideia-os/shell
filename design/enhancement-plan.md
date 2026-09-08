@@ -79,7 +79,7 @@ wiring.
 
 | Substrate the repo defers to | State at v1.0.0 (repo's own claim) | State at HEAD (2026-08-25, verified) |
 |---|---|---|
-| `KIND_TTY` | "not landed; `kind_tty.pdx` does not exist" (`STATUS.md:309`) | **Exists** — `src/kernel/core/cap/kind_tty.pdx`, 921 lines, six ops. One real gap remains: no `TTY_OP_READ` and no raw/cooked toggle — tracked as **paideia-os#1986**, do not refile. |
+| `KIND_TTY` | "not landed; `kind_tty.pdx` does not exist" (`STATUS.md:309`) | **Exists** — `src/kernel/core/cap/kind_tty.pdx` (KIND_TTY = 0x197), with `TTY_OP_READ` (ordinal 6, gated by R_TTY_READ 0x080) + raw/cooked toggle now landed via paideia-os#1986 (R66v2.POS-001, CLOSED 2026-08-31). Two upstream landings still block a shell-side migration to a cap-typed read: KIND_TTY is absent from `KIND_SEEDABLE_TABLE` (`kind.pdx:3450`), and no shell-time TTY row seed at boot exists — see `design/architecture.md` §3.3 (refreshed at #46) for the ledger. |
 | `sys_execve` with real argv/envp | "kernel side lands at R17" (`STATUS.md:317`) | **Exists** — `src/kernel/core/syscall/handlers/sys_execve_shim.pdx`; ABI frozen at `design/user/execve-abi.md` (argc in `rdi`, argv in `rsi` at `_start`); real argv/envp marshalling landed at **R62**. |
 | `sys_wait4` | deferred | **Exists** — `src/kernel/core/syscall/handlers/sys_wait.pdx`. |
 | `sys_chdir` / `sys_getcwd` | not contemplated | **Exist** — sysno 85 / 86, landed at **R86.M1-006/007** (paideia-os #1959/#1960); the monorepo's `cd_builtin` already calls `sys_chdir` directly (`src/user/dispatch.pdx:27`). |
@@ -91,9 +91,12 @@ wiring.
 already shipped" problem, and it has been that for several rounds
 without anyone noticing, because the repo's `STATUS.md` still describes
 a 2026-08-21 kernel. The single genuine remaining kernel dependency is
-the `KIND_TTY` read op (paideia-os#1986) — and even that is only
-binding if the shell insists on a cap-typed read; the VFS `sys_read`
-fallback unblocks the line reader immediately (§4, ENH-007).
+the `KIND_TTY` read op — paideia-os#1986 landed the op itself, but
+the shell-side seam swap remains blocked on two follow-up upstream
+landings (KIND_TTY loader-seedability + shell-time TTY row seed at
+boot). The VFS `sys_read` fallback continues to unblock the line
+reader immediately (§4, ENH-007); see `design/architecture.md`
+§3.3 (refreshed at #46) for the ledger.
 
 ---
 
@@ -192,8 +195,11 @@ shell.
 ### Stage 5 — de-stubbing the remainder (ENH-007, ENH-008, ENH-009)
 
 - **ENH-007** `line_reader.pdx`: drop `LR_STUB`, read real bytes.
-  Ships against the VFS `sys_read(0, …)` path so it is not blocked on
-  paideia-os#1986; migrates to `KIND_TTY(read)` when that op lands.
+  Ships against the VFS `sys_read(0, …)` path; migrates to
+  `KIND_TTY(read)` when the substrate lands (paideia-os#1986 gave us
+  the op, but two further upstream landings — KIND_TTY loader-
+  seedability + shell-time TTY row seed at boot — still gate the
+  seam swap; see architecture.md §3.3, refreshed at #46).
   This is also the point at which the open R66 issues (#17–#21 —
   raw mode, backspace, history recall, cursor movement) become
   *startable*; they are line-editing polish on a read loop that does
@@ -342,9 +348,13 @@ elsewhere**, per the coordinating pass:
 - `bin_seeds.pdx` seeding of a `shell`-produced ELF, and the smoke that
   proves it is a drop-in `/bin/sh` — monorepo-side, sequenced after
   ENH-006.
-- `KIND_TTY` `TTY_OP_READ` + raw/cooked toggle — **already tracked as
-  paideia-os#1986. Not refiled.** ENH-007 is deliberately designed not
-  to block on it.
+- `KIND_TTY` `TTY_OP_READ` + raw/cooked toggle — **paideia-os#1986,
+  CLOSED 2026-08-31 (R66v2.POS-001, kernel commit 0e96c99).** ENH-007
+  is deliberately designed not to block on it; shell-side migration of
+  `lr_read_one_byte` to the cap-typed invoke is a further follow-up
+  waiting on two additional paideia-os landings (KIND_TTY loader-
+  seedability + shell-time TTY row seed at boot). See
+  `design/architecture.md` §3.3 refresh at shell#46 for the ledger.
 
 ---
 

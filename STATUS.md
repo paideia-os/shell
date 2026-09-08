@@ -18,8 +18,13 @@
 > time behind a single seam (`lr_read_one_byte`), assembling bytes
 > into the caller's buffer until it sees a newline, EOF, buffer-full,
 > or an unrecoverable read error. The cap-typed `KIND_TTY(read)`
-> invoke is deferred behind the same seam until paideia-os#1986
-> lands `KIND_TTY_OP_READ`; see `design/architecture.md` §3.3.
+> invoke stays deferred behind the same seam. paideia-os#1986 landed
+> `TTY_OP_READ` (ordinal 6, R_TTY_READ 0x080, CLOSED 2026-08-31);
+> the seam swap still needs two upstream landings (KIND_TTY absent
+> from `KIND_SEEDABLE_TABLE`; no shell-time TTY cap seed at boot)
+> plus a `sys_yield` addition to the shell's Syscall floor for the
+> non-blocking-poll wrap. See `design/architecture.md` §3.3 for the
+> full ledger — refreshed at #46.
 >
 > **ENH-008 (#35) landed: the shell persists its history to disk.**
 > `shell_main` now opens `~/.history/<session>-<ts>.pdxhist` at
@@ -226,7 +231,7 @@ reading a test-run log distinguishes "SUT rejected input" from
 | 0xFFFFEC00 | SH_OK             | General success (unused at M1)                             |
 | 0xFFFFEC10 | (retired)         | was LR_STUB; retired at ENH-007 (#34); value unallocated   |
 | 0xFFFFEC11 | LR_ERR_BAD_BUF    | buf == 0 or buf_len == 0                                   |
-| 0xFFFFEC12 | LR_ERR_TTY_UNBOUND| reserved: cap-typed KIND_TTY(read) missing (paideia-os#1986) |
+| 0xFFFFEC12 | LR_ERR_TTY_UNBOUND| reserved: cap-typed KIND_TTY(read) seat not yet provisioned (paideia-os#1986 landed the op but KIND_TTY absent from KIND_SEEDABLE_TABLE + no shell-side TTY row seed at boot; see architecture.md §3.3) |
 | 0xFFFFEC13 | LR_ERR_EOF        | LineReader.ENH-007: sys_read returned 0 with no bytes read |
 | 0xFFFFEC14 | LR_ERR_READ_FAIL  | LineReader.ENH-007: sys_read returned a negative errno     |
 | 0xFFFFEC20 | EX_STUB           | Exec.M1 (retired at ENH-005): validated, no live spawn     |

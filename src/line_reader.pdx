@@ -26,24 +26,52 @@
 //
 // Per issue #34, the actual read syscall lives in exactly ONE helper:
 // `lr_read_one_byte(byte_ptr) -> u64`. This is the sole call site of
-// `sys_read` in the LineReader module. When paideia-os#1986 lands the
-// KIND_TTY_OP_READ operation and the shell can invoke a cap-typed
-// KIND_TTY(read) instead of the fd-0 VFS path, that migration is a
-// ONE-SITE change: swap the `sys_read(0, ptr, 1)` inside
-// `lr_read_one_byte` for the cap-typed invoke. Every other call site
-// -- the read loop in `line_reader_read_line`, plus any future line-
-// editing polish (raw mode / backspace / cursor moves / history recall,
-// tracked at #38 / ENH-011 as R66 shell polish tier 1) -- is untouched.
+// `sys_read` in the LineReader module. When the shell can invoke a
+// cap-typed KIND_TTY(read) instead of the fd-0 VFS path, that migration
+// is a ONE-FUNCTION (not one-*line*, per #46) change inside
+// `lr_read_one_byte`. Every other call site -- the read loop in
+// `line_reader_read_line`, plus any future line-editing polish
+// (raw mode / backspace / cursor moves / history recall, tracked at
+// #38 / ENH-011 as R66 shell polish tier 1) -- is untouched.
 //
-// The fallback to fd-0 (rather than blocking on #1986) is a documented
-// decision, recorded in design/architecture.md §3.3. Rationale: the
-// stub's original justification cited "KIND_TTY has not landed in the
-// paideia-os kernel at HEAD (2026-08-21)" -- but 921 lines of
-// `src/kernel/core/cap/kind_tty.pdx` exist today and only one gap
-// remains (no KIND_TTY_OP_READ / no raw/cooked toggle), which is
-// already tracked as paideia-os#1986. The right thing to do is ship
-// against the VFS path so the shell can read a line NOW and re-plumb
-// through the cap-typed invoke behind the seam when #1986 lands.
+// =============================================================================
+// #46 REFRESH (2026-09-08): why fd-0 STILL holds the seam
+// =============================================================================
+//
+// Original comment (below) blamed paideia-os#1986 for the deferral;
+// #1986 CLOSED 2026-08-31 (kernel commit 0e96c99, R66v2.POS-001) --
+// TTY_OP_READ (ordinal 6, gated by R_TTY_READ 0x080) plus
+// TTY_OP_SET_RAW / TTY_OP_SET_COOKED are live in the kernel. Two
+// upstream pre-requisites remain before this seam can flip; the full
+// ledger lives at design/architecture.md §3.3 and reduces to:
+//
+//   (i)   TTY_OP_READ is a NON-BLOCKING poll (returns TTY_READ_EMPTY
+//         = 0xFFFFEC35 on an empty ring, never sleeps), so the seam
+//         needs a busy-poll-with-sys_yield around empty polls to
+//         preserve line_reader_read_line's blocking-read contract.
+//         sys_yield (SC+ ID 5) is NOT yet in the shell's Syscall
+//         floor (ENH-001 enumerated nine sysnos, none of which include
+//         yield).
+//
+//   (ii)  KIND_TTY (0x197) is NOT in paideia-os
+//         src/kernel/core/cap/kind.pdx KIND_SEEDABLE_TABLE (L3450).
+//         The shell process can't self-request a KIND_TTY cap via the
+//         _init_caps sidecar today; kind_is_loader_seedable would
+//         refuse. Even if that opened, no boot-time provisioning binds
+//         a live tty_cap_mint_inner row to a shell cap-slot -- the
+//         only current callers of tty_cap_mint_inner are kernel boot
+//         witnesses. A follow-up paideia-os issue must land BOTH
+//         (KIND_TTY loader-seedability + shell-time TTY row seed) --
+//         a companion cross-repo issue is filed alongside this
+//         refresh.
+//
+// Until (i) and (ii) both land, the fd-0 fallback -- the exact
+// pattern the paideia-os monorepo's own shell uses at
+// src/user/shell.pdx:29 -- keeps every interactive REPL surface
+// functional. caps.decl was updated at #46 to name KIND_TTY(read)
+// alongside the extant KIND_TTY(write) requirement, so when the
+// substrate lands the manifest_verify gate at exec sees the read
+// authority as expected without a further caps.decl edit.
 //
 // =============================================================================
 // RETURN CONTRACT
@@ -121,12 +149,20 @@ module LineReader = structure {
   //   - negative errno on failure (unwrapped bit-for-bit, treated as
   //     signed by the caller for the `< 0` check).
   //
-  // When paideia-os#1986 (KIND_TTY_OP_READ / raw+cooked toggle) lands,
-  // this function's body is the ONE site that changes: `sys_read(0,
-  // byte_ptr, 1)` becomes a cap-typed KIND_TTY(read) invoke. The
-  // caller in `line_reader_read_line` is untouched; every future
-  // line-editing polish (ENH-011 raw mode, backspace, cursor moves,
-  // history recall) reads through this same seam.
+  // Migration target (deferred; see #46 refresh block above): this
+  // function's body is the ONE site that changes when the paideia-os
+  // substrate for shell-owned KIND_TTY caps lands. paideia-os#1986
+  // (CLOSED 2026-08-31) supplied the TTY_OP_READ op + R_TTY_READ
+  // right; the remaining upstream work is (a) adding KIND_TTY to
+  // KIND_SEEDABLE_TABLE and (b) seeding the shell's cap_table with
+  // a live KIND_TTY row at boot. When both land, the body becomes a
+  // busy-poll-with-sys_yield around
+  // `sys_cap_invoke(tty_cap_slot, TTY_OP_READ)` that folds
+  // TTY_READ_EMPTY (0xFFFFEC35) back into a yield-and-retry so the
+  // caller's blocking-read contract holds. The caller in
+  // `line_reader_read_line` is untouched; every future line-editing
+  // polish (ENH-011 raw mode, backspace, cursor moves, history recall)
+  // reads through this same seam.
   //
   // Register plan (leaf modulo the syscall):
   //   rdi (input): byte_ptr -- caller-owned 1-byte scratch
@@ -140,7 +176,7 @@ module LineReader = structure {
   pub let lr_read_one_byte : (u64) -> u64 !{mem, sysreg} @{fs} =
     fn (byte_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34): the SINGLE SEAM between the LineReader and the byte transport. Today this is sys_read(0, byte_ptr, 1) — the VFS-mediated fd-0 read the paideia-os monorepo's own shell_read_line uses (src/user/shell.pdx:29). When paideia-os#1986 lands KIND_TTY_OP_READ, this one function swaps sys_read for a cap-typed KIND_TTY(read) invoke — every other line_reader callsite is untouched. Argument shuffle: byte_ptr arrives in rdi (SysV arg0); sys_read wants fd in rdi, buf in rsi, count in rdx, so mov rsi, rdi; mov rdi, 0; mov rdx, 1 stages the args (order matters: rsi must be set before rdi is overwritten). Effect/cap set matches Syscall.sys_read's own {mem, sysreg} @{fs}. Prologue: sub rsp, 8 aligns rsp%16==0 for the nested SysV call into sys_read (entry rsp%16==8 from the caller's return addr). Leaf modulo the sys_read call; SYSCALL clobbers rcx/r11 (both caller-save, harmless). Labels: none (linear body).",
+      justification: "shell.ENH-007 (#34) + #46 refresh (2026-09-08): the SINGLE SEAM between the LineReader and the byte transport. Today this is sys_read(0, byte_ptr, 1) — the VFS-mediated fd-0 read the paideia-os monorepo's own shell_read_line uses (src/user/shell.pdx:29). Migration to a cap-typed KIND_TTY(read) invoke is DEFERRED: paideia-os#1986 landed the TTY_OP_READ op + R_TTY_READ right (kernel commit 0e96c99, R66v2.POS-001, closed 2026-08-31), but the seam swap needs two additional upstream landings — (i) adding KIND_TTY (0x197) to paideia-os kind.pdx KIND_SEEDABLE_TABLE (currently absent, L3450), (ii) seeding a live tty_cap_mint_inner row into the shell's cap_table at boot (no path exists today; the mint helper is called only from kernel boot witnesses), and (iii) adding sys_yield (SC+ ID 5) to the shell's Syscall floor so the seam's TTY_READ_EMPTY (0xFFFFEC35) branch can yield-and-retry to preserve the caller's blocking contract. See design/architecture.md §3.3 for the full ledger. Argument shuffle: byte_ptr arrives in rdi (SysV arg0); sys_read wants fd in rdi, buf in rsi, count in rdx, so mov rsi, rdi; mov rdi, 0; mov rdx, 1 stages the args (order matters: rsi must be set before rdi is overwritten). Effect/cap set matches Syscall.sys_read's own {mem, sysreg} @{fs}. Prologue: sub rsp, 8 aligns rsp%16==0 for the nested SysV call into sys_read (entry rsp%16==8 from the caller's return addr). Leaf modulo the sys_read call; SYSCALL clobbers rcx/r11 (both caller-save, harmless). Labels: none (linear body).",
       block: {
         sub rsp, 8;                          // align rsp % 16 for sys_read
         mov rsi, rdi;                        // buf = byte_ptr (must precede rdi overwrite)

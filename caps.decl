@@ -12,12 +12,24 @@
 #   * KIND_USER (0x190, paideia-os src/kernel/core/cap/kind_user.pdx)
 #     — the shell runs as a delegated user; every child inherits the
 #     caller's user identity by default (I6 capability handoff).
-#   * KIND_TTY — the terminal-render binding; the shell holds
-#     KIND_TTY(write) and delegates a sub-cap to each child. The
-#     ordinal is TBD — kind_tty.pdx has not landed at HEAD (2026-08-21
-#     kernel), so the shell M1 caps.decl names KIND_TTY symbolically;
-#     libpdx-cap's caps_decl parser is textual and accepts the name
-#     verbatim. shell.M2-001 pins the ordinal when the KIND lands.
+#   * KIND_TTY (0x197, paideia-os src/kernel/core/cap/kind_tty.pdx) —
+#     the terminal binding. The shell holds BOTH write and read
+#     authority: KIND_TTY(write) for prompt echo + builtin stdout,
+#     KIND_TTY(read) for line_reader_read_line's byte source at the
+#     lr_read_one_byte seam (see design/architecture.md §3 for the
+#     LineReader module and §3.3 for the migration ledger). The read
+#     right is R_TTY_READ = 0x080; the op it invokes is TTY_OP_READ
+#     (ordinal 6) — both landed at paideia-os#1986 (R66v2.POS-001,
+#     CLOSED 2026-08-31, kernel commit 0e96c99). Runtime migration of
+#     lr_read_one_byte from the fd-0 sys_read fallback to the cap-typed
+#     invoke is deferred behind two additional upstream landings noted
+#     in §3.3 (KIND_TTY absent from KIND_SEEDABLE_TABLE; no shell-side
+#     TTY row seed at boot). Naming both rights here NOW so the
+#     manifest_verify gate at exec sees the read authority as expected
+#     the moment the substrate lands. The shell delegates a sub-cap to
+#     each child (write-only for pipe consumers; the read authority
+#     stays with the interactive parent). libpdx-cap's caps_decl parser
+#     is textual and accepts KIND_TTY(read) verbatim.
 #   * KIND_IPC_ENDPOINT (5, paideia-os src/kernel/core/cap/kind.pdx:72)
 #     — the pipe substrate the shell mints one of per '|' at M2-002.
 #     M1 declares the requirement so the exec-time manifest_verify
@@ -58,6 +70,7 @@
 requires:
 - KIND_USER(read)
 - KIND_TTY(write)
+- KIND_TTY(read)
 - KIND_IPC_ENDPOINT(mint)
 - KIND_SHELL_SESSION(mint)
 - KIND_PDXFS_FILE(write)

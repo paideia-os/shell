@@ -33,8 +33,9 @@
 // compilation; a mock-inject function-pointer indirection would add
 // runtime cost to every real read (the shell's hot path is a byte-at-
 // a-time syscall loop where an extra indirection is measurable). The
-// single-seam design at ENH-007 is intended for the paideia-os#1986
-// migration, not for test-mock injection.
+// single-seam design at ENH-007 is intended for the eventual cap-typed
+// KIND_TTY(read) migration (see design/architecture.md §3.3, refreshed
+// at #46), not for test-mock injection.
 //
 // (b) is the same deferral test_syscall_floor.pdx uses for its
 // `sys_getcwd` + `sys_write` runtime cases: build against a live

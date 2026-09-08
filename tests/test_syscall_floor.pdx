@@ -28,10 +28,18 @@
 // declares !{mem, sysreg} @{fs}.
 //
 // The tests DO NOT exercise:
-//   - sys_read (needs a byte source; TTY read op still blocked on
-//     paideia-os#1986 KIND_TTY(read); parallel to the VFS sys_read
-//     path but that requires an open fd, which would need sys_open
-//     against a known /-file -- out of the ENH-001 floor's scope).
+//   - sys_read (needs a byte source. The TTY-cap parallel path is
+//     partially unblocked as of paideia-os#1986 (CLOSED 2026-08-31,
+//     kernel commit 0e96c99): TTY_OP_READ (ordinal 6) + R_TTY_READ
+//     (0x080) + raw/cooked toggle now exist. However the shell still
+//     cannot exercise the cap-typed path because KIND_TTY (0x197) is
+//     absent from paideia-os kind.pdx KIND_SEEDABLE_TABLE and no
+//     shell-side TTY cap seeding at boot is wired yet -- refresh
+//     ledger at shell#46 / design/architecture.md §3.3. The VFS
+//     sys_read path meanwhile requires an open fd, which would need
+//     sys_open against a known /-file -- out of the ENH-001 floor's
+//     scope. line_reader_read_line exercises sys_read via fd 0 at
+//     ENH-007 (#34) once shell is spawned by init).
 //   - sys_open / sys_close (need a known file path in the mounted
 //     tmpfs; ENH-005's exec path resolution will exercise these).
 //   - sys_execve / sys_wait4 (need a real child binary; ENH-005).

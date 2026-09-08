@@ -29,11 +29,14 @@ ELF entry (`Shell::shell_main`, per `manifest.pdxproj`) calls in order:
   Exposes `line_reader_read_line(buf, buf_len) → u64`; internally
   reads one byte at a time from fd 0 via `sys_read(0, ptr, 1)` behind
   a single seam (`lr_read_one_byte`). Real at ENH-007 (#34); the LR_STUB
-  M1 tail is retired. The cap-typed KIND_TTY(read) invoke is deferred
-  behind the same seam until paideia-os#1986 lands KIND_TTY_OP_READ
-  (see §3.3 below for the rationale). `shell_main` treats a bare 0,
-  `LR_ERR_EOF`, `LR_ERR_READ_FAIL`, and `LR_ERR_BAD_BUF` (defensive)
-  as EOF signals so the REPL terminates cleanly on any non-line return.
+  M1 tail is retired. The cap-typed KIND_TTY(read) invoke that would
+  replace `sys_read` remains deferred behind the same seam: paideia-os#1986
+  (TTY_OP_READ, ordinal 6, gated by R_TTY_READ 0x080) CLOSED 2026-08-31
+  with commit 0e96c99 (R66v2.POS-001), but two upstream pre-requisites
+  are still missing before the shell can migrate — see §3.3 for the
+  full ledger. `shell_main` treats a bare 0, `LR_ERR_EOF`,
+  `LR_ERR_READ_FAIL`, and `LR_ERR_BAD_BUF` (defensive) as EOF signals
+  so the REPL terminates cleanly on any non-line return.
 - `Exec` (`src/exec.pdx`) — the exec path. `exec_spawn_and_wait(pool,
   bytes, argc) → u64` marshals argv from the parser's pool slice,
   narrows the child's cap set against the parent's, opens an audit
@@ -752,7 +755,7 @@ bumps on every entry, `SH_ST_LINES` on every bytes-written return,
 `PROMPTS - LINES - ERRORS == 0` holds across a full session; a
 divergence is a live-counter regression.
 
-### 3.3 Cap-typed `KIND_TTY(read)` deferral
+### 3.3 Cap-typed `KIND_TTY(read)` deferral (refreshed for #46)
 
 The read syscall lives in exactly one helper — `lr_read_one_byte` —
 so the transport can be swapped at ONE site without touching the
@@ -764,29 +767,100 @@ Today the seam calls `sys_read(0, byte_ptr, 1)` — the VFS-mediated
 fd-0 path the paideia-os monorepo's own shell has used since
 R17.M3-002 (#622). The cap-typed alternative — a `KIND_TTY(read)`
 invoke that would let userspace bypass the VFS layer and negotiate
-raw / cooked mode explicitly — requires kernel work already tracked
-at paideia-os#1986 (add `KIND_TTY_OP_READ` op alongside the extant
-921-line `src/kernel/core/cap/kind_tty.pdx`). We deliberately do NOT
-block ENH-007 on #1986:
+raw / cooked mode explicitly — was originally tracked as blocked
+solely on paideia-os#1986 (add `TTY_OP_READ` op). That framing was
+inaccurate; this section is refreshed under paideia-os/shell#46.
 
-- The stub's original justification cited "KIND_TTY has not landed
-  in the paideia-os kernel at HEAD (2026-08-21)", but 921 lines of
-  `kind_tty.pdx` exist today; only the read op is missing.
-- The fd-0 fallback works TODAY and is the exact pattern the monorepo
-  shell uses. Blocking the shell's ability to read a line on a
-  kernel-side improvement would leave the REPL loop non-functional
-  for the entire time #1986 sits open.
-- The single-seam design means the migration is a ONE-SITE change
-  inside `lr_read_one_byte` when #1986 lands: swap the `sys_read`
-  call for a `cap_invoke(tty_cap, TTY_OP_READ, byte_ptr, 1)`. Every
-  caller in the loop and every future line-editor polish sits behind
-  the seam untouched.
+**State ledger (2026-09-08):**
+
+1. `paideia-os#1986` — CLOSED 2026-08-31 by kernel commit 0e96c99
+   (R66v2.POS-001). Landed:
+   - `TTY_OP_READ` at ordinal 6 in `src/kernel/core/cap/kind_tty.pdx`
+     (dispatch table L1187-1188, handler L1314-1325).
+   - `R_TTY_READ` right at mask `0x080` (kind_tty.pdx L193).
+   - `TTY_READ_EMPTY` sentinel `0xFFFFEC35` for the non-blocking-empty
+     case (kind_tty.pdx L248).
+   - `TTY_OP_SET_RAW` (7) / `TTY_OP_SET_COOKED` (8) mode toggles.
+   - R90-XREPO.004 (#1998) further landed VMIN/VTIME/ECHO controls.
+
+2. **Debugger-flagged blocking-semantics mismatch.** `TTY_OP_READ` is
+   a NON-BLOCKING poll: it returns one byte on success (0..255) or
+   `TTY_READ_EMPTY` (0xFFFFEC35) when the ring is empty; it never
+   sleeps. `sys_read(0, ...)` blocks on an empty stdin (kernel
+   `sched_block` inside `tty_read` at `core/tty/read.pdx:156`). A
+   literal one-line swap inside `lr_read_one_byte` therefore
+   silently changes the byte-loop's contract: `line_reader_read_line`
+   would spin the CPU instead of blocking. The migration is still
+   ONE-*FUNCTION*, but not ONE-*LINE*: the seam needs a
+   busy-poll-with-sched-yield around `TTY_READ_EMPTY` so the caller's
+   blocking-read contract is preserved. (`sys_yield` at SC+ ID 5 in
+   the syscall table would be the standard hook; the shell's
+   `Syscall` module does not currently expose it — its floor is the
+   nine sysnos ENH-001 enumerated, none of which include yield. A
+   later ENH would add `sys_yield` alongside the migration.)
+
+3. **User-space TTY-cap provisioning gap — NOT yet tracked in
+   paideia-os.** The migration to `sys_cap_invoke(tty_cap_slot,
+   TTY_OP_READ)` presupposes the shell process HOLDS a KIND_TTY cap
+   with R_TTY_READ in its cap_table. It does not. Two independent
+   pre-requisites remain on the paideia-os side, neither of which
+   #1986 addressed:
+
+   3a. `KIND_TTY` (0x197) is ABSENT from
+       `src/kernel/core/cap/kind.pdx` `KIND_SEEDABLE_TABLE` (L3450;
+       the seedable set is `{5, 0x15, 0x16, 0x20, 0x30}`). A shell
+       cannot self-request one via the `_init_caps` sidecar; the
+       loader-side `kind_is_loader_seedable` predicate would refuse.
+
+   3b. Even if the sidecar path were opened, no boot-time provisioning
+       binds a live KIND_TTY row (a real `tty_cap_mint_inner` output)
+       to the shell's cap-slot for stdin. The only current callers
+       of `tty_cap_mint_inner` are kernel boot witnesses
+       (`r66v2_tty_raw.pdx`, `r89_tui_canvas.pdx`,
+       `r90_tty_termios.pdx`); none write into a userspace cap_table.
+
+   A follow-up paideia-os issue must land BOTH — add KIND_TTY to
+   `KIND_SEEDABLE_TABLE` with a targeted rights mask (R_TTY_READ |
+   R_TTY_WRITE for the shell), AND wire the boot path so the shell's
+   `_init_caps` sidecar request materialises a live TTY row bound to
+   the boot console — before this seam can flip. Filing that issue is
+   part of #46's outbound work; a follow-up companion issue should
+   accompany this refresh.
+
+**Why the fd-0 fallback stays for now.** The paideia-os monorepo's
+own shell continues to read stdin via `sys_read` for the same reason.
+Blocking the shell REPL on the substrate work would leave every
+interactive path non-functional for the entire time the follow-up
+sits open. The single-seam design at `lr_read_one_byte` guarantees
+that when both (3a) and (3b) land, the migration is still one
+function edit: replace the `sys_read` shim with
+
+```
+loop:
+    rax = sys_cap_invoke(tty_cap_slot, TTY_OP_READ)     // op_arg = 6
+    if rax == TTY_READ_EMPTY (0xFFFFEC35): sys_yield; jmp loop
+    if rax > 0xFF: return rax                            // propagate cap err
+    mov_b [byte_ptr], al
+    return 1
+```
+
+Every other call site — the read loop in `line_reader_read_line`,
+the future line-editing polish under ENH-011 (#38) — sits behind the
+seam untouched.
+
+**Manifest-side prep landed in #46.** `caps.decl` now names
+`KIND_TTY(read)` alongside the extant `KIND_TTY(write)` requirement,
+so when the substrate lands the manifest_verify gate at exec already
+sees the read authority as expected. libpdx-cap's caps_decl parser
+is textual; the ordinal for KIND_TTY (0x197) is pinned by the kernel
+today and no per-repo constant needs re-pinning.
 
 Future line-editing polish (ENH-011 / #38, tracking issues #17-#21
 under R66 shell polish tier 1: raw mode, backspace erase, history
 ring recall, cursor movement) reads through this same seam. Those
-issues become startable only after ENH-007 lands, since the byte
-loop they extend did not exist until this change.
+issues become startable only after ENH-007 lands (they did); the
+raw-mode toggle at #17 will additionally invoke `TTY_OP_SET_RAW` (7)
+through the same cap once the substrate above lands.
 
 ## 3a. `Session` module (src/session.pdx) — M2-001
 
@@ -1390,7 +1464,7 @@ the smoke matrix pulls both sides into one build.
 0xFFFFEC00  SH_OK               general success sentinel (unused at M1)
 0xFFFFEC10  (retired)           was LR_STUB; retired at ENH-007 (#34); value unallocated
 0xFFFFEC11  LR_ERR_BAD_BUF      buf == 0 or buf_len == 0
-0xFFFFEC12  LR_ERR_TTY_UNBOUND  reserved: cap-typed KIND_TTY(read) missing (paideia-os#1986)
+0xFFFFEC12  LR_ERR_TTY_UNBOUND  reserved: cap-typed KIND_TTY(read) seat not yet provisioned in the shell's cap_table (see §3.3 substrate ledger; paideia-os#1986 landed the op, but KIND_TTY absent from KIND_SEEDABLE_TABLE + no shell-side TTY-row seed at boot yet)
 0xFFFFEC13  LR_ERR_EOF          sys_read returned 0 with no bytes read (EOF at start)
 0xFFFFEC14  LR_ERR_READ_FAIL    ENH-007: sys_read returned a negative errno
 0xFFFFEC20  EX_STUB             Exec.M1: validated, no live spawn yet

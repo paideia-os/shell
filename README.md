@@ -12,10 +12,12 @@ REPL.
 > dispatch -> exec. `manifest.pdxproj` `kind` flips back to `tool`.
 > ENH-007 (#34) lands the real bytes into `line_reader_read_line`
 > (byte-at-a-time `sys_read` from fd 0 behind a single seam
-> `lr_read_one_byte`; the cap-typed `KIND_TTY(read)` invoke is
-> deferred behind that same seam until paideia-os#1986 lands
-> `KIND_TTY_OP_READ`). One runtime gap remains as a documented
-> deferral: ENH-008 (#35) persists the in-memory history ring to
+> `lr_read_one_byte`; the cap-typed `KIND_TTY(read)` invoke stays
+> deferred behind that same seam — paideia-os#1986 landed the
+> `TTY_OP_READ` op 2026-08-31, but two upstream landings still
+> block the seam swap; see `design/architecture.md` §3.3, refreshed
+> at #46). One runtime gap remains as a documented deferral:
+> ENH-008 (#35) persists the in-memory history ring to
 > `~/.history/`. See
 > [`design/enhancement-plan.md`](design/enhancement-plan.md) §1 for
 > the grep-verified audit and §6 for why the release that first
@@ -47,8 +49,11 @@ sys_execve + audit-first ShellCommandRecord, ENH-006 shell_main +
 REPL, ENH-007 real line-reader bytes). `line_reader_read_line` now
 issues real `sys_read(0, ptr, 1)` byte-at-a-time reads behind a
 single seam (`lr_read_one_byte`); the cap-typed `KIND_TTY(read)`
-invoke is deferred behind that seam until paideia-os#1986 lands.
-See `design/architecture.md` §3.3 for the deferral rationale.
+invoke stays deferred behind that seam. paideia-os#1986 landed the
+`TTY_OP_READ` op 2026-08-31, but two upstream landings still block
+the seam swap (KIND_TTY absent from `KIND_SEEDABLE_TABLE`; no
+shell-time TTY cap seed at boot). See `design/architecture.md`
+§3.3 for the refreshed deferral ledger (#46).
 History persistence to `~/.history/` remains ENH-008 (#35) work;
 today the encoded HistoryEntry bytes are appended to an in-memory
 `.bss` ring so the encoder is exercised end-to-end from the REPL.

@@ -112,7 +112,7 @@ module Shell = structure {
   // reuse the value for a different meaning without a paired external
   // decoder-refresh sweep.
   pub let LR_ERR_BAD_BUF         : u64 = 0xFFFFEC11   // buf == 0 or buf_len == 0
-  pub let LR_ERR_TTY_UNBOUND     : u64 = 0xFFFFEC12   // reserved: cap-typed KIND_TTY(read) missing (paideia-os#1986)
+  pub let LR_ERR_TTY_UNBOUND     : u64 = 0xFFFFEC12   // reserved: cap-typed KIND_TTY(read) seat not yet provisioned (paideia-os#1986 landed the op but KIND_TTY absent from KIND_SEEDABLE_TABLE + no shell-side TTY row seed at boot; see design/architecture.md §3.3, refreshed at #46)
   pub let LR_ERR_EOF             : u64 = 0xFFFFEC13   // sys_read returned 0 with no bytes read
   pub let LR_ERR_READ_FAIL       : u64 = 0xFFFFEC14   // ENH-007: sys_read returned negative errno
 
