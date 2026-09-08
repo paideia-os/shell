@@ -305,9 +305,18 @@ module Syscall = structure {
   // ==========================================================================
   // sys_getcwd(buf, cap) -> u64
   //
-  // strlen (excl. NUL) of the written path on success; NUL-terminated
-  // in the buffer. Negative errno on failure. `cap` is the output
-  // buffer size; the kernel writes at most `cap` bytes.
+  // Returns total bytes written INCLUDING the trailing NUL on success
+  // (POSIX getcwd(3) convention: N-1 is the string's strlen). The buffer
+  // is always NUL-terminated on the success arm. Negative errno on
+  // failure (-ERANGE if the composed path + NUL does not fit in `cap`,
+  // -EFAULT / -ENOENT per kernel body). `cap` is the caller's declared
+  // output buffer size; the kernel refuses to write past it (-ERANGE)
+  // rather than silently truncating.
+  //
+  // Doc fixed under shell#43 (2026-09): the prior "strlen (excl. NUL)"
+  // wording was a wrapper-side docstring bug -- kernel ground truth at
+  // paideia-os `src/kernel/core/syscall/sys_getcwd.pdx:44-46,242,251,
+  // 280-281` has always returned the inclusive count.
   //
   // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2).
   // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_getcwd.pdx`.

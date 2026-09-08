@@ -640,16 +640,20 @@ module Builtins = structure {
   // checked defensively matching the monorepo pwd_builtin's own
   // negative-errno path at src/user/dispatch.pdx:400).
   //
-  // sys_getcwd return contract discrepancy: syscall.pdx §sys_getcwd
-  // documents "strlen (excl. NUL) of the written path on success", but
-  // the monorepo cd_builtin/pwd_builtin treat the return as INCLUSIVE
-  // of NUL (they `sub 1` before feeding sys_write). Since the LIVE
-  // monorepo behavior is what the running kernel actually delivers, we
-  // follow the monorepo idiom (`sub 1`) here rather than the shell
-  // repo's own comment. If the shell repo's contract is right and the
-  // monorepo's is wrong, a runtime smoke will trip a short-write and
-  // the fix lands as a one-line change here plus a syscall.pdx comment
-  // audit. Deliberately conservative: matches what runs today.
+  // sys_getcwd returns bytes INCLUDING the trailing NUL (POSIX
+  // getcwd(3) convention -- kernel body at paideia-os
+  // src/kernel/core/syscall/sys_getcwd.pdx:44-46,242,251,280-281 and
+  // wrapper doc at syscall.pdx §sys_getcwd both now say so). This
+  // handler feeds sys_write a strlen count via `sub r10, 1` to strip
+  // the NUL before writing (sys_write treats the length as raw bytes
+  // and would otherwise emit the terminator to stdout).
+  //
+  // Historical note (shell#43, 2026-09): the wrapper's original
+  // docstring incorrectly said "strlen (excl. NUL)". The `sub 1`
+  // here has always been correct because it was written against the
+  // LIVE kernel behavior (via the monorepo cd_builtin/pwd_builtin
+  // pattern at src/user/dispatch.pdx:400/628), not against the
+  // wrapper's now-corrected doc.
   //
   // Prologue: `sub rsp, 8` alone (three nested syscall wrapper calls;
   // no callee-save state).
@@ -665,7 +669,7 @@ module Builtins = structure {
   pub let bi_pwd : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (argv_ptr: u64) (argc: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-004 (#31): pwd builtin. Calls sys_getcwd(_bi_pwd_buf, 256) then emits the path via sys_write(1, buf, strlen) + sys_write(1, '\\n', 1). The `sub 1` on sys_getcwd's rax follows the monorepo cd_builtin/pwd_builtin idiom (LIVE runtime treats the return as inclusive of NUL, per src/user/dispatch.pdx:400/628); the shell repo's own syscall.pdx §sys_getcwd comment says exclusive-of-NUL -- discrepancy noted here and in the module header, we defer to LIVE behavior over documentation. Effect/cap set {mem, sysreg} @{fs} lifted from sys_getcwd + sys_write. Prologue: `sub rsp, 8` (aligns rsp%16==0 for the three nested syscall calls; no callee-save state). r10 survives across sys_write per SYSCALL semantics (kernel only clobbers rax/rcx/r11). On sys_getcwd negative errno, return BI_ERR_PWD_TOO_LONG without emitting anything -- matches monorepo pwd_builtin's own fail-silent-return-nonzero convention. argv_ptr / argc parameters are unused (pwd takes no args); kept in signature for uniform dispatcher signature. Labels prefixed bi_pw_.",
+      justification: "shell.ENH-004 (#31): pwd builtin. Calls sys_getcwd(_bi_pwd_buf, 256) then emits the path via sys_write(1, buf, strlen) + sys_write(1, '\\n', 1). The `sub 1` on sys_getcwd's rax strips the trailing NUL before feeding sys_write, since sys_getcwd returns bytes INCLUDING the NUL (POSIX getcwd(3) convention -- kernel body paideia-os src/kernel/core/syscall/sys_getcwd.pdx:44-46,242,251,280-281 and shell wrapper doc syscall.pdx §sys_getcwd both say so; wrapper doc corrected under shell#43). Effect/cap set {mem, sysreg} @{fs} lifted from sys_getcwd + sys_write. Prologue: `sub rsp, 8` (aligns rsp%16==0 for the three nested syscall calls; no callee-save state). r10 survives across sys_write per SYSCALL semantics (kernel only clobbers rax/rcx/r11). On sys_getcwd negative errno, return BI_ERR_PWD_TOO_LONG without emitting anything -- matches monorepo pwd_builtin's own fail-silent-return-nonzero convention. argv_ptr / argc parameters are unused (pwd takes no args); kept in signature for uniform dispatcher signature. Labels prefixed bi_pw_.",
       block: {
         sub rsp, 8;                          // align rsp % 16 for syscalls
 
