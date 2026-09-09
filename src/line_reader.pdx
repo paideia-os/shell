@@ -1,7 +1,8 @@
-// src/line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34) + R66.M1-001 (paideia-os/shell#17)
+// src/line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34) + R66.M1-001 (paideia-os/shell#17) + R66.M1-002 (paideia-os/shell#18)
 //
 // LineReader module: interactive line reader against fd 0 (stdin),
-// with raw-mode TTY input path + ESC-sequence recognition (#17).
+// with raw-mode TTY input path + ESC-sequence recognition (#17) +
+// on-screen backspace erase (#18).
 //
 // =============================================================================
 // SCOPE
@@ -21,8 +22,8 @@
 // foundational substrate for the rest of R66 milestone 1:
 //
 //   * #18 R66.M1-002 (backspace erase on-screen) hooks LR_KEY_BACKSPACE
-//     to write the `\b \b` erase sequence to fd 1 in addition to the
-//     buffer-level shrink #17 already performs.
+//     to write the `\b \b` (0x08 0x20 0x08) erase sequence to fd 1 in
+//     addition to the buffer-level shrink #17 performs. LANDED.
 //   * #19 R66.M1-003 (history ring recall) hooks LR_KEY_UP / LR_KEY_
 //     DOWN to swap the buffer contents with a history-ring entry.
 //   * #20 R66.M1-004 (cursor-left/right in-place edit) hooks LR_KEY_
@@ -30,8 +31,9 @@
 //     insertion.
 //
 // This file lands the recognition machinery + the buffer-level
-// backspace edit. Arrow keys are recognised-but-ignored so #19/#20
-// need only replace the no-op branches with their side-effect bodies.
+// backspace edit + the on-screen erase (#18). Arrow keys are
+// recognised-but-ignored so #19/#20 need only replace the no-op
+// branches with their side-effect bodies.
 //
 // This is the exact byte-source pattern the paideia-os monorepo's
 // `shell_read_line` uses in the live boot today (see
@@ -143,9 +145,12 @@
 //     (0xFFFFEC11). Fail-fast before any read.
 //   - Backspace key (0x7F -> LR_KEY_BACKSPACE via the FSM): decrements
 //     the buffer cursor and count if count > 0; buffer content at the
-//     freed slot is left as-is (subsequent byte overwrites it). The
-//     on-screen erase (`\b \b` write to fd 1) is #18's addition, not
-//     landed here.
+//     freed slot is left as-is (subsequent byte overwrites it). #18
+//     R66.M1-002 additionally emits the on-screen `\b \b` (0x08 0x20
+//     0x08) erase sequence to fd 1 via sys_write, so the terminal
+//     display tracks the buffer. No-op at column zero (count == 0):
+//     neither the buffer shrinks nor the erase fires, preventing the
+//     cursor from crossing back over the prompt.
 //   - Arrow keys (LR_KEY_UP / DOWN / LEFT / RIGHT via the FSM): no-op
 //     at #17; the loop iterates without side effect. #19/#20 replace
 //     the no-op branches with history-recall and cursor-move bodies.
@@ -283,6 +288,29 @@ module LineReader = structure {
   pub let LR_TTY_VTIME_ZERO    : u64 = 0
   pub let LR_TTY_ECHO_OFF      : u64 = 0
   pub let LR_TTY_ICANON_OFF    : u64 = 0
+
+  // ==========================================================================
+  // R66.M1-002 (#18): on-screen backspace erase byte string.
+  //
+  // The canonical VT/ANSI erase-one-visible-character sequence:
+  //   0x08 = BS  (move cursor left one column, non-destructive)
+  //   0x20 = SP  (overwrite the character under the cursor with space)
+  //   0x08 = BS  (move cursor left one column again, back over the space)
+  //
+  // Written to fd 1 as a single 3-byte sys_write from lr_rl_backspace
+  // when r14 > 0 (i.e. at least one visible character sits between the
+  // prompt and the cursor). The [u8; 4] type reserves one trailing
+  // NUL byte for the module-wide "strings are NUL-terminated even
+  // when the caller passes an explicit length" convention (see
+  // Shell::sm_prompt_str / sm_nl_str); sys_write consumes exactly 3
+  // bytes per the rdx argument at the call site.
+  //
+  // Escape encoding is paideia-as v0.33+ `\xHH` (see paideia-as
+  // crates/paideia-as-lexer/src/scan_string.rs parse_string_escape;
+  // \x08 lands as a single 0x08 byte in the emitted .rodata slot,
+  // symmetrically to \x41 landing as 0x41 = 'A').
+  // ==========================================================================
+  pub let lr_erase_str : [u8; 4] = "\x08 \x08\0"
 
   // ==========================================================================
   // lr_read_one_byte(byte_ptr) -> u64
@@ -620,12 +648,15 @@ module LineReader = structure {
   // Backspace side effect: LR_KEY_BACKSPACE decrements r14 and r12 if
   // r14 > 0; the byte at the freed slot is not zeroed (the next
   // append overwrites it, and the caller consumes r14 bytes only).
-  // The on-screen `\b \b` erase sequence is #18's contribution and
-  // is deliberately not landed here -- writing to fd 1 from inside
-  // the read loop would require re-entering shell_note's counter
-  // discipline and threading an "output during input" invariant that
-  // #17 does not need. #18 replaces the lr_rl_backspace body with the
-  // three-byte fd-1 write + the shrink #17 already does.
+  // #18 R66.M1-002 additionally emits the on-screen erase: a single
+  // sys_write(1, lr_erase_str, 3) writing the canonical `\b \b`
+  // (0x08 0x20 0x08) sequence, so the terminal cursor tracks the
+  // buffer shrink. sys_write does NOT re-enter shell_note (only
+  // line_reader_read_line's own entry / return / error paths bump
+  // SH_ST_*), so the PROMPTS - LINES - ERRORS invariant is unaffected
+  // by per-keystroke erase writes. At column zero (r14 == 0) the
+  // whole branch is a no-op: neither shrink nor erase fires, so the
+  // cursor cannot cross back over the prompt.
   //
   // Arrow keys / LR_KEY_UNKNOWN: recognised, then discarded. The
   // FSM has consumed the bytes; the loop iterates. #19 replaces the
@@ -636,7 +667,7 @@ module LineReader = structure {
   pub let line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (buf: u64) (buf_len: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17): byte-at-a-time line assembly over the key-event FSM. The pre-#17 body called lr_read_one_byte directly and treated every byte as verbatim buffer input; the #17 body calls lr_read_key which folds 0x1B [...final and 0x7F into LR_KEY_* sentinels. Raw bytes (0..0xFF, excluding 0x1B and 0x7F which the FSM consumes) still take the append path; the newline byte (0x0A) terminates as before. Backspace (LR_KEY_BACKSPACE): shrinks the buffer cursor + count by 1 if count > 0 (buffer-level erase only; on-screen `\\b \\b` is deferred to #18 per the header comment). Arrow keys (LR_KEY_UP/DOWN/LEFT/RIGHT): recognised then discarded; #19/#20 replace the no-op branches. LR_KEY_UNKNOWN (unmapped ESC or CSI): also discarded. LR_KEY_EOF: routes to lr_rl_eof (mid-stream EOF returns count so far; start EOF returns LR_ERR_EOF). LR_ERR_READ_FAIL: routes to lr_rl_read_fail. Three callee-save pushes (r12=buf-walker, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_key). No `sub rsp, 8` needed. Gate rejects (buf==0 || buf_len==0) fail fast with LR_ERR_BAD_BUF before any read; SH_ST_PROMPTS bumps unconditionally at entry so a caller-side gate reject still records the prompt attempt. Counter discipline unchanged from ENH-007: SH_ST_PROMPTS on entry, SH_ST_LINES on any bytes-written return, SH_ST_ERRORS on every error sentinel — the invariant PROMPTS - LINES - ERRORS == 0 holds. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A appear as low-byte compares; large-imm LR_KEY_* / LR_ERR_* sentinels stage via `mov r11, imm64; cmp rax, r11`); byte STORE uses `mov_b [r12], rax` (rax's low byte) per the history.pdx / command_record.pdx pattern; byte LOAD not needed in this body (the FSM already delivered the byte in rax). raw-mode entry / cooked-mode restore are NOT called from this body: R66.M1-001 places them as scaffolded no-ops that a future shell_main will call once at session start / teardown when the KIND_TTY cap seat is provisioned (per-session, not per-line, so a Ctrl-C exit does not leave the tty stuck in raw mode). Labels prefixed lr_rl_.",
+      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17) + R66.M1-002 (#18): byte-at-a-time line assembly over the key-event FSM. The pre-#17 body called lr_read_one_byte directly and treated every byte as verbatim buffer input; the #17 body calls lr_read_key which folds 0x1B [...final and 0x7F into LR_KEY_* sentinels. Raw bytes (0..0xFF, excluding 0x1B and 0x7F which the FSM consumes) still take the append path; the newline byte (0x0A) terminates as before. Backspace (LR_KEY_BACKSPACE): shrinks the buffer cursor + count by 1 if count > 0 AND, per #18 R66.M1-002, emits the canonical on-screen erase `\\x08 \\x08` (BS SP BS) via sys_write(1, lr_erase_str, 3) so the terminal display tracks the buffer shrink. At column zero (count == 0) the branch is a full no-op: neither shrink nor erase, so the cursor never crosses back over the prompt. sys_write does NOT re-enter shell_note (only line_reader_read_line's own entry/return/error paths bump SH_ST_*), so the PROMPTS-LINES-ERRORS invariant is unaffected by per-keystroke erase writes. sys_write's clobber of rax/rcx/r11 is benign: r11 is re-staged at the top of every loop iteration (sentinel compares each stage `mov r11, imm64` fresh), rax/rcx are caller-save with no live value across the write. r12/r13/r14 (callee-save) survive as required. rsp%16==0 holds at the sys_write call site: entry rsp%16==8 plus 3 callee-save pushes (24 bytes) leaves rsp%16==0, and no local stack activity moves rsp between the prologue and the call. Arrow keys (LR_KEY_UP/DOWN/LEFT/RIGHT): recognised then discarded; #19/#20 replace the no-op branches. LR_KEY_UNKNOWN (unmapped ESC or CSI): also discarded. LR_KEY_EOF: routes to lr_rl_eof (mid-stream EOF returns count so far; start EOF returns LR_ERR_EOF). LR_ERR_READ_FAIL: routes to lr_rl_read_fail. Three callee-save pushes (r12=buf-walker, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_key, sys_write from #18). No `sub rsp, 8` needed. Gate rejects (buf==0 || buf_len==0) fail fast with LR_ERR_BAD_BUF before any read; SH_ST_PROMPTS bumps unconditionally at entry so a caller-side gate reject still records the prompt attempt. Counter discipline unchanged from ENH-007: SH_ST_PROMPTS on entry, SH_ST_LINES on any bytes-written return, SH_ST_ERRORS on every error sentinel — the invariant PROMPTS - LINES - ERRORS == 0 holds. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A appear as low-byte compares; large-imm LR_KEY_* / LR_ERR_* sentinels stage via `mov r11, imm64; cmp rax, r11`); byte STORE uses `mov_b [r12], rax` (rax's low byte) per the history.pdx / command_record.pdx pattern; byte LOAD not needed in this body (the FSM already delivered the byte in rax). Effect/cap set !{mem, sysreg} @{fs} already covers sys_write (identical to sys_read's annotation) so #18's added call site widens nothing. raw-mode entry / cooked-mode restore are NOT called from this body: R66.M1-001 places them as scaffolded no-ops that a future shell_main will call once at session start / teardown when the KIND_TTY cap seat is provisioned (per-session, not per-line, so a Ctrl-C exit does not leave the tty stuck in raw mode). In cooked mode (what the substrate runs today) the kernel tty driver consumes 0x7F before it reaches sys_read, so the erase-write branch is dead code by construction; when the substrate lands and shell_main calls lr_tty_set_raw at startup, this branch activates without a further edit. Labels prefixed lr_rl_.",
       block: {
         push r12;
         push r13;
@@ -711,11 +742,33 @@ module LineReader = structure {
         jmp lr_rl_loop;
 
       lr_rl_backspace:
-        // Shrink the buffer if count > 0; iterate either way.
+        // Shrink the buffer if count > 0; iterate either way. At
+        // column zero the branch is a full no-op (no shrink, no
+        // erase) so the on-screen cursor cannot cross back over the
+        // prompt.
         cmp r14, 0;
         je  lr_rl_loop;
         sub r14, 1;
         sub r12, 1;
+        // R66.M1-002 (#18): on-screen erase. sys_write(1, lr_erase_
+        // str, 3) writes the canonical `\b \b` (0x08 0x20 0x08)
+        // sequence to stdout so the terminal display tracks the
+        // buffer shrink. sys_write clobbers rax/rcx/r11 (all caller-
+        // save; r11 is re-staged at the top of every loop iteration,
+        // so its clobber is benign). r12/r13/r14 are callee-save and
+        // survive. rsp%16==0 holds at the call site: entry rsp%16==8
+        // plus 3 callee-save pushes (24 bytes) leaves rsp%16==0, and
+        // no local stack activity has moved rsp since the prologue.
+        // Return value is discarded: a failed erase (short write to
+        // a full pipe, negative errno) leaves the terminal state
+        // out-of-sync with the buffer for exactly one keystroke,
+        // which the next append or a redraw corrects; no
+        // SH_ST_ERRORS bump because this is not a line-assembly
+        // failure -- the buffer edit already succeeded.
+        mov rdi, 1;
+        lea rsi, [rip + lr_erase_str];
+        mov rdx, 3;
+        call sys_write;
         jmp lr_rl_loop;
 
       lr_rl_eof:
