@@ -1,0 +1,598 @@
+// tests/tokenizer_tilde.pdx -- R106.SHELL-002 (paideia-os/shell#41)
+//
+// TestTokenizerTilde module: golden-fingerprint driver for the R106
+// `Tokenizer.tokenizer_tilde_classify` surface at src/tokenizer.pdx.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Exercises the novel-tilde classifier's five-way decision matrix
+// (see src/tokenizer.pdx tokenizer_tilde_classify header for the
+// underlying rules). One case per return value plus a "not a tilde
+// token" baseline and a bare '~/' HOME case that keeps HOME distinct
+// from the empty-tilde form:
+//
+//   0  none       "ls"           -> TILDE_KIND_NONE        (0)
+//   1  home       "~"            -> TILDE_KIND_HOME        (1)
+//   2  home_slash "~/foo"        -> TILDE_KIND_HOME        (1)
+//   3  fp_ok      "~<64-hex>"    -> TILDE_KIND_FINGERPRINT (2)
+//   4  fp_slash   "~<64-hex>/x"  -> TILDE_KIND_FINGERPRINT (2)
+//   5  alias      "~alice"       -> TILDE_KIND_ALIAS       (3)
+//   6  malformed  "~deadbeef"    -> TOK_ERR_FINGERPRINT_MALFORMED (0xFFFFEB06)
+//   7  empty      len=0          -> TILDE_KIND_NONE        (0)
+//
+// The 64-hex fingerprint used for cases 3 and 4 is the ASCII-hex
+// rendering of a synthetic SHAKE-256 fingerprint value: 64 bytes of
+// lowercase '0'..'f' (specifically the repeating pattern
+// "0123456789abcdef" x 4). Not derived from any real user; the
+// classifier does not consult the registry so any byte pattern that
+// satisfies the shape (all lowercase hex, length exactly 64) counts.
+//
+// =============================================================================
+// FIXTURE STRATEGY
+// =============================================================================
+//
+// Same byte-write shape as tests/test_tokenizer.pdx: every input
+// buffer is `.bss [u8; N] uninit @align(8)` and populated by
+// `ttt_reset` via mov_b byte writes. The classifier does not touch
+// the buffer past its length, so an over-sized buffer with tail
+// garbage would still classify correctly -- the reset zero-fills
+// each buffer anyway so a stale byte from a prior test cannot leak.
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFEDCx (TestTokenizerTilde)
+// =============================================================================
+//
+// Adjacent to TestTokenizer's 0xFFFFEDBx band; reserved by the
+// tests/README.md ledger for the three #41-dependent test files. The
+// two sibling modules TestTokenizerBareCd and TestDispatchArgvConstruction
+// claim 0xFFFFEDDx and 0xFFFFEDEx respectively so all three landing-
+// site fail codes stay disjoint.
+//
+//   0            TTT_PASS
+//   0xFFFFEDC0   TTT_FAIL_NONE
+//   0xFFFFEDC1   TTT_FAIL_HOME
+//   0xFFFFEDC2   TTT_FAIL_HOME_SLASH
+//   0xFFFFEDC3   TTT_FAIL_FP_OK
+//   0xFFFFEDC4   TTT_FAIL_FP_SLASH
+//   0xFFFFEDC5   TTT_FAIL_ALIAS
+//   0xFFFFEDC6   TTT_FAIL_MALFORMED
+//   0xFFFFEDC7   TTT_FAIL_EMPTY
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module basename PascalCase (`TestTokenizerTilde`).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7F (all constants are single-
+//     byte ASCII or single-digit TILDE_KIND_* values).
+//   - Large-imm compare 0xFFFFEB06 stages via `mov r10, imm64; cmp rax, r10`.
+//   - r11 (paideia-as reserved) untouched; .bss LEA uses r10.
+//   - Byte writes use mov_b [ptr], rax pattern.
+//   - Per-case prologue: `sub rsp, 8` alone (leaf-modulo-classify;
+//     rsp%16==8 entry, rsp%16==0 for the nested classify call).
+//   - Labels prefixed `ttt_` per reserved-keyword discipline.
+
+module TokenizerTilde = structure {
+
+  // ==========================================================================
+  // Fail codes (0xFFFFEDCx band)
+  // ==========================================================================
+  pub let TTT_PASS               : u64 = 0
+  pub let TTT_FAIL_NONE          : u64 = 0xFFFFEDC0
+  pub let TTT_FAIL_HOME          : u64 = 0xFFFFEDC1
+  pub let TTT_FAIL_HOME_SLASH    : u64 = 0xFFFFEDC2
+  pub let TTT_FAIL_FP_OK         : u64 = 0xFFFFEDC3
+  pub let TTT_FAIL_FP_SLASH      : u64 = 0xFFFFEDC4
+  pub let TTT_FAIL_ALIAS         : u64 = 0xFFFFEDC5
+  pub let TTT_FAIL_MALFORMED     : u64 = 0xFFFFEDC6
+  pub let TTT_FAIL_EMPTY         : u64 = 0xFFFFEDC7
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  //   _ttt_in_none     "ls"                    2 bytes
+  //   _ttt_in_home     "~"                     1 byte
+  //   _ttt_in_home_sl  "~/foo"                 5 bytes
+  //   _ttt_in_fp       "~" + 64 hex            65 bytes
+  //   _ttt_in_fp_sl    "~" + 64 hex + "/x"     67 bytes
+  //   _ttt_in_alias    "~alice"                6 bytes
+  //   _ttt_in_malf     "~deadbeef"             9 bytes
+  //   _ttt_in_empty    unused (len=0 case reads nothing)
+  //
+  // Sizes rounded up to the next qword multiple for byte-write tidy.
+  // ==========================================================================
+  pub let mut _ttt_in_none    : [u8; 8]  = uninit @align(8)
+  pub let mut _ttt_in_home    : [u8; 8]  = uninit @align(8)
+  pub let mut _ttt_in_home_sl : [u8; 8]  = uninit @align(8)
+  pub let mut _ttt_in_fp      : [u8; 72] = uninit @align(8)
+  pub let mut _ttt_in_fp_sl   : [u8; 72] = uninit @align(8)
+  pub let mut _ttt_in_alias   : [u8; 8]  = uninit @align(8)
+  pub let mut _ttt_in_malf    : [u8; 16] = uninit @align(8)
+  pub let mut _ttt_in_empty   : [u8; 8]  = uninit @align(8)
+
+  // ==========================================================================
+  // ttt_reset() -> ()
+  //
+  // Zero every fixture then populate the seven non-empty inputs via
+  // mov_b byte writes. Same idiom the sibling ttk_reset uses.
+  // Leaf function. Labels prefixed ttt_rs_ (none needed; linear body).
+  // ==========================================================================
+  pub let ttt_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (paideia-os/shell#41): zero every fixture .bss buffer then populate the seven case inputs with the classifier decision-matrix byte patterns via mov_b. Same shape as sibling ttk_reset at tests/test_tokenizer.pdx. r10 is .bss LEA scratch; rax is byte-constant staging. Leaf; no push/pop parity concern. The 64-hex fingerprint uses the pattern '0123456789abcdef' x 4 (a synthetic sanity value; the classifier does not consult the registry). Labels prefixed ttt_rs_.",
+      block: {
+        xor rax, rax;
+
+        // Zero every buffer (one write per qword).
+        lea r10, [rip + _ttt_in_none];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _ttt_in_home];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _ttt_in_home_sl];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _ttt_in_fp];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+        mov [r10 + 64], rax;
+        lea r10, [rip + _ttt_in_fp_sl];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+        mov [r10 + 64], rax;
+        lea r10, [rip + _ttt_in_alias];
+        mov [r10 + 0], rax;
+        lea r10, [rip + _ttt_in_malf];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+        lea r10, [rip + _ttt_in_empty];
+        mov [r10 + 0], rax;
+
+        // Populate _ttt_in_none: "ls" (no leading tilde).
+        lea r10, [rip + _ttt_in_none];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;
+        mov rax, 0x73; mov_b [r10 + 1], rax;
+
+        // Populate _ttt_in_home: "~" (single tilde).
+        lea r10, [rip + _ttt_in_home];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+
+        // Populate _ttt_in_home_sl: "~/foo" (tilde then slash-path).
+        lea r10, [rip + _ttt_in_home_sl];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+        mov rax, 0x2f; mov_b [r10 + 1], rax;
+        mov rax, 0x66; mov_b [r10 + 2], rax;
+        mov rax, 0x6f; mov_b [r10 + 3], rax;
+        mov rax, 0x6f; mov_b [r10 + 4], rax;
+
+        // Populate _ttt_in_fp: "~" + 64 hex chars (repeating "0123456789abcdef" x 4).
+        // Total 65 bytes (1 for '~', 64 for hex).
+        lea r10, [rip + _ttt_in_fp];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+        // Repeat pattern 4 times.
+        // Round 1 (offsets 1..16).
+        mov rax, 0x30; mov_b [r10 +  1], rax;
+        mov rax, 0x31; mov_b [r10 +  2], rax;
+        mov rax, 0x32; mov_b [r10 +  3], rax;
+        mov rax, 0x33; mov_b [r10 +  4], rax;
+        mov rax, 0x34; mov_b [r10 +  5], rax;
+        mov rax, 0x35; mov_b [r10 +  6], rax;
+        mov rax, 0x36; mov_b [r10 +  7], rax;
+        mov rax, 0x37; mov_b [r10 +  8], rax;
+        mov rax, 0x38; mov_b [r10 +  9], rax;
+        mov rax, 0x39; mov_b [r10 + 10], rax;
+        mov rax, 0x61; mov_b [r10 + 11], rax;
+        mov rax, 0x62; mov_b [r10 + 12], rax;
+        mov rax, 0x63; mov_b [r10 + 13], rax;
+        mov rax, 0x64; mov_b [r10 + 14], rax;
+        mov rax, 0x65; mov_b [r10 + 15], rax;
+        mov rax, 0x66; mov_b [r10 + 16], rax;
+        // Round 2 (17..32).
+        mov rax, 0x30; mov_b [r10 + 17], rax;
+        mov rax, 0x31; mov_b [r10 + 18], rax;
+        mov rax, 0x32; mov_b [r10 + 19], rax;
+        mov rax, 0x33; mov_b [r10 + 20], rax;
+        mov rax, 0x34; mov_b [r10 + 21], rax;
+        mov rax, 0x35; mov_b [r10 + 22], rax;
+        mov rax, 0x36; mov_b [r10 + 23], rax;
+        mov rax, 0x37; mov_b [r10 + 24], rax;
+        mov rax, 0x38; mov_b [r10 + 25], rax;
+        mov rax, 0x39; mov_b [r10 + 26], rax;
+        mov rax, 0x61; mov_b [r10 + 27], rax;
+        mov rax, 0x62; mov_b [r10 + 28], rax;
+        mov rax, 0x63; mov_b [r10 + 29], rax;
+        mov rax, 0x64; mov_b [r10 + 30], rax;
+        mov rax, 0x65; mov_b [r10 + 31], rax;
+        mov rax, 0x66; mov_b [r10 + 32], rax;
+        // Round 3 (33..48).
+        mov rax, 0x30; mov_b [r10 + 33], rax;
+        mov rax, 0x31; mov_b [r10 + 34], rax;
+        mov rax, 0x32; mov_b [r10 + 35], rax;
+        mov rax, 0x33; mov_b [r10 + 36], rax;
+        mov rax, 0x34; mov_b [r10 + 37], rax;
+        mov rax, 0x35; mov_b [r10 + 38], rax;
+        mov rax, 0x36; mov_b [r10 + 39], rax;
+        mov rax, 0x37; mov_b [r10 + 40], rax;
+        mov rax, 0x38; mov_b [r10 + 41], rax;
+        mov rax, 0x39; mov_b [r10 + 42], rax;
+        mov rax, 0x61; mov_b [r10 + 43], rax;
+        mov rax, 0x62; mov_b [r10 + 44], rax;
+        mov rax, 0x63; mov_b [r10 + 45], rax;
+        mov rax, 0x64; mov_b [r10 + 46], rax;
+        mov rax, 0x65; mov_b [r10 + 47], rax;
+        mov rax, 0x66; mov_b [r10 + 48], rax;
+        // Round 4 (49..64).
+        mov rax, 0x30; mov_b [r10 + 49], rax;
+        mov rax, 0x31; mov_b [r10 + 50], rax;
+        mov rax, 0x32; mov_b [r10 + 51], rax;
+        mov rax, 0x33; mov_b [r10 + 52], rax;
+        mov rax, 0x34; mov_b [r10 + 53], rax;
+        mov rax, 0x35; mov_b [r10 + 54], rax;
+        mov rax, 0x36; mov_b [r10 + 55], rax;
+        mov rax, 0x37; mov_b [r10 + 56], rax;
+        mov rax, 0x38; mov_b [r10 + 57], rax;
+        mov rax, 0x39; mov_b [r10 + 58], rax;
+        mov rax, 0x61; mov_b [r10 + 59], rax;
+        mov rax, 0x62; mov_b [r10 + 60], rax;
+        mov rax, 0x63; mov_b [r10 + 61], rax;
+        mov rax, 0x64; mov_b [r10 + 62], rax;
+        mov rax, 0x65; mov_b [r10 + 63], rax;
+        mov rax, 0x66; mov_b [r10 + 64], rax;
+
+        // Populate _ttt_in_fp_sl: same 65 bytes as fp, then "/x" tail (2 bytes).
+        // Total 67 bytes.
+        lea r10, [rip + _ttt_in_fp_sl];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+        // 64-hex body (identical to _ttt_in_fp offsets 1..64).
+        mov rax, 0x30; mov_b [r10 +  1], rax;
+        mov rax, 0x31; mov_b [r10 +  2], rax;
+        mov rax, 0x32; mov_b [r10 +  3], rax;
+        mov rax, 0x33; mov_b [r10 +  4], rax;
+        mov rax, 0x34; mov_b [r10 +  5], rax;
+        mov rax, 0x35; mov_b [r10 +  6], rax;
+        mov rax, 0x36; mov_b [r10 +  7], rax;
+        mov rax, 0x37; mov_b [r10 +  8], rax;
+        mov rax, 0x38; mov_b [r10 +  9], rax;
+        mov rax, 0x39; mov_b [r10 + 10], rax;
+        mov rax, 0x61; mov_b [r10 + 11], rax;
+        mov rax, 0x62; mov_b [r10 + 12], rax;
+        mov rax, 0x63; mov_b [r10 + 13], rax;
+        mov rax, 0x64; mov_b [r10 + 14], rax;
+        mov rax, 0x65; mov_b [r10 + 15], rax;
+        mov rax, 0x66; mov_b [r10 + 16], rax;
+        mov rax, 0x30; mov_b [r10 + 17], rax;
+        mov rax, 0x31; mov_b [r10 + 18], rax;
+        mov rax, 0x32; mov_b [r10 + 19], rax;
+        mov rax, 0x33; mov_b [r10 + 20], rax;
+        mov rax, 0x34; mov_b [r10 + 21], rax;
+        mov rax, 0x35; mov_b [r10 + 22], rax;
+        mov rax, 0x36; mov_b [r10 + 23], rax;
+        mov rax, 0x37; mov_b [r10 + 24], rax;
+        mov rax, 0x38; mov_b [r10 + 25], rax;
+        mov rax, 0x39; mov_b [r10 + 26], rax;
+        mov rax, 0x61; mov_b [r10 + 27], rax;
+        mov rax, 0x62; mov_b [r10 + 28], rax;
+        mov rax, 0x63; mov_b [r10 + 29], rax;
+        mov rax, 0x64; mov_b [r10 + 30], rax;
+        mov rax, 0x65; mov_b [r10 + 31], rax;
+        mov rax, 0x66; mov_b [r10 + 32], rax;
+        mov rax, 0x30; mov_b [r10 + 33], rax;
+        mov rax, 0x31; mov_b [r10 + 34], rax;
+        mov rax, 0x32; mov_b [r10 + 35], rax;
+        mov rax, 0x33; mov_b [r10 + 36], rax;
+        mov rax, 0x34; mov_b [r10 + 37], rax;
+        mov rax, 0x35; mov_b [r10 + 38], rax;
+        mov rax, 0x36; mov_b [r10 + 39], rax;
+        mov rax, 0x37; mov_b [r10 + 40], rax;
+        mov rax, 0x38; mov_b [r10 + 41], rax;
+        mov rax, 0x39; mov_b [r10 + 42], rax;
+        mov rax, 0x61; mov_b [r10 + 43], rax;
+        mov rax, 0x62; mov_b [r10 + 44], rax;
+        mov rax, 0x63; mov_b [r10 + 45], rax;
+        mov rax, 0x64; mov_b [r10 + 46], rax;
+        mov rax, 0x65; mov_b [r10 + 47], rax;
+        mov rax, 0x66; mov_b [r10 + 48], rax;
+        mov rax, 0x30; mov_b [r10 + 49], rax;
+        mov rax, 0x31; mov_b [r10 + 50], rax;
+        mov rax, 0x32; mov_b [r10 + 51], rax;
+        mov rax, 0x33; mov_b [r10 + 52], rax;
+        mov rax, 0x34; mov_b [r10 + 53], rax;
+        mov rax, 0x35; mov_b [r10 + 54], rax;
+        mov rax, 0x36; mov_b [r10 + 55], rax;
+        mov rax, 0x37; mov_b [r10 + 56], rax;
+        mov rax, 0x38; mov_b [r10 + 57], rax;
+        mov rax, 0x39; mov_b [r10 + 58], rax;
+        mov rax, 0x61; mov_b [r10 + 59], rax;
+        mov rax, 0x62; mov_b [r10 + 60], rax;
+        mov rax, 0x63; mov_b [r10 + 61], rax;
+        mov rax, 0x64; mov_b [r10 + 62], rax;
+        mov rax, 0x65; mov_b [r10 + 63], rax;
+        mov rax, 0x66; mov_b [r10 + 64], rax;
+        // "/x" tail.
+        mov rax, 0x2f; mov_b [r10 + 65], rax;
+        mov rax, 0x78; mov_b [r10 + 66], rax;
+
+        // Populate _ttt_in_alias: "~alice" (6 bytes).
+        lea r10, [rip + _ttt_in_alias];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+        mov rax, 0x61; mov_b [r10 + 1], rax;
+        mov rax, 0x6c; mov_b [r10 + 2], rax;
+        mov rax, 0x69; mov_b [r10 + 3], rax;
+        mov rax, 0x63; mov_b [r10 + 4], rax;
+        mov rax, 0x65; mov_b [r10 + 5], rax;
+
+        // Populate _ttt_in_malf: "~deadbeef" (9 bytes; all-hex segment length 8 != 64).
+        lea r10, [rip + _ttt_in_malf];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+        mov rax, 0x64; mov_b [r10 + 1], rax;
+        mov rax, 0x65; mov_b [r10 + 2], rax;
+        mov rax, 0x61; mov_b [r10 + 3], rax;
+        mov rax, 0x64; mov_b [r10 + 4], rax;
+        mov rax, 0x62; mov_b [r10 + 5], rax;
+        mov rax, 0x65; mov_b [r10 + 6], rax;
+        mov rax, 0x65; mov_b [r10 + 7], rax;
+        mov rax, 0x66; mov_b [r10 + 8], rax;
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Per-case shape: 24-byte prologue (sub rsp, 8 alone) for one nested
+  // classify call. rsp%16==8 entry -> rsp%16==0 for the call.
+  // ==========================================================================
+
+  // Case 0: "ls" -> NONE.
+  pub let ttt_case_none : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case none: bare 'ls' has no leading '~' so tokenizer_tilde_classify falls through the first-byte check and returns TILDE_KIND_NONE (0). Prologue `sub rsp, 8` alone -- no callee-save state; the nested classify call sees rsp%16==0.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_none];
+        mov rsi, 2;
+        call tokenizer_tilde_classify;
+        cmp rax, 0;
+        jne ttt_none_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_none_fail:
+        mov rax, 0xFFFFEDC0;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // Case 1: "~" (single tilde, len 1) -> HOME.
+  pub let ttt_case_home : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case home: bare '~' (len=1) has zero-length segment after '~' so classify returns TILDE_KIND_HOME (1). Fingerprint: rax==1.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_home];
+        mov rsi, 1;
+        call tokenizer_tilde_classify;
+        cmp rax, 1;
+        jne ttt_home_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_home_fail:
+        mov rax, 0xFFFFEDC1;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // Case 2: "~/foo" -> HOME (slash bounds the empty segment).
+  pub let ttt_case_home_slash : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case home_slash: '~/foo' has '~' at 0 and '/' at 1 so the segment length is 0 (empty). classify short-circuits to TILDE_KIND_HOME (1) without entering the hex scan; the /foo tail is a caller (argv-construct) concern, not a classifier concern.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_home_sl];
+        mov rsi, 5;
+        call tokenizer_tilde_classify;
+        cmp rax, 1;
+        jne ttt_hs_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_hs_fail:
+        mov rax, 0xFFFFEDC2;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // Case 3: "~<64-hex>" -> FINGERPRINT.
+  pub let ttt_case_fp_ok : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case fp_ok: '~' followed by 64 lowercase hex bytes; segment length exactly 64 -> TILDE_KIND_FINGERPRINT (2). Exercises the full second-pass hex scan and the length-eq-64 branch of the hex-done gate.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_fp];
+        mov rsi, 65;                             // 1 ('~') + 64 (hex)
+        call tokenizer_tilde_classify;
+        cmp rax, 2;
+        jne ttt_fp_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_fp_fail:
+        mov rax, 0xFFFFEDC3;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // Case 4: "~<64-hex>/x" -> FINGERPRINT (slash caps segment at 64).
+  pub let ttt_case_fp_slash : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case fp_slash: '~' + 64 hex + '/x'. Segment walker stops at the '/' at position 65 (i.e. after 64 hex bytes), so segment length is 64 and all bytes are hex -> TILDE_KIND_FINGERPRINT (2). The trailing '/x' does not perturb the classifier.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_fp_sl];
+        mov rsi, 67;                             // 1 + 64 + 2
+        call tokenizer_tilde_classify;
+        cmp rax, 2;
+        jne ttt_fps_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_fps_fail:
+        mov rax, 0xFFFFEDC4;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // Case 5: "~alice" -> ALIAS ('l' is not a hex digit).
+  pub let ttt_case_alias : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case alias: '~alice'. Segment 'alice' contains 'l' (0x6c) which fails the [0-9a-f] hex gate at ttc_hex_scan; classifier returns TILDE_KIND_ALIAS (3). The actual KIND_USER_ALIAS lookup and the R106 stub's E_ALIAS_UNRESOLVED response are argv-construction concerns tested in TestDispatchArgvConstruction, not here -- this case only verifies the byte-shape classification.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_alias];
+        mov rsi, 6;
+        call tokenizer_tilde_classify;
+        cmp rax, 3;
+        jne ttt_alias_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_alias_fail:
+        mov rax, 0xFFFFEDC5;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // Case 6: "~deadbeef" -> MALFORMED (all-hex, length 8 != 64).
+  pub let ttt_case_malformed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case malformed: '~deadbeef'. Segment 'deadbeef' is 8 bytes, all in [0-9a-f]. Second-pass hex scan completes without hitting ALIAS; then the length-eq-64 gate fails and classifier returns TOK_ERR_FINGERPRINT_MALFORMED (0xFFFFEB06). Large-imm compare stages via `mov r10, imm64; cmp rax, r10`.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_malf];
+        mov rsi, 9;
+        call tokenizer_tilde_classify;
+        mov r10, 0xFFFFEB06;                     // TOK_ERR_FINGERPRINT_MALFORMED
+        cmp rax, r10;
+        jne ttt_malf_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_malf_fail:
+        mov rax, 0xFFFFEDC6;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // Case 7: empty token (len=0) -> NONE (short-circuits without reading).
+  pub let ttt_case_empty : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case empty: tok_len=0. classify returns TILDE_KIND_NONE (0) via the empty-token short-circuit BEFORE touching the buffer -- so a caller passing a null buffer with len=0 stays safe. Assert rax==0.",
+      block: {
+        sub rsp, 8;
+        call ttt_reset;
+        lea rdi, [rip + _ttt_in_empty];
+        mov rsi, 0;
+        call tokenizer_tilde_classify;
+        cmp rax, 0;
+        jne ttt_empty_fail;
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+      ttt_empty_fail:
+        mov rax, 0xFFFFEDC7;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttt_run_all() -> u64
+  //
+  // Umbrella: run the eight cases in order; first non-zero return
+  // short-circuits and propagates.
+  // ==========================================================================
+  pub let ttt_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) umbrella: sequential invocation of the eight ttt_case_* entries; propagate the first non-zero verdict. Effect/cap set {mem} @{} (classifier is pure over caller-owned buffer). Prologue `sub rsp, 8` alone. Labels prefixed ttt_ra_.",
+      block: {
+        sub rsp, 8;
+
+        call ttt_case_none;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        call ttt_case_home;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        call ttt_case_home_slash;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        call ttt_case_fp_ok;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        call ttt_case_fp_slash;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        call ttt_case_alias;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        call ttt_case_malformed;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        call ttt_case_empty;
+        cmp rax, 0;
+        jne ttt_ra_out;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      ttt_ra_out:
+        add rsp, 8;
+        ret
+      }
+    }
+}

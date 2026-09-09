@@ -98,6 +98,9 @@ tests:
   - tests/test_line_reader.pdx     # ENH-007 (#34): line_reader_read_line + lr_read_one_byte input-gate fingerprint
   - tests/test_history.pdx         # ENH-008 (#35): history persist path format + flush skip paths fingerprint
   - tests/test_tokenizer.pdx       # R106.SHELL-003 (#42): R106.M1 tokenize fingerprint matrix (14 cases)
+  - tests/tokenizer_tilde.pdx      # R106.SHELL-002 (#41): tokenizer_tilde_classify decision matrix (band 0xFFFFEDCx)
+  - tests/tokenizer_bare_cd.pdx    # R106.SHELL-002 (#41): tokenize("cd")+bi_cd(argc=1) → BI_ERR_CD_NO_ARG (band 0xFFFFEDDx)
+  - tests/dispatch_argv_construction.pdx  # R106.SHELL-002 (#41): dispatch_argv_construct novel-tilde expansion (band 0xFFFFEDEx)
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

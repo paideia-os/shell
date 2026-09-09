@@ -111,6 +111,61 @@ module Dispatch = structure {
   pub let BI_MISS   : u64 = 0xFFFFECE0
 
   // ==========================================================================
+  // Argv-construction return-code band 0xFFFFEBAx (R106.SHELL-002, #41)
+  //
+  // dispatch_argv_construct returns AC_OK (0) on success and one of the
+  // sentinels below on failure. Disjoint from the 0xFFFFEB0x tokenizer
+  // band (0xFFFFEB01..0xFFFFEB04, 0xFFFFEB06) so a downstream operator
+  // can tell "tokenizer refused input" from "argv-construction refused
+  // expansion" by the second-nibble alone (Bx vs 0x). See paideia-os
+  // design/user/content-addressed-identity.md §4 for the underlying
+  // semantic error taxonomy this band names.
+  //
+  //   AC_ERR_BAD_ARGS         0xFFFFEBA0  desc_ptr NULL, or any zero-cap
+  //                                        buffer with a non-zero source
+  //   AC_ERR_POOL_OVERFLOW    0xFFFFEBA1  pool_used + needed > pool_cap
+  //                                        for the current token's
+  //                                        expansion
+  //   AC_ERR_ARGC_OVERFLOW    0xFFFFEBA2  argc == off_cap on emit of the
+  //                                        next argv[i]
+  //   AC_ERR_HOME_MISSING     0xFFFFEBA3  TILDE_KIND_HOME with home_len
+  //                                        == 0 (envp did not carry
+  //                                        HOME=; refuse expansion,
+  //                                        never fall through to a
+  //                                        silent literal '~')
+  //   AC_ERR_ALIAS_UNRESOLVED 0xFFFFEBA4  TILDE_KIND_ALIAS + the R106
+  //                                        stub kernel backend returns
+  //                                        E_ALIAS_UNRESOLVED for every
+  //                                        symbolic name. At R108.M4 the
+  //                                        real KIND_USER_ALIAS.lookup
+  //                                        replaces the stub in-place;
+  //                                        this shell code does not
+  //                                        change then, only the
+  //                                        kernel-side backend flips.
+  //   AC_ERR_FP_MALFORMED     0xFFFFEBA5  bubbled verbatim from
+  //                                        tokenizer_tilde_classify's
+  //                                        TOK_ERR_FINGERPRINT_MALFORMED
+  //                                        return (rebadged with the
+  //                                        argv-construction band so
+  //                                        the caller decodes it here)
+  // ==========================================================================
+  pub let AC_OK                  : u64 = 0
+  pub let AC_ERR_BAD_ARGS        : u64 = 0xFFFFEBA0
+  pub let AC_ERR_POOL_OVERFLOW   : u64 = 0xFFFFEBA1
+  pub let AC_ERR_ARGC_OVERFLOW   : u64 = 0xFFFFEBA2
+  pub let AC_ERR_HOME_MISSING    : u64 = 0xFFFFEBA3
+  pub let AC_ERR_ALIAS_UNRESOLVED : u64 = 0xFFFFEBA4
+  pub let AC_ERR_FP_MALFORMED    : u64 = 0xFFFFEBA5
+
+  // "/home/" prefix used by the FINGERPRINT expansion path. Stored as
+  // a NUL-terminated [u8; 7] rodata slot per the paideia-as fingerprint-
+  // string rule (N == strlen + 1); the NUL byte is a tag-size sentinel
+  // and is NOT written to the pool -- the runtime copy uses length 6
+  // (AC_HOME_PREFIX_LEN) verbatim.
+  pub let ac_home_prefix       : [u8; 7] = "/home/\0"
+  pub let AC_HOME_PREFIX_LEN   : u64 = 6
+
+  // ==========================================================================
   // Builtin name literals.
   //
   // Each is a NUL-terminated .rodata byte string; N in `[u8; N]` MUST
@@ -360,6 +415,423 @@ module Dispatch = structure {
         pop r14;
         pop r13;
         pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // _ac_copy_bytes(src, dst, len) -> ()
+  //
+  // Internal helper for dispatch_argv_construct's kind-specific pool
+  // writes. Byte-at-a-time forward copy of `len` bytes from `src` to
+  // `dst`; both pointers are consumed as inputs (not advanced for the
+  // caller). Neither source nor destination is checked for overlap;
+  // the caller (dispatch_argv_construct) guarantees the pool cursor
+  // moves strictly forward and never re-enters a written region.
+  //
+  // Signature:
+  //   fn (src: u64, dst: u64, len: u64) -> ()
+  //   rdi = src, rsi = dst, rdx = len
+  //
+  // Leaf function; no push/pop / no sub rsp. Alignment: entry rsp %
+  // 16 == 8 as caller passed; ret restores rsp % 16 == 0 for the
+  // caller (matching every SysV ret site). All byte moves use the
+  // #1248 pattern (xor rax, rax; mov_b rax, [ptr]) on the read side
+  // and `mov_b [dst], rax` on the write side. No 2-op imul, no test
+  // mnemonic, no imm > 0x7FFFFFFF; r11 (paideia-as reserved) unused.
+  // Labels prefixed acb_.
+  // ==========================================================================
+  pub let _ac_copy_bytes : (u64, u64, u64) -> () !{mem} @{} =
+    fn (src: u64) (dst: u64) (len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (paideia-os/shell#41): byte-at-a-time forward memcpy helper for dispatch_argv_construct's expansion pool writes. rdi=src, rsi=dst, rdx=len. Leaf; no push/pop; byte loads use xor rax, rax; mov_b rax, [ptr] per #1248, byte stores use mov_b [dst], rax. Caller (dispatch_argv_construct) guarantees dst > (all prior src) so overlap is impossible. Trivial linear body; the alternative was to inline five ~10-line copy loops in dispatch_argv_construct's kind blocks, which loses the single-audit-site invariant this helper provides. Labels prefixed acb_.",
+      block: {
+        cmp rdx, 0;
+        je acb_done;
+      acb_loop:
+        xor rax, rax;
+        mov_b rax, [rdi];
+        mov_b [rsi], rax;
+        add rdi, 1;
+        add rsi, 1;
+        sub rdx, 1;
+        cmp rdx, 0;
+        jne acb_loop;
+      acb_done:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // dispatch_argv_construct(desc_ptr) -> u64
+  //
+  // R106.SHELL-002 (paideia-os/shell#41). Takes the tokenizer's raw
+  // (offset, length) records over a source line, applies novel-tilde
+  // classification + expansion (with $HOME from envp and the
+  // KIND_USER_ALIAS stub for R106), and emits a NUL-separated argv
+  // pool + per-argv offset table for consumption by dispatch_line.
+  //
+  // Signature:
+  //   fn (desc_ptr: u64) -> u64
+  //   rdi = desc_ptr (VA of the ArgvConstructDesc struct)
+  //   rax = AC_OK (0) on success; AC_ERR_* sentinel on any failure
+  //
+  // Descriptor layout (13 u64 = 104 bytes; caller-allocated,
+  // typically on .bss @align(8) or on the caller's stack):
+  //
+  //   +  0  tok_ptr        input: array of 16-byte (offset, length)
+  //                        records (Tokenizer output shape)
+  //   +  8  tok_count      input: number of token records
+  //   + 16  src_ptr        input: base VA the token offsets are
+  //                        relative to (typically the original line
+  //                        buffer)
+  //   + 24  src_len        input: bytes in source line (bounds sanity;
+  //                        not enforced per byte -- the tokenizer's
+  //                        length field is authoritative)
+  //   + 32  pool_out_ptr   output: byte pool for expanded argv strings
+  //   + 40  pool_cap       output cap: pool_out_ptr[0..pool_cap)
+  //   + 48  off_out_ptr    output: qword array holding per-argv start
+  //                        offset into pool_out (argv[i] byte VA =
+  //                        pool_out_ptr + off_out_ptr[i])
+  //   + 56  off_cap        output cap: max argv[] slots
+  //   + 64  home_ptr       input: $HOME string from envp
+  //   + 72  home_len       input: bytes in $HOME (no NUL)
+  //   + 80  alias_cap      input: KIND_USER_ALIAS handle (0 = stub /
+  //                        no cap available -- every alias hits
+  //                        AC_ERR_ALIAS_UNRESOLVED at R106; R108.M4
+  //                        flips the backend and this field becomes
+  //                        load-bearing)
+  //   + 88  pool_used_out  output: bytes written to pool_out on success
+  //   + 96  argc_out       output: argv count written on success
+  //
+  // Expansion rules (see Tokenizer::tokenizer_tilde_classify header
+  // for the classification decision matrix; this function performs
+  // the byte-write half):
+  //
+  //   NONE          copy tok_bytes[0..tok_length] + NUL
+  //   HOME          copy home_ptr[0..home_len] + tok_bytes[1..len] + NUL
+  //                 (empty home_len -> AC_ERR_HOME_MISSING)
+  //   FINGERPRINT   copy "/home/" (6 bytes) + tok_bytes[1..len] + NUL
+  //                 (the segment is bytes[1..1+64] plus tail bytes
+  //                 [1+64..len]; concatenated in the source they are
+  //                 exactly tok_bytes[1..len], so a single _ac_copy_
+  //                 bytes suffices for the fingerprint + tail)
+  //   ALIAS         -> AC_ERR_ALIAS_UNRESOLVED (R106 stub; every
+  //                 symbolic name currently unresolved)
+  //   MALFORMED     -> AC_ERR_FP_MALFORMED
+  //
+  // Register plan (non-leaf; nested `call tokenizer_tilde_classify`
+  // and `call _ac_copy_bytes`):
+  //   rbx = i (loop index, callee-save)
+  //   rbp = argc accumulator (callee-save)
+  //   r12 = pool_used accumulator (callee-save)
+  //   r13 = desc_ptr (callee-save; read repeatedly for struct fields)
+  //   r14 = current tok_length (callee-save; survives classify call)
+  //   r15 = current tok_bytes ptr = src_ptr + tok_offset (callee-save)
+  //
+  // 6 callee-save pushes = 48 bytes; 48 mod 16 == 0, so after the
+  // pushes alone rsp % 16 stays at 8 (entry alignment unchanged). We
+  // need one `sub rsp, 8` on top of the 6 pushes to reach rsp % 16 ==
+  // 0 for the nested SysV calls -- matched `add rsp, 8` at the shared
+  // epilogue before the pop sequence. Total prologue: 56 bytes. Scratch:
+  // rax, rcx, rdx, rdi, rsi, r8, r9, r10 (all caller-save; per SysV,
+  // none are preserved across the classify / copy calls -- we reload
+  // from r13/r14/r15 as needed).
+  //
+  // Encoder pitfalls avoided: (a) no `test`; every zero-check is `cmp
+  // reg, 0`; (b) every cmp reg, imm uses imm <= 0x7F (largest is
+  // AC_HOME_PREFIX_LEN=6 and tok record size=16); (c) tok record byte
+  // offset i*16 via `shl r10, 4` (power-of-two; no imul); (d) argv
+  // offset i*8 via `shl r10, 3` (same); (e) byte loads use xor rax,
+  // rax; mov_b rax, [ptr] per #1248; (f) r11 (paideia-as reserved
+  // scratch) used only as short-lived .rodata LEA in the FINGERPRINT
+  // path and not held across any call; (g) large-immediate compares
+  // against TILDE_KIND_* and AC_ERR_* sentinels: TILDE_KIND_* fit
+  // imm32 (0..3), TOK_ERR_FINGERPRINT_MALFORMED (0xFFFFEB06) staged
+  // via `mov r10, imm64; cmp rax, r10`; (h) labels prefixed acx_.
+  // ==========================================================================
+  pub let dispatch_argv_construct : (u64) -> u64 !{mem} @{} =
+    fn (desc_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (paideia-os/shell#41): argv construction from tokenizer records with novel-tilde expansion. Walks tok_count records at desc.tok_ptr; for each, calls tokenizer_tilde_classify(tok_bytes, tok_length) and emits a NUL-terminated expanded string into desc.pool_out per the classification: NONE = verbatim, HOME = $HOME + tail, FINGERPRINT = /home/ + <64-hex>+tail, ALIAS = AC_ERR_ALIAS_UNRESOLVED (R106 stub; R108.M4 flips the kernel backend without changing this code), MALFORMED bubbled as AC_ERR_FP_MALFORMED. Per-argv start offset into pool_out written to desc.off_out. Bounds gates: argc >= off_cap -> AC_ERR_ARGC_OVERFLOW; pool_used + needed > pool_cap -> AC_ERR_POOL_OVERFLOW; HOME with home_len=0 -> AC_ERR_HOME_MISSING (deliberate refusal to silently expand '~' to literal on envp gap, per design/user/content-addressed-identity.md §4 'hard errors not silent literals'). On success, desc.pool_used_out and desc.argc_out are populated and rax = 0. On any failure, rax = AC_ERR_* and the descriptor's out-fields are left in whatever partial state the loop reached (caller must not consume). Non-leaf: nested `call tokenizer_tilde_classify` (leaf; preserves r12-r15/rbx/rbp/r11) and `call _ac_copy_bytes` (leaf; same). 6 callee-save pushes (rbx=i, rbp=argc, r12=pool_used, r13=desc_ptr, r14=tok_length, r15=tok_bytes) = 48 bytes prologue; entry rsp%16==8, after 6 pushes rsp%16==0, no local scratch. tok record byte offset via shl r10, 4 (power-of-two, no imul); off_out slot offset via shl r10, 3 (same). TOK_ERR_FINGERPRINT_MALFORMED compare stages via mov r10, imm64; cmp rax, r10 (large-imm). Labels prefixed acx_.",
+      block: {
+        push rbx;
+        push rbp;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;                              // rsp%16 alignment for nested calls
+
+        // Argument sanity: desc_ptr NULL -> BAD_ARGS.
+        cmp rdi, 0;
+        je acx_bad_args;
+
+        mov r13, rdi;                            // r13 = desc_ptr
+
+        // Init accumulators.
+        xor rbx, rbx;                            // i = 0
+        xor rbp, rbp;                            // argc = 0
+        xor r12, r12;                            // pool_used = 0
+
+      acx_loop:
+        // Load tok_count (desc + 8).
+        mov rax, [r13 + 8];
+        cmp rbx, rax;
+        jae acx_finish;
+
+        // argc bound gate.
+        mov rax, [r13 + 56];                     // off_cap
+        cmp rbp, rax;
+        jae acx_argc_overflow;
+
+        // Compute per-record byte offset: r10 = i * 16 (shl 4).
+        mov r10, rbx;
+        shl r10, 4;
+
+        // Load token record.
+        mov rax, [r13 + 0];                      // tok_ptr
+        add rax, r10;                            // -> record base
+        mov rcx, [rax + 0];                      // offset in source
+        mov r14, [rax + 8];                      // r14 = tok_length
+
+        // r15 = tok_bytes = src_ptr + offset.
+        mov r15, [r13 + 16];                     // src_ptr
+        add r15, rcx;
+
+        // Record per-argv pool start offset: off_out[argc] = pool_used.
+        // Slot byte offset = argc * 8 via shl r10, 3.
+        mov r10, rbp;
+        shl r10, 3;
+        mov rax, [r13 + 48];                     // off_out_ptr
+        add rax, r10;
+        mov [rax], r12;                          // store pool_used
+
+        // Classify: rdi = tok_bytes, rsi = tok_length.
+        mov rdi, r15;
+        mov rsi, r14;
+        call tokenizer_tilde_classify;
+        // rax = TILDE_KIND_* or 0xFFFFEB06.
+
+        // Dispatch on kind. TILDE_KIND_NONE = 0.
+        cmp rax, 0;
+        je acx_kind_none;
+        cmp rax, 1;
+        je acx_kind_home;
+        cmp rax, 2;
+        je acx_kind_fp;
+        cmp rax, 3;
+        je acx_kind_alias;
+
+        // Not a valid kind: must be TOK_ERR_FINGERPRINT_MALFORMED.
+        mov r10, 0xFFFFEB06;
+        cmp rax, r10;
+        je acx_fp_malformed;
+
+        // Any other rax from classify is unexpected -- treat as BAD_ARGS.
+        jmp acx_bad_args;
+
+        // ------------------------------------------------------------
+        // NONE: copy tok_bytes[0..tok_length] + NUL to pool.
+        // needed = tok_length + 1.
+        // ------------------------------------------------------------
+      acx_kind_none:
+        mov rax, r14;
+        add rax, 1;                              // needed
+        // Bound check: pool_used + needed <= pool_cap.
+        mov rcx, [r13 + 40];                     // pool_cap
+        mov rdx, r12;
+        add rdx, rax;
+        cmp rdx, rcx;
+        ja acx_pool_overflow;
+
+        // Copy tok_length bytes.
+        mov rdi, r15;                            // src = tok_bytes
+        mov rsi, [r13 + 32];                     // pool_out_ptr
+        add rsi, r12;                            // dst = pool + pool_used
+        mov rdx, r14;                            // len = tok_length
+        call _ac_copy_bytes;
+
+        // Append NUL at pool + pool_used + tok_length.
+        mov rax, [r13 + 32];
+        add rax, r12;
+        add rax, r14;
+        xor rcx, rcx;
+        mov_b [rax], rcx;
+
+        // pool_used += tok_length + 1.
+        add r12, r14;
+        add r12, 1;
+        jmp acx_next;
+
+        // ------------------------------------------------------------
+        // HOME: home_ptr + tok_bytes[1..len] + NUL.
+        // needed = home_len + (tok_length - 1) + 1 = home_len + tok_length.
+        // home_len == 0 -> AC_ERR_HOME_MISSING.
+        // ------------------------------------------------------------
+      acx_kind_home:
+        mov rcx, [r13 + 72];                     // home_len
+        cmp rcx, 0;
+        je acx_home_missing;
+
+        mov rax, rcx;                            // needed = home_len
+        add rax, r14;                            //        + tok_length
+        // ( tok_length is >= 1 because leading '~' matched; the '-1'
+        //   for stripping '~' and '+1' for NUL cancel exactly. )
+
+        mov rcx, [r13 + 40];                     // pool_cap
+        mov rdx, r12;
+        add rdx, rax;
+        cmp rdx, rcx;
+        ja acx_pool_overflow;
+
+        // Copy home_ptr[0..home_len] into pool + pool_used.
+        mov rdi, [r13 + 64];                     // home_ptr
+        mov rsi, [r13 + 32];                     // pool_out_ptr
+        add rsi, r12;
+        mov rdx, [r13 + 72];                     // home_len
+        call _ac_copy_bytes;
+
+        // Advance pool cursor by home_len (bookkeeping in a scratch --
+        // r12 still holds pre-copy pool_used and we need it below).
+        mov rcx, [r13 + 72];                     // home_len (re-read)
+        mov r8, r12;
+        add r8, rcx;                             // r8 = new cursor after home
+
+        // Copy tok_bytes[1..tok_length] (tail after '~') into pool + r8.
+        // Length of tail = tok_length - 1.
+        mov rdx, r14;
+        sub rdx, 1;                              // tail_len
+        cmp rdx, 0;
+        je acx_home_nul;
+
+        mov rdi, r15;
+        add rdi, 1;                              // src = tok_bytes + 1
+        mov rsi, [r13 + 32];
+        add rsi, r8;                             // dst = pool + r8
+        call _ac_copy_bytes;
+
+      acx_home_nul:
+        // NUL byte at pool + r8 + (tok_length - 1).
+        mov rax, [r13 + 32];
+        add rax, r8;
+        mov rcx, r14;
+        sub rcx, 1;
+        add rax, rcx;
+        xor rcx, rcx;
+        mov_b [rax], rcx;
+
+        // pool_used += home_len + tok_length (already computed rax
+        // above -- but rax has been reused; recompute for clarity).
+        mov rcx, [r13 + 72];
+        add r12, rcx;                            // += home_len
+        add r12, r14;                            // += tok_length (covers tail+NUL)
+        // note: home_len + tok_length == home_len + (tok_length-1) + 1
+        //       = home_bytes + tail_bytes + NUL byte -- exactly needed.
+        jmp acx_next;
+
+        // ------------------------------------------------------------
+        // FINGERPRINT: "/home/" (6 bytes) + tok_bytes[1..len] + NUL.
+        // needed = 6 + (tok_length - 1) + 1 = tok_length + 6.
+        // ------------------------------------------------------------
+      acx_kind_fp:
+        mov rax, r14;
+        add rax, 6;                              // needed
+
+        mov rcx, [r13 + 40];                     // pool_cap
+        mov rdx, r12;
+        add rdx, rax;
+        cmp rdx, rcx;
+        ja acx_pool_overflow;
+
+        // Copy "/home/" (6 bytes) into pool + pool_used.
+        lea rdi, [rip + ac_home_prefix];         // rodata prefix
+        mov rsi, [r13 + 32];
+        add rsi, r12;
+        mov rdx, 6;                              // AC_HOME_PREFIX_LEN
+        call _ac_copy_bytes;
+
+        // Advance to r8 = pool_used + 6.
+        mov r8, r12;
+        add r8, 6;
+
+        // Copy tok_bytes[1..tok_length] into pool + r8.
+        mov rdx, r14;
+        sub rdx, 1;
+        cmp rdx, 0;
+        je acx_fp_nul;
+
+        mov rdi, r15;
+        add rdi, 1;
+        mov rsi, [r13 + 32];
+        add rsi, r8;
+        call _ac_copy_bytes;
+
+      acx_fp_nul:
+        // NUL at pool + r8 + (tok_length - 1) = pool + pool_used + 6 + tok_length - 1.
+        mov rax, [r13 + 32];
+        add rax, r8;
+        mov rcx, r14;
+        sub rcx, 1;
+        add rax, rcx;
+        xor rcx, rcx;
+        mov_b [rax], rcx;
+
+        // pool_used += 6 + tok_length (= 6 + (tok_length-1) + 1).
+        add r12, 6;
+        add r12, r14;
+        jmp acx_next;
+
+        // ------------------------------------------------------------
+        // ALIAS: unconditional AC_ERR_ALIAS_UNRESOLVED at R106.
+        // ------------------------------------------------------------
+      acx_kind_alias:
+        mov rax, 0xFFFFEBA4;                     // AC_ERR_ALIAS_UNRESOLVED
+        jmp acx_epilogue;
+
+        // ------------------------------------------------------------
+        // MALFORMED: bubble as AC_ERR_FP_MALFORMED.
+        // ------------------------------------------------------------
+      acx_fp_malformed:
+        mov rax, 0xFFFFEBA5;                     // AC_ERR_FP_MALFORMED
+        jmp acx_epilogue;
+
+      acx_next:
+        add rbp, 1;                              // argc++
+        add rbx, 1;                              // i++
+        jmp acx_loop;
+
+      acx_finish:
+        // pool_used_out = r12; argc_out = rbp.
+        mov [r13 + 88], r12;
+        mov [r13 + 96], rbp;
+        xor rax, rax;                            // AC_OK
+        jmp acx_epilogue;
+
+      acx_bad_args:
+        mov rax, 0xFFFFEBA0;                     // AC_ERR_BAD_ARGS
+        jmp acx_epilogue;
+
+      acx_pool_overflow:
+        mov rax, 0xFFFFEBA1;                     // AC_ERR_POOL_OVERFLOW
+        jmp acx_epilogue;
+
+      acx_argc_overflow:
+        mov rax, 0xFFFFEBA2;                     // AC_ERR_ARGC_OVERFLOW
+        jmp acx_epilogue;
+
+      acx_home_missing:
+        mov rax, 0xFFFFEBA3;                     // AC_ERR_HOME_MISSING
+        jmp acx_epilogue;
+
+      acx_epilogue:
+        add rsp, 8;                              // undo alignment pad
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbp;
         pop rbx;
         ret
       }

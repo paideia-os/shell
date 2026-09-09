@@ -123,10 +123,59 @@ module Tokenizer = structure {
   // ==========================================================================
   // Return-code band 0xFFFFEB0x (R106 Tokenizer)
   // ==========================================================================
-  pub let TOK_ERR_BAD_ARGS           : u64 = 0xFFFFEB01
-  pub let TOK_ERR_UNTERMINATED_QUOTE : u64 = 0xFFFFEB02
-  pub let TOK_ERR_INVALID_ESCAPE     : u64 = 0xFFFFEB03
-  pub let TOK_ERR_OVERFLOW           : u64 = 0xFFFFEB04
+  pub let TOK_ERR_BAD_ARGS              : u64 = 0xFFFFEB01
+  pub let TOK_ERR_UNTERMINATED_QUOTE    : u64 = 0xFFFFEB02
+  pub let TOK_ERR_INVALID_ESCAPE        : u64 = 0xFFFFEB03
+  pub let TOK_ERR_OVERFLOW              : u64 = 0xFFFFEB04
+  // R106.SHELL-002 (paideia-os/shell#41): novel-tilde classifier extra
+  // sentinel. TOK_ERR_FINGERPRINT_MALFORMED signals a `~<all-hex>` tail
+  // whose length is not exactly 64 -- the caller (argv-construction
+  // layer at src/dispatch.pdx dispatch_argv_construct) refuses to
+  // expand and aborts argv construction so no exec happens on a
+  // malformed fingerprint reference.
+  pub let TOK_ERR_FINGERPRINT_MALFORMED : u64 = 0xFFFFEB06
+
+  // ==========================================================================
+  // Novel-tilde classification kinds (R106.SHELL-002, paideia-os/shell#41)
+  //
+  // Returned by tokenizer_tilde_classify(tok_ptr, tok_len). A token
+  // whose FIRST byte is not 0x7E ('~') has kind NONE (0) and the
+  // caller emits it verbatim into argv. A token whose first byte is
+  // '~' is classified by the byte-shape of the segment between '~' and
+  // the first '/' (or end-of-token):
+  //
+  //   HOME         segment length 0 (`~` alone or `~/...`)
+  //                => expansion = $HOME + tail-after-'~'
+  //   FINGERPRINT  segment is exactly 64 lowercase hex digits [0-9a-f]
+  //                => expansion = /home/<64-hex> + tail-after-fp
+  //   ALIAS        segment contains at least one non-hex byte (or is
+  //                lowercase hex of length in [1..63] or > 64 but not
+  //                all-hex -- see MALFORMED below for the all-hex case)
+  //                => expansion = KIND_USER_ALIAS.lookup(segment) ->
+  //                   /home/<fp> + tail. At R106 the alias-registry
+  //                   backend is a stub and every ALIAS classification
+  //                   collapses to AC_ERR_ALIAS_UNRESOLVED at the
+  //                   argv-construction layer; the tokenizer itself
+  //                   does not know about the cap handle.
+  //   MALFORMED    segment is all lowercase hex but length != 64
+  //                => TOK_ERR_FINGERPRINT_MALFORMED. Distinct from
+  //                   ALIAS so the operator diagnostic can tell "typo
+  //                   in a fingerprint" from "alias not in registry".
+  //
+  // Design spec: paideia-os design/user/content-addressed-identity.md
+  // §4 "Tokenizer novel-tilde (R106.M4 syntax; R108.M4 real alias
+  // resolution)" table + failure-mode enumeration. The tokenizer half
+  // of the M4 landing produces the CLASSIFICATION; the argv-construction
+  // half at src/dispatch.pdx dispatch_argv_construct produces the
+  // EXPANSION. The split keeps the tokenizer a pure byte-classifier
+  // with no envp / cap-handle knowledge, so the tokenizer stays
+  // testable against a caller-owned buffer (see tests/
+  // tokenizer_tilde.pdx band 0xFFFFEDCx).
+  // ==========================================================================
+  pub let TILDE_KIND_NONE        : u64 = 0
+  pub let TILDE_KIND_HOME        : u64 = 1
+  pub let TILDE_KIND_FINGERPRINT : u64 = 2
+  pub let TILDE_KIND_ALIAS       : u64 = 3
 
   // ==========================================================================
   // tokenize(line_ptr, line_len, tokens_out_ptr, tokens_out_cap) -> u64
@@ -370,6 +419,159 @@ module Tokenizer = structure {
         pop r12;
         pop rbp;
         pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tokenizer_tilde_classify(tok_ptr, tok_len) -> u64
+  //
+  // R106.SHELL-002 (paideia-os/shell#41). Classifies a token's leading-
+  // tilde shape without touching envp or the alias-registry cap. Pure
+  // byte-scanner: reads at most `tok_len` bytes at `tok_ptr` and
+  // returns one of TILDE_KIND_{NONE, HOME, FINGERPRINT, ALIAS} or
+  // TOK_ERR_FINGERPRINT_MALFORMED. See the classification-kinds block
+  // in the module header for the full decision matrix.
+  //
+  // Signature:
+  //   fn (tok_ptr: u64, tok_len: u64) -> u64
+  //   rdi = tok_ptr (VA of the token's first byte in the source line)
+  //   rsi = tok_len (byte count of the token span; may be 0)
+  //   rax = TILDE_KIND_* on classification, or 0xFFFFEB06 on malformed
+  //         fingerprint. NONE (0) covers both "empty token" and "first
+  //         byte is not 0x7E" -- either way the caller emits the token
+  //         verbatim (no tilde work).
+  //
+  // The segment length rule: after the leading '~' (byte 0), walk
+  // forward until the next 0x2F ('/') or end-of-token; the segment is
+  // the bytes strictly between '~' and that terminator. Only the
+  // segment participates in the hex-shape check; a trailing `/foo`
+  // does not affect classification (the caller concatenates it after
+  // expansion). This matches the design spec's `~alice/foo` example
+  // (identity.md §4) which resolves alice, then concatenates `/foo`.
+  //
+  // The all-hex check accepts lowercase [0-9a-f] only. Uppercase hex
+  // (`A..F`) counts as a non-hex byte and drives the ALIAS path (an
+  // alias literal is unlikely to be all-uppercase-hex either but the
+  // rule is deterministic and matches the fingerprint on-disk rendering
+  // -- fingerprints are lowercase per PdxFS convention at rendering-
+  // time). This mirrors the sanitization the KIND_USER_ALIAS registry's
+  // own alias-name regex enforces (§3 alias-shape rule).
+  //
+  // Register plan (leaf, no push/pop, no callee-save state -- pure
+  // byte-scanner, no nested calls):
+  //   r8  = tok_ptr parked from rdi so the walker regs can shadow rdi
+  //   r9  = tok_len parked from rsi
+  //   r10 = walker cursor
+  //   rcx = segment length accumulator
+  //   rax = byte load / return
+  //   rdi / rsi are reused as loop-remaining counters after parking
+  //
+  // Encoder pitfalls avoided: (a) no `test rN,rN` -- every zero-check
+  // uses `cmp reg, 0`; (b) every `cmp reg, imm` uses imm <= 0x7F (the
+  // largest is 64 for the fingerprint-length gate); (c) no 2-op `imul
+  // r, imm`; (d) byte loads follow xor rax, rax; mov_b rax, [ptr] per
+  // #1248; (e) r11 (paideia-as reserved scratch) untouched; (f) labels
+  // prefixed `ttc_` to avoid `loop`/`if`/`hex`/etc. reserved-name
+  // collisions.
+  //
+  // Alignment: entry rsp % 16 == 8; no push/pop / no sub rsp / no
+  // nested call, so the ret site sees rsp % 16 == 8 as expected.
+  // ==========================================================================
+  pub let tokenizer_tilde_classify : (u64, u64) -> u64 !{mem} @{} =
+    fn (tok_ptr: u64) (tok_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (paideia-os/shell#41): novel-tilde classifier. Reads the token byte span [tok_ptr .. tok_ptr+tok_len) and returns one of TILDE_KIND_NONE (0; empty or first byte != 0x7E), TILDE_KIND_HOME (1; '~' or '~/...'), TILDE_KIND_FINGERPRINT (2; '~<64 lowercase hex chars>' with optional /tail), TILDE_KIND_ALIAS (3; '~<segment>' where segment contains at least one non-hex byte), or TOK_ERR_FINGERPRINT_MALFORMED (0xFFFFEB06; '~<segment>' where segment is all lowercase hex but length != 64). Pure byte-classifier: no envp lookup, no cap invoke, no source-buffer mutation. Segment is bounded by the next 0x2F ('/') or end-of-token; a trailing /path affects the expansion (done by the argv-construction layer at src/dispatch.pdx dispatch_argv_construct) but not this classification. Lowercase-hex only per PdxFS rendering convention (uppercase hex drives the ALIAS path). Leaf function; no push/pop / no callee-save state / no nested call. r8/r9 park rdi/rsi so the walker registers r10/rcx do not shadow the original args (needed for the second-pass hex scan after the first-pass segment-length compute). Encoder conformance: no `test rN,rN` (every zero-check uses `cmp reg, 0`); every cmp reg, imm uses imm <= 0x7F (largest is 64 for the fingerprint-length gate); no 2-op `imul r, imm`; byte loads use `xor rax, rax; mov_b rax, [ptr]` per #1248; r11 (paideia-as reserved scratch) untouched. Labels prefixed ttc_.",
+      block: {
+        // Park args in r8/r9 so the walker registers can reuse rdi/rsi.
+        mov r8, rdi;                             // r8 = tok_ptr
+        mov r9, rsi;                             // r9 = tok_len
+
+        // Empty token -> NONE.
+        cmp r9, 0;
+        je ttc_none;
+
+        // First byte != '~' (0x7E) -> NONE.
+        xor rax, rax;
+        mov_b rax, [r8];
+        cmp rax, 0x7E;
+        jne ttc_none;
+
+        // First-pass walk: measure segment length between '~' and the
+        // next '/' (or end-of-token). Segment does NOT include '~'.
+        //
+        //   r10 = walker starting at tok_ptr + 1
+        //   rcx = segment length accumulator (0-based)
+        //   rdi = remaining bytes after '~' (initial = tok_len - 1)
+        mov r10, r8;
+        add r10, 1;
+        xor rcx, rcx;
+        mov rdi, r9;
+        sub rdi, 1;
+
+      ttc_seg_scan:
+        cmp rcx, rdi;
+        jae ttc_seg_done;
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0x2F;                           // '/' closes the segment
+        je ttc_seg_done;
+        add rcx, 1;
+        add r10, 1;
+        jmp ttc_seg_scan;
+
+      ttc_seg_done:
+        // rcx = segment length. If 0 -> HOME (bare '~' or '~/...').
+        cmp rcx, 0;
+        je ttc_home;
+
+        // Second-pass walk: check every byte in [tok_ptr+1 .. +1+rcx)
+        // is lowercase hex [0-9a-f]. Reset walker; use rsi as the
+        // remaining-bytes counter (freed since original tok_len parked
+        // in r9).
+        mov r10, r8;
+        add r10, 1;
+        mov rsi, rcx;
+
+      ttc_hex_scan:
+        cmp rsi, 0;
+        je ttc_hex_done;
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0x30;                           // '0'
+        jb ttc_alias;
+        cmp rax, 0x39;                           // '9'
+        jbe ttc_hex_step;
+        cmp rax, 0x61;                           // 'a'
+        jb ttc_alias;
+        cmp rax, 0x66;                           // 'f'
+        ja ttc_alias;
+      ttc_hex_step:
+        add r10, 1;
+        sub rsi, 1;
+        jmp ttc_hex_scan;
+
+      ttc_hex_done:
+        // All segment bytes are hex; length must be exactly 64.
+        cmp rcx, 64;
+        je ttc_fingerprint;
+        mov rax, 0xFFFFEB06;                     // TOK_ERR_FINGERPRINT_MALFORMED
+        ret;
+
+      ttc_alias:
+        mov rax, 3;                              // TILDE_KIND_ALIAS
+        ret;
+
+      ttc_none:
+        xor rax, rax;                            // TILDE_KIND_NONE (0)
+        ret;
+
+      ttc_home:
+        mov rax, 1;                              // TILDE_KIND_HOME
+        ret;
+
+      ttc_fingerprint:
+        mov rax, 2;                              // TILDE_KIND_FINGERPRINT
         ret
       }
     }

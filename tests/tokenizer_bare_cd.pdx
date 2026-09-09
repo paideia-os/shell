@@ -1,0 +1,253 @@
+// tests/tokenizer_bare_cd.pdx -- R106.SHELL-002 (paideia-os/shell#41)
+//
+// TestTokenizerBareCd module: bare-`cd` ambiguous-target invariant.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Verifies the load-bearing end-to-end shape the acceptance criterion
+// names: a user typing bare `cd` (no path argument) MUST reach the
+// bi_cd handler and MUST receive BI_ERR_CD_NO_ARG (0xFFFFECE1) as the
+// ambiguous-target error. No POSIX-style silent chdir-to-$HOME
+// fallback. Two golden invariants:
+//
+//   Case 1 (tbc_tokenize): Tokenizer::tokenize("cd", 2) returns 1
+//     token record at (offset=0, length=2). Confirms the two-byte
+//     word is emitted intact by the R106.M1 tokenizer's whitespace-
+//     separated walker (single-word bare-`cd` case).
+//
+//   Case 2 (tbc_dispatch): Builtins::bi_cd(&"cd\0", 1) returns
+//     BI_ERR_CD_NO_ARG (0xFFFFECE1). Confirms the handler's argc<2
+//     gate at bi_cd_no_arg is reached without falling through to
+//     sys_chdir. The argv buffer here has a single "cd\0" entry
+//     (argc=1) matching the shape dispatch_line would build from
+//     Tokenizer's output after argv-construction stripping.
+//
+// The novel-tilde expansion path is orthogonal: bare `cd` and bare
+// `cd ~` are DIFFERENT commands -- `cd` alone is the ambiguous-target
+// error tested here; `cd ~` (with tilde) is a valid command that
+// argv-construct expands to `cd /home/<fp>` and then bi_cd chdirs to
+// $HOME. The bare-`cd` case exists to prove that omitting the target
+// entirely does not silently pick $HOME (design/user/content-
+// addressed-identity.md §4 rationale: "bare cd in POSIX is a
+// footgun -- PaideiaOS's shell will not carry that").
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFEDDx (TestTokenizerBareCd)
+// =============================================================================
+//
+//   0            TBC_PASS
+//   0xFFFFEDD0   TBC_FAIL_TOKENIZE       tokenize("cd") count or record wrong
+//   0xFFFFEDD1   TBC_FAIL_DISPATCH       bi_cd(argc=1) return != BI_ERR_CD_NO_ARG
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module basename PascalCase (`TestTokenizerBareCd`).
+//   - Every zero-check via `cmp reg, 0`; no `test` mnemonic.
+//   - Large-imm 0xFFFFECE1 (BI_ERR_CD_NO_ARG) compares via `mov r10, imm64`.
+//   - r11 (paideia-as reserved) untouched; .bss LEA via r10.
+//   - Labels prefixed `tbc_`.
+
+module TokenizerBareCd = structure {
+
+  pub let TBC_PASS         : u64 = 0
+  pub let TBC_FAIL_TOKENIZE : u64 = 0xFFFFEDD0
+  pub let TBC_FAIL_DISPATCH : u64 = 0xFFFFEDD1
+
+  // Input buffer for the tokenize case: "cd" (2 bytes).
+  pub let mut _tbc_in_cd     : [u8; 8]  = uninit @align(8)
+
+  // Argv buffer for the dispatch case: "cd\0" (3 bytes). Extra
+  // padding is a safety margin for any downstream walker.
+  pub let mut _tbc_argv_cd   : [u8; 8]  = uninit @align(8)
+
+  // Output token buffer for the tokenize case (16 records).
+  pub let mut _tbc_tokens_out : [u64; 32] = uninit @align(16)
+
+  // ==========================================================================
+  // tbc_reset() -> ()
+  //
+  // Zero every fixture then populate the two input buffers with the
+  // bare-`cd` byte sequence.
+  // ==========================================================================
+  pub let tbc_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) reset: zero the tokenize-input, dispatch-argv, and tokens-out buffers, then populate the two input buffers with 'cd' bytes (input: 'c','d' at 0..1; argv: 'c','d',0x00 at 0..2). Leaf; no push/pop parity concern. r10 = .bss LEA scratch. Labels prefixed tbc_rs_.",
+      block: {
+        xor rax, rax;
+
+        lea r10, [rip + _tbc_in_cd];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _tbc_argv_cd];
+        mov [r10 + 0], rax;
+
+        lea r10, [rip + _tbc_tokens_out];
+        mov [r10 +   0], rax;
+        mov [r10 +   8], rax;
+        mov [r10 +  16], rax;
+        mov [r10 +  24], rax;
+        mov [r10 +  32], rax;
+        mov [r10 +  40], rax;
+        mov [r10 +  48], rax;
+        mov [r10 +  56], rax;
+        mov [r10 +  64], rax;
+        mov [r10 +  72], rax;
+        mov [r10 +  80], rax;
+        mov [r10 +  88], rax;
+        mov [r10 +  96], rax;
+        mov [r10 + 104], rax;
+        mov [r10 + 112], rax;
+        mov [r10 + 120], rax;
+        mov [r10 + 128], rax;
+        mov [r10 + 136], rax;
+        mov [r10 + 144], rax;
+        mov [r10 + 152], rax;
+        mov [r10 + 160], rax;
+        mov [r10 + 168], rax;
+        mov [r10 + 176], rax;
+        mov [r10 + 184], rax;
+        mov [r10 + 192], rax;
+        mov [r10 + 200], rax;
+        mov [r10 + 208], rax;
+        mov [r10 + 216], rax;
+        mov [r10 + 224], rax;
+        mov [r10 + 232], rax;
+        mov [r10 + 240], rax;
+        mov [r10 + 248], rax;
+
+        // _tbc_in_cd = "cd".
+        lea r10, [rip + _tbc_in_cd];
+        mov rax, 0x63; mov_b [r10 + 0], rax;     // 'c'
+        mov rax, 0x64; mov_b [r10 + 1], rax;     // 'd'
+
+        // _tbc_argv_cd = "cd\0".
+        lea r10, [rip + _tbc_argv_cd];
+        mov rax, 0x63; mov_b [r10 + 0], rax;     // 'c'
+        mov rax, 0x64; mov_b [r10 + 1], rax;     // 'd'
+        xor rax, rax;  mov_b [r10 + 2], rax;     // NUL
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbc_case_tokenize() -> u64
+  //
+  // Tokenize("cd", 2) -> 1 token at (offset=0, length=2).
+  // Prologue: push r12 + sub rsp,8 = 16 bytes; entry rsp%16==8,
+  // after prologue rsp%16==0 for the nested tokenize call.
+  // ==========================================================================
+  pub let tbc_case_tokenize : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) tokenize half: assert Tokenizer::tokenize on 'cd' (2 bytes) returns count=1 with the single record at (offset=0, length=2). Exercises the M1 tokenizer's non-whitespace first-byte + end-of-input word closure without any quoting/escape branch. Prologue `push rbx; push r12; sub rsp, 8` = 24 bytes for rsp%16==0 at the nested tokenize call; r12 holds the tokens_out base for the per-record asserts, rbx pushed as alignment dummy. Fingerprint 0xFFFFEDD0 on any assert mismatch. Labels prefixed tbc_tk_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbc_reset;
+
+        lea rdi, [rip + _tbc_in_cd];
+        mov rsi, 2;
+        lea rdx, [rip + _tbc_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 1;
+        jne tbc_tk_fail;
+
+        lea r12, [rip + _tbc_tokens_out];
+        mov rax, [r12 + 0];                      // offset
+        cmp rax, 0;
+        jne tbc_tk_fail;
+        mov rax, [r12 + 8];                      // length
+        cmp rax, 2;
+        jne tbc_tk_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbc_tk_fail:
+        mov rax, 0xFFFFEDD0;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbc_case_dispatch() -> u64
+  //
+  // Builtins::bi_cd(&"cd\0", 1) -> BI_ERR_CD_NO_ARG (0xFFFFECE1).
+  // The handler's argc<2 gate at bi_cd_no_arg fires before sys_chdir
+  // is invoked, so this test does NOT execute a real syscall -- pure
+  // encoder-half assertion.
+  // ==========================================================================
+  pub let tbc_case_dispatch : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "R106.SHELL-002 (#41) dispatch half: bi_cd with argc=1 hits the bi_cd_no_arg branch BEFORE reaching sys_chdir. Return code MUST equal 0xFFFFECE1 (BI_ERR_CD_NO_ARG) per Builtins module contract; any other value -- 0 (OK), 0xFFFFECE2 (CD_FAIL), or a fresh sentinel -- indicates a regression that would let bare `cd` silently chdir somewhere (design gap the acceptance criterion locks down). Effect/cap set {mem, sysreg} @{fs} propagates from bi_cd's own annotation (unreachable in this test because argc=1 short-circuits, but the type signature must match). Prologue `sub rsp, 8` alone; large-imm compare via `mov r10, imm64; cmp rax, r10`. Labels prefixed tbc_dp_.",
+      block: {
+        sub rsp, 8;
+
+        call tbc_reset;
+
+        lea rdi, [rip + _tbc_argv_cd];
+        mov rsi, 1;                              // argc=1 (no path)
+        call bi_cd;
+
+        mov r10, 0xFFFFECE1;                     // BI_ERR_CD_NO_ARG
+        cmp rax, r10;
+        jne tbc_dp_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tbc_dp_fail:
+        mov rax, 0xFFFFEDD1;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tbc_run_all() -> u64
+  //
+  // Umbrella: run both cases in order.
+  // ==========================================================================
+  pub let tbc_run_all : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "R106.SHELL-002 (#41) umbrella for the bare-`cd` invariant. Runs tokenize-half then dispatch-half; propagates first non-zero verdict. Effect/cap set union: {mem, sysreg} @{fs} lifted from tbc_case_dispatch (the widest of the two cases). Prologue `sub rsp, 8`. Labels prefixed tbc_ra_.",
+      block: {
+        sub rsp, 8;
+
+        call tbc_case_tokenize;
+        cmp rax, 0;
+        jne tbc_ra_out;
+
+        call tbc_case_dispatch;
+        cmp rax, 0;
+        jne tbc_ra_out;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tbc_ra_out:
+        add rsp, 8;
+        ret
+      }
+    }
+}

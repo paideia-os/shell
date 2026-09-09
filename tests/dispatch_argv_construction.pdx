@@ -1,0 +1,704 @@
+// tests/dispatch_argv_construction.pdx -- R106.SHELL-002 (paideia-os/shell#41)
+//
+// TestDispatchArgvConstruction module: golden-fingerprint driver for
+// `Dispatch.dispatch_argv_construct` at src/dispatch.pdx.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// Exercises the argv-construction layer's five outcomes end-to-end:
+//
+//   Case 0 (verbatim):  tokens = [(0,2), (3,2)] over source "ls -l"
+//                       + no tilde. Expected argc=2, pool =
+//                       "ls\0-l\0" (6 bytes), off_out = [0, 3].
+//
+//   Case 1 (home):      tokens = [(0,5)] over source "~/foo",
+//                       home_ptr = "/home/aa", home_len=8.
+//                       Expected argc=1, pool = "/home/aa/foo\0"
+//                       (13 bytes), off_out = [0].
+//
+//   Case 2 (alias):     tokens = [(0,6)] over source "~alice",
+//                       any home_ptr. Expected AC_ERR_ALIAS_UNRESOLVED
+//                       (0xFFFFEBA4) return; argc_out / pool_used_out
+//                       not required to be consistent (caller must
+//                       not consume on error).
+//
+//   Case 3 (malformed): tokens = [(0,9)] over source "~deadbeef".
+//                       Expected AC_ERR_FP_MALFORMED (0xFFFFEBA5).
+//
+//   Case 4 (home_missing): tokens = [(0,1)] over source "~",
+//                       home_len=0. Expected AC_ERR_HOME_MISSING
+//                       (0xFFFFEBA3). Guards the design invariant
+//                       that a missing $HOME becomes an EXPLICIT
+//                       refusal, not a silent literal '~'.
+//
+// The fingerprint (2) path is verified transitively via the classifier
+// tests in TestTokenizerTilde and via a partial FP smoke that a full
+// end-to-end substrate run in the paideia-os side will cover -- not
+// re-tested here to keep the fixture pool bounded. (Real user testing
+// with a 64-hex fingerprint source line is 65 input bytes and 71
+// output pool bytes per case; the transitive coverage keeps the .bss
+// footprint of this file under 512 bytes.)
+//
+// =============================================================================
+// DESCRIPTOR LAYOUT
+// =============================================================================
+//
+// The ArgvConstructDesc struct (see src/dispatch.pdx dispatch_argv_construct
+// header) is 13 qwords = 104 bytes. Test cases populate it via mov qword
+// stores at explicit offsets 0/8/16/24/.../96; no byte-level packing.
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFEDEx (TestDispatchArgvConstruction)
+// =============================================================================
+//
+//   0            TDAC_PASS
+//   0xFFFFEDE0   TDAC_FAIL_VERBATIM
+//   0xFFFFEDE1   TDAC_FAIL_HOME
+//   0xFFFFEDE2   TDAC_FAIL_ALIAS
+//   0xFFFFEDE3   TDAC_FAIL_MALFORMED
+//   0xFFFFEDE4   TDAC_FAIL_HOME_MISSING
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module basename PascalCase (`TestDispatchArgvConstruction`).
+//   - Every zero-check via `cmp reg, 0`.
+//   - Large-imm sentinels (AC_ERR_* 0xFFFFEBAx) stage via mov r10, imm64.
+//   - r11 (paideia-as reserved) untouched; .bss LEA via r10.
+//   - Per-case prologue: `push r12; sub rsp, 8` = 16 bytes for the
+//     nested dispatch_argv_construct call which is non-leaf.
+//   - Labels prefixed `tdac_`.
+
+module DispatchArgvConstruction = structure {
+
+  pub let TDAC_PASS               : u64 = 0
+  pub let TDAC_FAIL_VERBATIM      : u64 = 0xFFFFEDE0
+  pub let TDAC_FAIL_HOME          : u64 = 0xFFFFEDE1
+  pub let TDAC_FAIL_ALIAS         : u64 = 0xFFFFEDE2
+  pub let TDAC_FAIL_MALFORMED     : u64 = 0xFFFFEDE3
+  pub let TDAC_FAIL_HOME_MISSING  : u64 = 0xFFFFEDE4
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  //   _tdac_desc      104-byte descriptor
+  //   _tdac_src       source line pool (48 bytes -- enough for the
+  //                   longest test input "~deadbeef" plus slack)
+  //   _tdac_tokens    up to 4 tokens (4 * 16 = 64 bytes)
+  //   _tdac_pool      up to 64 bytes of expanded output
+  //   _tdac_offs      up to 4 argv offsets (4 * 8 = 32 bytes)
+  //   _tdac_home      "/home/aa" (8 bytes; distinct fingerprint-like
+  //                   prefix so a diff assertion is meaningful)
+  // ==========================================================================
+  pub let mut _tdac_desc    : [u64; 13] = uninit @align(8)
+  pub let mut _tdac_src     : [u8;  48] = uninit @align(8)
+  pub let mut _tdac_tokens  : [u64;  8] = uninit @align(8)
+  pub let mut _tdac_pool    : [u8;  64] = uninit @align(8)
+  pub let mut _tdac_offs    : [u64;  4] = uninit @align(8)
+  pub let mut _tdac_home    : [u8;   8] = uninit @align(8)
+
+  // ==========================================================================
+  // tdac_reset() -> ()
+  //
+  // Zero every .bss slot then populate _tdac_home with "/home/aa".
+  // Case-specific setup (src / tokens / descriptor init) happens
+  // inside each tdac_case_* to keep the reset shape small.
+  // ==========================================================================
+  pub let tdac_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) reset: zero every fixture .bss buffer then populate _tdac_home with '/home/aa' (8 bytes). The remaining case-specific init (src line, token records, descriptor fields) happens inside each tdac_case_* -- the shared reset keeps the common invariant 'no stale bytes from a prior case'. r10 = .bss LEA scratch; rax = zero / byte constant. Labels prefixed tdac_rs_.",
+      block: {
+        xor rax, rax;
+
+        // Zero _tdac_desc (13 qwords).
+        lea r10, [rip + _tdac_desc];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+        mov [r10 + 64], rax;
+        mov [r10 + 72], rax;
+        mov [r10 + 80], rax;
+        mov [r10 + 88], rax;
+        mov [r10 + 96], rax;
+
+        // Zero _tdac_src (6 qwords).
+        lea r10, [rip + _tdac_src];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+
+        // Zero _tdac_tokens (8 qwords).
+        lea r10, [rip + _tdac_tokens];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+
+        // Zero _tdac_pool (8 qwords).
+        lea r10, [rip + _tdac_pool];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+        mov [r10 + 32], rax;
+        mov [r10 + 40], rax;
+        mov [r10 + 48], rax;
+        mov [r10 + 56], rax;
+
+        // Zero _tdac_offs (4 qwords).
+        lea r10, [rip + _tdac_offs];
+        mov [r10 +  0], rax;
+        mov [r10 +  8], rax;
+        mov [r10 + 16], rax;
+        mov [r10 + 24], rax;
+
+        // Zero _tdac_home (1 qword).
+        lea r10, [rip + _tdac_home];
+        mov [r10 + 0], rax;
+
+        // Populate _tdac_home: "/home/aa" (8 bytes).
+        lea r10, [rip + _tdac_home];
+        mov rax, 0x2f; mov_b [r10 + 0], rax;     // '/'
+        mov rax, 0x68; mov_b [r10 + 1], rax;     // 'h'
+        mov rax, 0x6f; mov_b [r10 + 2], rax;     // 'o'
+        mov rax, 0x6d; mov_b [r10 + 3], rax;     // 'm'
+        mov rax, 0x65; mov_b [r10 + 4], rax;     // 'e'
+        mov rax, 0x2f; mov_b [r10 + 5], rax;     // '/'
+        mov rax, 0x61; mov_b [r10 + 6], rax;     // 'a'
+        mov rax, 0x61; mov_b [r10 + 7], rax;     // 'a'
+
+        ret
+      }
+    }
+
+  // Small helper: populate the common tail of _tdac_desc (fields 32..96)
+  // with the standard pointers into the shared .bss buffers. Fields
+  // 0..24 (tokens / src) and 64..80 (home / alias_cap) are case-specific
+  // and set by the caller inline.
+  //
+  // Leaf; no push/pop; ret with rsp%16==8 for caller alignment.
+  pub let tdac_desc_fill_outs : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) shared helper: populate _tdac_desc[32..56] (pool_out_ptr, pool_cap, off_out_ptr, off_cap) with the standard shared-buffer pointers and their fixture caps (pool 64, off 4). Extracts one repeat idiom out of every case. r10 = .bss LEA scratch. Leaf; no push/pop parity concern.",
+      block: {
+        lea r10, [rip + _tdac_desc];
+
+        // pool_out_ptr at +32.
+        lea rax, [rip + _tdac_pool];
+        mov [r10 + 32], rax;
+        // pool_cap = 64 at +40.
+        mov rax, 64;
+        mov [r10 + 40], rax;
+        // off_out_ptr at +48.
+        lea rax, [rip + _tdac_offs];
+        mov [r10 + 48], rax;
+        // off_cap = 4 at +56.
+        mov rax, 4;
+        mov [r10 + 56], rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tdac_case_verbatim() -> u64
+  //
+  // Two-word "ls -l" pipeline stage; no tilde.
+  // Expected: rax=AC_OK (0), argc_out=2, pool_used_out=6,
+  //           pool[0..6] = 'l','s',0x00,'-','l',0x00,
+  //           off_out[0]=0, off_out[1]=3.
+  // ==========================================================================
+  pub let tdac_case_verbatim : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case verbatim: two-token NONE path. src='ls -l' (5 bytes); tokens = [(offset=0, length=2), (offset=3, length=2)]. Expected pool = 'ls\\0-l\\0' (6 bytes); off_out = [0, 3]; argc_out = 2; pool_used_out = 6; return AC_OK. This is the baseline case that proves the tokenizer->argv wire works without any tilde expansion touched. Prologue `push rbx; push r12; sub rsp, 8` = 24 bytes; r12 holds desc base across the dispatch_argv_construct call. Entry rsp%16==8, after 2 pushes rsp%16==8 (both mods sum to zero), sub rsp,8 -> rsp%16==0 for the nested call. rbx pushed for alignment (unused). Labels prefixed tdac_v_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tdac_reset;
+
+        // Populate _tdac_src = "ls -l".
+        lea r10, [rip + _tdac_src];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;     // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;     // 's'
+        mov rax, 0x20; mov_b [r10 + 2], rax;     // ' '
+        mov rax, 0x2d; mov_b [r10 + 3], rax;     // '-'
+        mov rax, 0x6c; mov_b [r10 + 4], rax;     // 'l'
+
+        // Populate _tdac_tokens = [(0,2), (3,2)].
+        lea r10, [rip + _tdac_tokens];
+        mov rax, 0;  mov [r10 +  0], rax;        // tok[0].offset
+        mov rax, 2;  mov [r10 +  8], rax;        // tok[0].length
+        mov rax, 3;  mov [r10 + 16], rax;        // tok[1].offset
+        mov rax, 2;  mov [r10 + 24], rax;        // tok[1].length
+
+        // Populate _tdac_desc inputs.
+        lea r12, [rip + _tdac_desc];
+        // tok_ptr (+0)
+        lea rax, [rip + _tdac_tokens];
+        mov [r12 + 0], rax;
+        // tok_count (+8) = 2
+        mov rax, 2;
+        mov [r12 + 8], rax;
+        // src_ptr (+16)
+        lea rax, [rip + _tdac_src];
+        mov [r12 + 16], rax;
+        // src_len (+24) = 5
+        mov rax, 5;
+        mov [r12 + 24], rax;
+        // home_ptr (+64) = &_tdac_home (unused by NONE, but populate)
+        lea rax, [rip + _tdac_home];
+        mov [r12 + 64], rax;
+        // home_len (+72) = 8
+        mov rax, 8;
+        mov [r12 + 72], rax;
+        // alias_cap (+80) = 0 (no cap; unused by NONE)
+        xor rax, rax;
+        mov [r12 + 80], rax;
+
+        call tdac_desc_fill_outs;
+
+        // Invoke.
+        lea rdi, [rip + _tdac_desc];
+        call dispatch_argv_construct;
+
+        cmp rax, 0;                              // AC_OK
+        jne tdac_v_fail;
+
+        // Assert argc_out (+96) == 2.
+        mov rax, [r12 + 96];
+        cmp rax, 2;
+        jne tdac_v_fail;
+
+        // Assert pool_used_out (+88) == 6.
+        mov rax, [r12 + 88];
+        cmp rax, 6;
+        jne tdac_v_fail;
+
+        // Assert off_out[0] == 0, off_out[1] == 3.
+        lea r10, [rip + _tdac_offs];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne tdac_v_fail;
+        mov rax, [r10 + 8];
+        cmp rax, 3;
+        jne tdac_v_fail;
+
+        // Assert pool bytes.
+        lea r10, [rip + _tdac_pool];
+        xor rax, rax; mov_b rax, [r10 + 0];
+        cmp rax, 0x6c;                           // 'l'
+        jne tdac_v_fail;
+        xor rax, rax; mov_b rax, [r10 + 1];
+        cmp rax, 0x73;                           // 's'
+        jne tdac_v_fail;
+        xor rax, rax; mov_b rax, [r10 + 2];
+        cmp rax, 0;                              // NUL
+        jne tdac_v_fail;
+        xor rax, rax; mov_b rax, [r10 + 3];
+        cmp rax, 0x2d;                           // '-'
+        jne tdac_v_fail;
+        xor rax, rax; mov_b rax, [r10 + 4];
+        cmp rax, 0x6c;                           // 'l'
+        jne tdac_v_fail;
+        xor rax, rax; mov_b rax, [r10 + 5];
+        cmp rax, 0;                              // NUL
+        jne tdac_v_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tdac_v_fail:
+        mov rax, 0xFFFFEDE0;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tdac_case_home() -> u64
+  //
+  // Single token "~/foo" (5 bytes) with home_ptr = "/home/aa" (8).
+  // Expected: rax=AC_OK; argc_out=1; pool_used_out = 8 + 4 + 1 = 13;
+  //           pool[0..13] = "/home/aa/foo\0"; off_out[0] = 0.
+  // ==========================================================================
+  pub let tdac_case_home : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case home: one-token HOME expansion path. src='~/foo' (5 bytes); tokens=[(0,5)]; home_ptr=_tdac_home ('/home/aa', 8 bytes); alias_cap=0. Expected pool='/home/aa/foo\\0' (13 bytes); off_out=[0]; argc_out=1; pool_used_out=13; return AC_OK. This is the fingerprint that proves the two-copy path (home prefix + tail-after-'~') writes exactly the right byte sequence. Prologue `push rbx; push r12; sub rsp, 8` = 24 bytes for alignment; r12 = desc base; rbx pushed as alignment dummy. Labels prefixed tdac_h_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tdac_reset;
+
+        // src = "~/foo".
+        lea r10, [rip + _tdac_src];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;     // '~'
+        mov rax, 0x2f; mov_b [r10 + 1], rax;     // '/'
+        mov rax, 0x66; mov_b [r10 + 2], rax;     // 'f'
+        mov rax, 0x6f; mov_b [r10 + 3], rax;     // 'o'
+        mov rax, 0x6f; mov_b [r10 + 4], rax;     // 'o'
+
+        // tokens = [(0, 5)].
+        lea r10, [rip + _tdac_tokens];
+        mov rax, 0;  mov [r10 + 0], rax;
+        mov rax, 5;  mov [r10 + 8], rax;
+
+        // desc.
+        lea r12, [rip + _tdac_desc];
+        lea rax, [rip + _tdac_tokens];
+        mov [r12 + 0], rax;
+        mov rax, 1;
+        mov [r12 + 8], rax;
+        lea rax, [rip + _tdac_src];
+        mov [r12 + 16], rax;
+        mov rax, 5;
+        mov [r12 + 24], rax;
+        lea rax, [rip + _tdac_home];
+        mov [r12 + 64], rax;
+        mov rax, 8;
+        mov [r12 + 72], rax;
+        xor rax, rax;
+        mov [r12 + 80], rax;
+
+        call tdac_desc_fill_outs;
+
+        lea rdi, [rip + _tdac_desc];
+        call dispatch_argv_construct;
+
+        cmp rax, 0;
+        jne tdac_h_fail;
+
+        mov rax, [r12 + 96];                     // argc_out
+        cmp rax, 1;
+        jne tdac_h_fail;
+        mov rax, [r12 + 88];                     // pool_used_out
+        cmp rax, 13;
+        jne tdac_h_fail;
+
+        lea r10, [rip + _tdac_offs];
+        mov rax, [r10 + 0];
+        cmp rax, 0;
+        jne tdac_h_fail;
+
+        // Assert pool[0..12] = "/home/aa/foo" + pool[12] = NUL.
+        lea r10, [rip + _tdac_pool];
+        xor rax, rax; mov_b rax, [r10 +  0];
+        cmp rax, 0x2f;                           // '/'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  1];
+        cmp rax, 0x68;                           // 'h'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  2];
+        cmp rax, 0x6f;                           // 'o'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  3];
+        cmp rax, 0x6d;                           // 'm'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  4];
+        cmp rax, 0x65;                           // 'e'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  5];
+        cmp rax, 0x2f;                           // '/'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  6];
+        cmp rax, 0x61;                           // 'a'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  7];
+        cmp rax, 0x61;                           // 'a'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  8];
+        cmp rax, 0x2f;                           // '/' (tail)
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 +  9];
+        cmp rax, 0x66;                           // 'f'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 + 10];
+        cmp rax, 0x6f;                           // 'o'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 + 11];
+        cmp rax, 0x6f;                           // 'o'
+        jne tdac_h_fail;
+        xor rax, rax; mov_b rax, [r10 + 12];
+        cmp rax, 0;                              // NUL
+        jne tdac_h_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tdac_h_fail:
+        mov rax, 0xFFFFEDE1;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tdac_case_alias() -> u64
+  //
+  // Single token "~alice" (6 bytes). Expected: rax=AC_ERR_ALIAS_UNRESOLVED
+  // (0xFFFFEBA4) -- R106 stub returns unresolved for every symbolic name.
+  // ==========================================================================
+  pub let tdac_case_alias : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case alias: one-token ALIAS path. src='~alice' (6 bytes); tokens=[(0,6)]. Classifier returns TILDE_KIND_ALIAS; argv-construct hits acx_kind_alias and returns AC_ERR_ALIAS_UNRESOLVED (0xFFFFEBA4) unconditionally at R106 (the KIND_USER_ALIAS backend is a stub -- see paideia-os design/roadmap/persistent-home-wave.md R106.M4 vs R108.M4 split). No pool/argc invariants asserted -- on error the descriptor's out-fields are left in whatever partial state the loop reached. Prologue `sub rsp, 8`. Labels prefixed tdac_a_.",
+      block: {
+        sub rsp, 8;
+
+        call tdac_reset;
+
+        // src = "~alice".
+        lea r10, [rip + _tdac_src];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+        mov rax, 0x61; mov_b [r10 + 1], rax;
+        mov rax, 0x6c; mov_b [r10 + 2], rax;
+        mov rax, 0x69; mov_b [r10 + 3], rax;
+        mov rax, 0x63; mov_b [r10 + 4], rax;
+        mov rax, 0x65; mov_b [r10 + 5], rax;
+
+        // tokens = [(0, 6)].
+        lea r10, [rip + _tdac_tokens];
+        mov rax, 0;  mov [r10 + 0], rax;
+        mov rax, 6;  mov [r10 + 8], rax;
+
+        // desc.
+        lea r10, [rip + _tdac_desc];
+        lea rax, [rip + _tdac_tokens];
+        mov [r10 + 0], rax;
+        mov rax, 1;
+        mov [r10 + 8], rax;
+        lea rax, [rip + _tdac_src];
+        mov [r10 + 16], rax;
+        mov rax, 6;
+        mov [r10 + 24], rax;
+        lea rax, [rip + _tdac_home];
+        mov [r10 + 64], rax;
+        mov rax, 8;
+        mov [r10 + 72], rax;
+        xor rax, rax;
+        mov [r10 + 80], rax;
+
+        call tdac_desc_fill_outs;
+
+        lea rdi, [rip + _tdac_desc];
+        call dispatch_argv_construct;
+
+        mov r10, 0xFFFFEBA4;                     // AC_ERR_ALIAS_UNRESOLVED
+        cmp rax, r10;
+        jne tdac_a_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tdac_a_fail:
+        mov rax, 0xFFFFEDE2;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tdac_case_malformed() -> u64
+  //
+  // Single token "~deadbeef" (9 bytes; segment all hex, length 8 != 64).
+  // Expected: rax=AC_ERR_FP_MALFORMED (0xFFFFEBA5).
+  // ==========================================================================
+  pub let tdac_case_malformed : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case malformed: one-token MALFORMED path. src='~deadbeef' (9 bytes); tokens=[(0,9)]. Classifier returns TOK_ERR_FINGERPRINT_MALFORMED (0xFFFFEB06); argv-construct rebadges it as AC_ERR_FP_MALFORMED (0xFFFFEBA5) via acx_fp_malformed. Prologue `sub rsp, 8`. Labels prefixed tdac_m_.",
+      block: {
+        sub rsp, 8;
+
+        call tdac_reset;
+
+        // src = "~deadbeef".
+        lea r10, [rip + _tdac_src];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+        mov rax, 0x64; mov_b [r10 + 1], rax;
+        mov rax, 0x65; mov_b [r10 + 2], rax;
+        mov rax, 0x61; mov_b [r10 + 3], rax;
+        mov rax, 0x64; mov_b [r10 + 4], rax;
+        mov rax, 0x62; mov_b [r10 + 5], rax;
+        mov rax, 0x65; mov_b [r10 + 6], rax;
+        mov rax, 0x65; mov_b [r10 + 7], rax;
+        mov rax, 0x66; mov_b [r10 + 8], rax;
+
+        // tokens = [(0, 9)].
+        lea r10, [rip + _tdac_tokens];
+        mov rax, 0;  mov [r10 + 0], rax;
+        mov rax, 9;  mov [r10 + 8], rax;
+
+        // desc.
+        lea r10, [rip + _tdac_desc];
+        lea rax, [rip + _tdac_tokens];
+        mov [r10 + 0], rax;
+        mov rax, 1;
+        mov [r10 + 8], rax;
+        lea rax, [rip + _tdac_src];
+        mov [r10 + 16], rax;
+        mov rax, 9;
+        mov [r10 + 24], rax;
+        lea rax, [rip + _tdac_home];
+        mov [r10 + 64], rax;
+        mov rax, 8;
+        mov [r10 + 72], rax;
+        xor rax, rax;
+        mov [r10 + 80], rax;
+
+        call tdac_desc_fill_outs;
+
+        lea rdi, [rip + _tdac_desc];
+        call dispatch_argv_construct;
+
+        mov r10, 0xFFFFEBA5;                     // AC_ERR_FP_MALFORMED
+        cmp rax, r10;
+        jne tdac_m_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tdac_m_fail:
+        mov rax, 0xFFFFEDE3;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tdac_case_home_missing() -> u64
+  //
+  // Single token "~" with home_len = 0. Expected: rax=AC_ERR_HOME_MISSING
+  // (0xFFFFEBA3). Proves the "no silent literal" invariant.
+  // ==========================================================================
+  pub let tdac_case_home_missing : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) case home_missing: one-token HOME path with envp gap. src='~' (1 byte); tokens=[(0,1)]; home_len=0. Classifier returns TILDE_KIND_HOME (empty segment); acx_kind_home's home_len==0 gate fires immediately and returns AC_ERR_HOME_MISSING (0xFFFFEBA3). This locks down the design invariant that a missing $HOME is an EXPLICIT refusal, not a silent literal '~' (design/user/content-addressed-identity.md §4 'hard errors not silent literals'). Prologue `sub rsp, 8`. Labels prefixed tdac_hm_.",
+      block: {
+        sub rsp, 8;
+
+        call tdac_reset;
+
+        // src = "~".
+        lea r10, [rip + _tdac_src];
+        mov rax, 0x7e; mov_b [r10 + 0], rax;
+
+        // tokens = [(0, 1)].
+        lea r10, [rip + _tdac_tokens];
+        mov rax, 0;  mov [r10 + 0], rax;
+        mov rax, 1;  mov [r10 + 8], rax;
+
+        // desc: home_len = 0.
+        lea r10, [rip + _tdac_desc];
+        lea rax, [rip + _tdac_tokens];
+        mov [r10 + 0], rax;
+        mov rax, 1;
+        mov [r10 + 8], rax;
+        lea rax, [rip + _tdac_src];
+        mov [r10 + 16], rax;
+        mov rax, 1;
+        mov [r10 + 24], rax;
+        // home_ptr non-null but home_len = 0.
+        lea rax, [rip + _tdac_home];
+        mov [r10 + 64], rax;
+        xor rax, rax;
+        mov [r10 + 72], rax;                     // home_len = 0
+        xor rax, rax;
+        mov [r10 + 80], rax;
+
+        call tdac_desc_fill_outs;
+
+        lea rdi, [rip + _tdac_desc];
+        call dispatch_argv_construct;
+
+        mov r10, 0xFFFFEBA3;                     // AC_ERR_HOME_MISSING
+        cmp rax, r10;
+        jne tdac_hm_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tdac_hm_fail:
+        mov rax, 0xFFFFEDE4;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tdac_run_all() -> u64
+  //
+  // Umbrella: run the five cases in order; propagate first non-zero.
+  // ==========================================================================
+  pub let tdac_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-002 (#41) umbrella for the argv-construction end-to-end matrix: verbatim, home, alias, malformed, home_missing. Propagates first non-zero verdict. Effect/cap set {mem} @{} (argv-construction is pure over caller-owned buffers; the R106 alias 'lookup' is a synchronous stub, no cap invoke). Prologue `sub rsp, 8`. Labels prefixed tdac_ra_.",
+      block: {
+        sub rsp, 8;
+
+        call tdac_case_verbatim;
+        cmp rax, 0;
+        jne tdac_ra_out;
+
+        call tdac_case_home;
+        cmp rax, 0;
+        jne tdac_ra_out;
+
+        call tdac_case_alias;
+        cmp rax, 0;
+        jne tdac_ra_out;
+
+        call tdac_case_malformed;
+        cmp rax, 0;
+        jne tdac_ra_out;
+
+        call tdac_case_home_missing;
+        cmp rax, 0;
+        jne tdac_ra_out;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tdac_ra_out:
+        add rsp, 8;
+        ret
+      }
+    }
+}
