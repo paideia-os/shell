@@ -1,6 +1,7 @@
-// src/line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34)
+// src/line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34) + R66.M1-001 (paideia-os/shell#17)
 //
-// LineReader module: interactive line reader against fd 0 (stdin).
+// LineReader module: interactive line reader against fd 0 (stdin),
+// with raw-mode TTY input path + ESC-sequence recognition (#17).
 //
 // =============================================================================
 // SCOPE
@@ -12,6 +13,25 @@
 // (`sys_read(0, byte_ptr, 1)`), assembling bytes into the caller's
 // buffer until it sees a newline, EOF, buffer-full, or an
 // unrecoverable read error.
+//
+// As of R66.M1-001 (#17) the read loop is filtered through a key-event
+// FSM (`lr_read_key`) that recognises CSI arrow sequences (ESC [ A
+// through D) and backspace (0x7F), turning them into key-code
+// sentinels in the 0xFFFFEC5x band (see LR_KEY_*). The FSM is the
+// foundational substrate for the rest of R66 milestone 1:
+//
+//   * #18 R66.M1-002 (backspace erase on-screen) hooks LR_KEY_BACKSPACE
+//     to write the `\b \b` erase sequence to fd 1 in addition to the
+//     buffer-level shrink #17 already performs.
+//   * #19 R66.M1-003 (history ring recall) hooks LR_KEY_UP / LR_KEY_
+//     DOWN to swap the buffer contents with a history-ring entry.
+//   * #20 R66.M1-004 (cursor-left/right in-place edit) hooks LR_KEY_
+//     LEFT / LR_KEY_RIGHT to move an in-buffer cursor for mid-line
+//     insertion.
+//
+// This file lands the recognition machinery + the buffer-level
+// backspace edit. Arrow keys are recognised-but-ignored so #19/#20
+// need only replace the no-op branches with their side-effect bodies.
 //
 // This is the exact byte-source pattern the paideia-os monorepo's
 // `shell_read_line` uses in the live boot today (see
@@ -29,10 +49,18 @@
 // `sys_read` in the LineReader module. When the shell can invoke a
 // cap-typed KIND_TTY(read) instead of the fd-0 VFS path, that migration
 // is a ONE-FUNCTION (not one-*line*, per #46) change inside
-// `lr_read_one_byte`. Every other call site -- the read loop in
-// `line_reader_read_line`, plus any future line-editing polish
-// (raw mode / backspace / cursor moves / history recall, tracked at
-// #38 / ENH-011 as R66 shell polish tier 1) -- is untouched.
+// `lr_read_one_byte`. Every other call site -- `lr_read_key`, the
+// read loop in `line_reader_read_line`, the line-editing polish added
+// at #17 (raw-mode toggles + ESC FSM) plus the future polish tracked
+// at #18/#19/#20 (backspace on-screen erase, history recall, cursor
+// moves) -- is untouched.
+//
+// R66.M1-001 (#17) extends the seam discipline with a SECOND seam,
+// `lr_read_key`, that sits BETWEEN `lr_read_one_byte` (byte source)
+// and `line_reader_read_line` (line assembler). Any future refinement
+// of the key-recognition FSM (extended ESC sequences, function keys,
+// bracketed-paste mode) is a one-function change inside `lr_read_key`;
+// `line_reader_read_line`'s dispatch loop is untouched.
 //
 // =============================================================================
 // #46 REFRESH (2026-09-08): why fd-0 STILL holds the seam
@@ -49,9 +77,9 @@
 //         = 0xFFFFEC35 on an empty ring, never sleeps), so the seam
 //         needs a busy-poll-with-sys_yield around empty polls to
 //         preserve line_reader_read_line's blocking-read contract.
-//         sys_yield (SC+ ID 5) is NOT yet in the shell's Syscall
-//         floor (ENH-001 enumerated nine sysnos, none of which include
-//         yield).
+//         sys_yield (SC+ ID 5) was added to the shell's Syscall floor
+//         at shell#47 (ENH-001 originally enumerated nine sysnos with
+//         no yield); the wrapper is ready when this seam flips.
 //
 //   (ii)  KIND_TTY (0x197) is NOT in paideia-os
 //         src/kernel/core/cap/kind.pdx KIND_SEEDABLE_TABLE (L3450).
@@ -65,13 +93,26 @@
 //         a companion cross-repo issue is filed alongside this
 //         refresh.
 //
-// Until (i) and (ii) both land, the fd-0 fallback -- the exact
-// pattern the paideia-os monorepo's own shell uses at
-// src/user/shell.pdx:29 -- keeps every interactive REPL surface
-// functional. caps.decl was updated at #46 to name KIND_TTY(read)
-// alongside the extant KIND_TTY(write) requirement, so when the
-// substrate lands the manifest_verify gate at exec sees the read
-// authority as expected without a further caps.decl edit.
+// Until (ii) lands, the fd-0 fallback -- the exact pattern the
+// paideia-os monorepo's own shell uses at src/user/shell.pdx:29 --
+// keeps every interactive REPL surface functional. caps.decl was
+// updated at #46 to name KIND_TTY(read) alongside the extant
+// KIND_TTY(write) requirement, so when the substrate lands the
+// manifest_verify gate at exec sees the read authority as expected
+// without a further caps.decl edit.
+//
+// R66.M1-001 (#17) landing consequence: the RAW-MODE TOGGLE
+// (`lr_tty_set_raw` / `lr_tty_set_cooked`) is scaffolded here and
+// returns `LR_ERR_TTY_UNBOUND` (0xFFFFEC12) today because the
+// KIND_TTY cap seat is not reachable from the shell task. The FSM
+// inside `lr_read_key` therefore fires only when the substrate lands
+// and `shell_main` starts calling `lr_tty_set_raw` at startup (a
+// deferred one-line insertion in the shell_main prologue). In cooked
+// mode -- what the substrate runs today -- the tty driver's line
+// editor consumes 0x7F and ESC sequences before they reach sys_read,
+// so the FSM's arrow/backspace branches are dead code by construction
+// and cost nothing at runtime; every raw byte falls through the
+// GROUND-state fast path unchanged, matching the pre-#17 loop shape.
 //
 // =============================================================================
 // RETURN CONTRACT
@@ -84,25 +125,66 @@
 //     the caller sees the terminator in the buffer, which lets a
 //     lexer that wants to skip trailing whitespace do so uniformly
 //     regardless of how the read terminated.
-//   - EOF at start (first `sys_read` returns 0, count == 0): returns
-//     `LR_ERR_EOF` (0xFFFFEC13). `shell_main` treats this and a bare
-//     0 identically as EOF-exit.
+//   - EOF at start (first read returns EOF sentinel, count == 0):
+//     returns `LR_ERR_EOF` (0xFFFFEC13). `shell_main` treats this
+//     and a bare 0 identically as EOF-exit.
 //   - Buffer full without newline: returns bytes-written (== buf_cap).
-//     No LR_ERR_OVERFLOW sentinel: partial-line return lets the
-//     future line-continuation polish (ENH-011 / R66) glue the pieces
-//     without an error round-trip; today the caller (shell_main)
-//     hands the partial line to shell_repl_step just like any other
-//     line.
-//   - Mid-stream EOF (0-byte read after some bytes read): returns
-//     bytes-written-so-far. This is the "Ctrl-D on a non-empty line"
-//     shape POSIX shells expose today.
-//   - Unrecoverable read error (sys_read returns a negative errno):
-//     returns `LR_ERR_READ_FAIL` (0xFFFFEC14 -- new, allocated at
-//     ENH-007). `shell_main` treats this as EOF for now (exit cleanly
-//     rather than spin); a future error-surfacing polish can promote
-//     this to a user-visible "shell: read failed" message.
+//     No LR_ERR_OVERFLOW sentinel: partial-line return lets a future
+//     line-continuation polish glue the pieces without an error
+//     round-trip; today the caller (shell_main) hands the partial
+//     line to shell_repl_step just like any other line.
+//   - Mid-stream EOF: returns bytes-written-so-far. This is the
+//     "Ctrl-D on a non-empty line" shape POSIX shells expose today.
+//   - Unrecoverable read error: returns `LR_ERR_READ_FAIL`
+//     (0xFFFFEC14). `shell_main` treats this as EOF for now (exit
+//     cleanly rather than spin); a future error-surfacing polish can
+//     promote this to a user-visible "shell: read failed" message.
 //   - buf_ptr == 0 || buf_cap == 0: returns `LR_ERR_BAD_BUF`
 //     (0xFFFFEC11). Fail-fast before any read.
+//   - Backspace key (0x7F -> LR_KEY_BACKSPACE via the FSM): decrements
+//     the buffer cursor and count if count > 0; buffer content at the
+//     freed slot is left as-is (subsequent byte overwrites it). The
+//     on-screen erase (`\b \b` write to fd 1) is #18's addition, not
+//     landed here.
+//   - Arrow keys (LR_KEY_UP / DOWN / LEFT / RIGHT via the FSM): no-op
+//     at #17; the loop iterates without side effect. #19/#20 replace
+//     the no-op branches with history-recall and cursor-move bodies.
+//   - Unrecognised ESC sequences (LR_KEY_UNKNOWN via the FSM): no-op;
+//     the loop iterates.
+//
+// `lr_read_key() -> u64`
+//
+//   - 0..0xFF: verbatim byte from stdin (a control byte or a
+//     printable). 0x1B and 0x7F are always consumed by the FSM and
+//     never returned as raw bytes.
+//   - LR_KEY_UP / DOWN / LEFT / RIGHT / BACKSPACE: recognised key.
+//   - LR_KEY_UNKNOWN: ESC sequence whose final byte is not one of
+//     'A','B','C','D' (extension point for #19/#20 or later polish).
+//   - LR_KEY_EOF: byte source is exhausted (EOF from lr_read_one_byte).
+//   - LR_ERR_READ_FAIL: read failure (propagates from lr_read_one_byte).
+//
+// =============================================================================
+// FSM STATES (lr_read_key)
+// =============================================================================
+//
+//   ESC_STATE_GROUND (0)  Baseline. A newly-read byte either terminates
+//                         with a key/byte return or transitions state.
+//                         Transitions: 0x1B -> ESC; 0x7F -> emit
+//                         LR_KEY_BACKSPACE; any other byte -> emit
+//                         byte verbatim.
+//   ESC_STATE_ESC    (1)  Saw 0x1B; awaiting the introducer.
+//                         Transitions: 0x5B ('[') -> CSI; any other
+//                         byte -> emit LR_KEY_UNKNOWN (unhandled ESC
+//                         family, e.g. ESC O, ESC ESC).
+//   ESC_STATE_CSI    (2)  Saw ESC [. Consume parameter/intermediate
+//                         bytes (0x20-0x3F) until a final byte
+//                         (0x40-0x7E) arrives; dispatch on the final
+//                         byte via `lr_csi_final_to_key`.
+//
+// This is a strict subset of the ECMA-48 CSI recogniser: no OSC
+// (ESC ]), no DCS (ESC P), no SS3 (ESC O). Extended sequences can be
+// added later by fanning out the ESC-state transition without
+// touching `line_reader_read_line`.
 //
 // =============================================================================
 // COUNTER DISCIPLINE
@@ -122,21 +204,85 @@
 //
 //   - Module name PascalCase basename (`LineReader`), no directory prefix.
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
-//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A
-//     appear as compare immediates in this module).
-//   - r11 is scratch; not used in this module (no large-immediate
-//     compares here).
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0, 0x0A,
+//     0x1B, 0x20, 0x3F, 0x40, 0x41-0x44, 0x5B, 0x7E, 0x7F appear as
+//     compare immediates; large-imm sentinels stage via `mov r11,
+//     imm64; cmp rax, r11`).
+//   - r11 is scratch (paideia-as reserved); used for large-imm sentinel
+//     staging + .bss LEA reach.
 //   - Byte read uses the `xor rax, rax; mov_b rax, [ptr]` pattern per
 //     the #1248 mitigation the whole repo observes.
-//   - Three callee-save pushes (r12=buf_ptr walker, r13=buf_cap,
-//     r14=count) = 24 bytes prologue. Entry rsp%16==8 (return addr);
-//     after 3 pushes rsp%16==0 for every nested SysV call
-//     (`shell_note`, `lr_read_one_byte`). No `sub rsp, 8` needed.
-//   - `lr_read_one_byte` is a leaf-modulo-syscall function; one
-//     `sub rsp, 8` prologue keeps rsp%16==0 for the SysV call into
-//     `sys_read`.
+//   - Byte store uses `mov_b [ptr + idx * 1], rax` with the explicit
+//     `* 1` scale per the U1606 mitigation history.pdx / command_
+//     record.pdx already observe.
+//   - Prologue/epilogue rsp%16==0 discipline preserved at every nested
+//     SysV call site; see per-function prologue comments.
 
 module LineReader = structure {
+
+  // ==========================================================================
+  // R66.M1-001 (#17): key-code sentinels (0xFFFFEC5x band)
+  //
+  // The FSM in `lr_read_key` returns one of these when it recognises a
+  // multi-byte sequence or a control byte with a semantic role (0x7F ->
+  // backspace). The 0xFFFFEC5x band is disjoint from every existing
+  // LineReader sentinel (LR_ERR_* at 0xFFFFEC1x) and every raw byte
+  // (0x00..0xFF), so `line_reader_read_line`'s dispatch can distinguish
+  // key / byte / error at a single compare per class.
+  //
+  // 0xFFFFEC35 (TTY_READ_EMPTY per paideia-os kind_tty.pdx L248) sits
+  // in the same 0xFFFFEC3x sub-band as SS_ERR_* (session errors); the
+  // LR_KEY_* band is deliberately 0xFFFFEC5x to leave that neighbourhood
+  // free for the eventual KIND_TTY(read) migration to spell TTY_READ_
+  // EMPTY without a per-repo constant.
+  //
+  // Arrow-key semantics follow ECMA-48 CSI conventions:
+  //   ESC [ A  -- cursor up
+  //   ESC [ B  -- cursor down
+  //   ESC [ C  -- cursor right
+  //   ESC [ D  -- cursor left
+  // ==========================================================================
+  pub let LR_KEY_UP        : u64 = 0xFFFFEC50
+  pub let LR_KEY_DOWN      : u64 = 0xFFFFEC51
+  pub let LR_KEY_LEFT      : u64 = 0xFFFFEC52
+  pub let LR_KEY_RIGHT     : u64 = 0xFFFFEC53
+  pub let LR_KEY_BACKSPACE : u64 = 0xFFFFEC54
+  pub let LR_KEY_UNKNOWN   : u64 = 0xFFFFEC55
+  pub let LR_KEY_EOF       : u64 = 0xFFFFEC56
+
+  // ==========================================================================
+  // R66.M1-001 (#17): KIND_TTY termios op ordinal mirrors
+  //
+  // Authoritative values in paideia-os src/kernel/core/cap/kind_tty.pdx
+  // dispatch table (L1187+). The shell mirrors them here for the same
+  // reason libpdx-cap mirrors RIGHTS_* -- so callers do not need to
+  // link the kernel graph to spell the ordinal. paideia-os#1986
+  // (CLOSED 2026-08-31, kernel commit 0e96c99, R66v2.POS-001) landed
+  // TTY_OP_READ (6) + TTY_OP_SET_RAW (7) + TTY_OP_SET_COOKED (8);
+  // paideia-os R90-XREPO.004 (#1998) further landed VMIN/VTIME/ECHO
+  // termios controls layered onto the SET_RAW handler's argument
+  // record (`tty_set_raw` takes {vmin, vtime, echo} inline in the
+  // op_arg fused qword when the shell's `sys_cap_invoke` wrapper
+  // lands).
+  //
+  // R66.M1-001 raw-mode semantics per the issue plan: ICANON off +
+  // ECHO off + VMIN=1 + VTIME=0 -- deliver each byte to sys_read as
+  // it arrives, with no line editing and no local echo (the shell
+  // echoes explicitly via sys_write). LR_TTY_VMIN_ONE / VTIME_ZERO
+  // mirror the intended argument values so the future
+  // `sys_cap_invoke(tty_cap_slot, TTY_OP_SET_RAW, arg_ptr)` call site
+  // can spell them symbolically. Bit positions inside the arg record
+  // are pinned by the kernel-side handler; the shell does not attempt
+  // to spell them here until the sys_cap_invoke wrapper lands (a
+  // paired change).
+  // ==========================================================================
+  pub let LR_TTY_OP_READ       : u64 = 6
+  pub let LR_TTY_OP_SET_RAW    : u64 = 7
+  pub let LR_TTY_OP_SET_COOKED : u64 = 8
+  pub let LR_TTY_VMIN_ONE      : u64 = 1
+  pub let LR_TTY_VTIME_ZERO    : u64 = 0
+  pub let LR_TTY_ECHO_OFF      : u64 = 0
+  pub let LR_TTY_ICANON_OFF    : u64 = 0
 
   // ==========================================================================
   // lr_read_one_byte(byte_ptr) -> u64
@@ -160,9 +306,9 @@ module LineReader = structure {
   // `sys_cap_invoke(tty_cap_slot, TTY_OP_READ)` that folds
   // TTY_READ_EMPTY (0xFFFFEC35) back into a yield-and-retry so the
   // caller's blocking-read contract holds. The caller in
-  // `line_reader_read_line` is untouched; every future line-editing
-  // polish (ENH-011 raw mode, backspace, cursor moves, history recall)
-  // reads through this same seam.
+  // `line_reader_read_line` is untouched; the R66 line-editing polish
+  // (raw mode, backspace, cursor moves, history recall) reads through
+  // this same seam (indirectly, via `lr_read_key`).
   //
   // Register plan (leaf modulo the syscall):
   //   rdi (input): byte_ptr -- caller-owned 1-byte scratch
@@ -176,7 +322,7 @@ module LineReader = structure {
   pub let lr_read_one_byte : (u64) -> u64 !{mem, sysreg} @{fs} =
     fn (byte_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34) + #46 refresh (2026-09-08): the SINGLE SEAM between the LineReader and the byte transport. Today this is sys_read(0, byte_ptr, 1) — the VFS-mediated fd-0 read the paideia-os monorepo's own shell_read_line uses (src/user/shell.pdx:29). Migration to a cap-typed KIND_TTY(read) invoke is DEFERRED: paideia-os#1986 landed the TTY_OP_READ op + R_TTY_READ right (kernel commit 0e96c99, R66v2.POS-001, closed 2026-08-31), but the seam swap needs two additional upstream landings — (i) adding KIND_TTY (0x197) to paideia-os kind.pdx KIND_SEEDABLE_TABLE (currently absent, L3450), (ii) seeding a live tty_cap_mint_inner row into the shell's cap_table at boot (no path exists today; the mint helper is called only from kernel boot witnesses), and (iii) adding sys_yield (SC+ ID 5) to the shell's Syscall floor so the seam's TTY_READ_EMPTY (0xFFFFEC35) branch can yield-and-retry to preserve the caller's blocking contract. See design/architecture.md §3.3 for the full ledger. Argument shuffle: byte_ptr arrives in rdi (SysV arg0); sys_read wants fd in rdi, buf in rsi, count in rdx, so mov rsi, rdi; mov rdi, 0; mov rdx, 1 stages the args (order matters: rsi must be set before rdi is overwritten). Effect/cap set matches Syscall.sys_read's own {mem, sysreg} @{fs}. Prologue: sub rsp, 8 aligns rsp%16==0 for the nested SysV call into sys_read (entry rsp%16==8 from the caller's return addr). Leaf modulo the sys_read call; SYSCALL clobbers rcx/r11 (both caller-save, harmless). Labels: none (linear body).",
+      justification: "shell.ENH-007 (#34) + #46 refresh (2026-09-08): the SINGLE SEAM between the LineReader and the byte transport. Today this is sys_read(0, byte_ptr, 1) — the VFS-mediated fd-0 read the paideia-os monorepo's own shell_read_line uses (src/user/shell.pdx:29). Migration to a cap-typed KIND_TTY(read) invoke is DEFERRED: paideia-os#1986 landed the TTY_OP_READ op + R_TTY_READ right (kernel commit 0e96c99, R66v2.POS-001, closed 2026-08-31), and shell#47 added sys_yield (SC+ ID 5) to the shell's Syscall floor, so the seam swap now depends only on the two remaining upstream landings — (i) adding KIND_TTY (0x197) to paideia-os kind.pdx KIND_SEEDABLE_TABLE (currently absent, L3450), (ii) seeding a live tty_cap_mint_inner row into the shell's cap_table at boot (no path exists today; the mint helper is called only from kernel boot witnesses). See design/architecture.md §3.3 for the full ledger. Argument shuffle: byte_ptr arrives in rdi (SysV arg0); sys_read wants fd in rdi, buf in rsi, count in rdx, so mov rsi, rdi; mov rdi, 0; mov rdx, 1 stages the args (order matters: rsi must be set before rdi is overwritten). Effect/cap set matches Syscall.sys_read's own {mem, sysreg} @{fs}. Prologue: sub rsp, 8 aligns rsp%16==0 for the nested SysV call into sys_read (entry rsp%16==8 from the caller's return addr). Leaf modulo the sys_read call; SYSCALL clobbers rcx/r11 (both caller-save, harmless). Labels: none (linear body).",
       block: {
         sub rsp, 8;                          // align rsp % 16 for sys_read
         mov rsi, rdi;                        // buf = byte_ptr (must precede rdi overwrite)
@@ -185,6 +331,261 @@ module LineReader = structure {
         call sys_read;
         // rax = 1 on success, 0 on EOF, negative errno on failure.
         add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lr_tty_set_raw() -> u64  (R66.M1-001 / #17)
+  //
+  // Enter raw-mode TTY input: ICANON off + ECHO off + VMIN=1 +
+  // VTIME=0. The shell task then owns line editing (backspace, cursor
+  // moves, history recall) instead of the kernel tty driver.
+  //
+  // DEFERRED RUNTIME. The kernel-side op (`TTY_OP_SET_RAW`, ordinal 7)
+  // landed at paideia-os#1986 (2026-08-31); VMIN/VTIME/ECHO controls
+  // layered on it at paideia-os R90-XREPO.004 (#1998). But the shell
+  // cannot invoke it today: (a) no `sys_cap_invoke` wrapper exists in
+  // the shell's Syscall floor (Syscall enumerates 11 wrappers; none
+  // is cap_invoke), and (b) even if it did, the shell process holds
+  // no KIND_TTY cap in its cap_table (design/architecture.md §3.3
+  // items 3a, 3b). Until BOTH gaps land, this helper is a no-op that
+  // returns `LR_ERR_TTY_UNBOUND` (0xFFFFEC12); the caller in
+  // `line_reader_read_line` ignores the return.
+  //
+  // When the substrate is complete, this function's body becomes:
+  //
+  //     // Stage arg record: {vmin=1, vtime=0, echo=0, icanon=0} fused
+  //     // into one qword per the R90-XREPO.004 layout.
+  //     mov rdi, <_lr_tty_cap_slot>          // shell-owned KIND_TTY slot
+  //     mov rsi, 7                           // TTY_OP_SET_RAW
+  //     mov rdx, <termios_arg_ptr>           // packed {vmin, vtime, echo, icanon}
+  //     call sys_cap_invoke
+  //     ret
+  //
+  // Same shape as `lr_tty_set_cooked` below. Callers should invoke
+  // set_raw at the top of an interactive session and set_cooked at
+  // teardown (per-session, not per-line) so a Ctrl-C exit while inside
+  // a raw block does not leave the tty in a stuck raw state; that
+  // pairing is the responsibility of `shell_main` once the substrate
+  // lands.
+  //
+  // Register plan (leaf, no syscall): no callee-save state; direct
+  // sentinel return. Prologue empty.
+  // ==========================================================================
+  pub let lr_tty_set_raw : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17): scaffolded raw-mode entry helper. Returns LR_ERR_TTY_UNBOUND (0xFFFFEC12) today because (a) no sys_cap_invoke wrapper exists in the shell's Syscall module (the SC+ floor enumerates 11 wrappers per src/syscall.pdx; cap_invoke is not one of them) and (b) the shell process holds no KIND_TTY cap in its cap_table (design/architecture.md §3.3 items 3a, 3b: KIND_TTY absent from KIND_SEEDABLE_TABLE + no shell-time TTY row seed at boot). When both land, the body becomes a sys_cap_invoke(tty_cap_slot, TTY_OP_SET_RAW=7, termios_arg) call per the header comment. Empty effect/cap set today because the no-op body issues no syscall and touches no memory; when the body flips to a real cap_invoke the annotation widens to !{sysreg} @{sched, fs} in step with the wrapper. Leaf function; no push/pop parity. Large-imm sentinel LR_ERR_TTY_UNBOUND (0xFFFFEC12) stores via `mov rax, imm32` (fits the 32-bit MOV zero-extend). Labels: none.",
+      block: {
+        mov rax, 0xFFFFEC12;                 // LR_ERR_TTY_UNBOUND
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lr_tty_set_cooked() -> u64  (R66.M1-001 / #17)
+  //
+  // Restore cooked-mode TTY input (kernel line editor + ICANON + ECHO
+  // on). Symmetric peer of `lr_tty_set_raw`; same deferral rationale.
+  // Kernel op: `TTY_OP_SET_COOKED` (ordinal 8).
+  //
+  // When the substrate is complete:
+  //
+  //     mov rdi, <_lr_tty_cap_slot>          // shell-owned KIND_TTY slot
+  //     mov rsi, 8                           // TTY_OP_SET_COOKED
+  //     xor rdx, rdx                         // no arg record
+  //     call sys_cap_invoke
+  //     ret
+  // ==========================================================================
+  pub let lr_tty_set_cooked : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17): scaffolded cooked-mode restore helper. Symmetric peer of lr_tty_set_raw; same deferral rationale (no sys_cap_invoke + no KIND_TTY cap seat). Returns LR_ERR_TTY_UNBOUND today. When both substrate gaps land, the body becomes a sys_cap_invoke(tty_cap_slot, TTY_OP_SET_COOKED=8, 0) call. Leaf function.",
+      block: {
+        mov rax, 0xFFFFEC12;                 // LR_ERR_TTY_UNBOUND
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lr_csi_final_to_key(final_byte) -> u64  (R66.M1-001 / #17)
+  //
+  // Pure lookup: map an ECMA-48 CSI final byte (0x40-0x7E) to a
+  // LR_KEY_* sentinel. `line_reader_read_key`'s FSM calls this at the
+  // moment it consumes the terminating byte of a CSI sequence.
+  // Splitting the lookup out of the FSM makes it OFFLINE-TESTABLE
+  // without a live tty: tests can pass literal bytes and check the
+  // returned sentinel.
+  //
+  // Recognised finals (per issue #17 scope):
+  //   0x41 'A' -> LR_KEY_UP
+  //   0x42 'B' -> LR_KEY_DOWN
+  //   0x43 'C' -> LR_KEY_RIGHT
+  //   0x44 'D' -> LR_KEY_LEFT
+  // Any other final byte returns LR_KEY_UNKNOWN. Extension to F1-F12
+  // (finals 'P','Q','R','S' with a leading '1;<mod>' parameter),
+  // Home/End ('H'/'F'), Insert/Delete (via CSI ~), etc. is a
+  // one-function edit here; the FSM does not need to change.
+  //
+  // Register plan (leaf): rdi = final_byte (input); rax = return.
+  // No callee-save state; no memory touch; no syscall.
+  // ==========================================================================
+  pub let lr_csi_final_to_key : (u64) -> u64 !{} @{} =
+    fn (final_byte: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17): pure lookup from CSI final byte to LR_KEY_* sentinel. Splitting the lookup out of the FSM makes it offline-testable without a live tty (tests/test_line_reader.pdx exercises every recognised final byte + one unknown case). Recognised finals per issue #17 scope: 'A'/'B'/'C'/'D' -> UP/DOWN/RIGHT/LEFT. Any other byte -> UNKNOWN. `cmp rdi, imm8` uses imm <= 0x7FFFFFFF (only 0x41..0x44 appear). Return-value staging uses `mov rax, imm32` (0xFFFFEC5x fits the 32-bit MOV zero-extend). Leaf function; no push/pop parity. Labels prefixed lr_cf_.",
+      block: {
+        cmp rdi, 0x41;                       // 'A'
+        je  lr_cf_up;
+        cmp rdi, 0x42;                       // 'B'
+        je  lr_cf_down;
+        cmp rdi, 0x43;                       // 'C'
+        je  lr_cf_right;
+        cmp rdi, 0x44;                       // 'D'
+        je  lr_cf_left;
+
+        mov rax, 0xFFFFEC55;                 // LR_KEY_UNKNOWN
+        ret;
+
+      lr_cf_up:
+        mov rax, 0xFFFFEC50;                 // LR_KEY_UP
+        ret;
+
+      lr_cf_down:
+        mov rax, 0xFFFFEC51;                 // LR_KEY_DOWN
+        ret;
+
+      lr_cf_right:
+        mov rax, 0xFFFFEC53;                 // LR_KEY_RIGHT
+        ret;
+
+      lr_cf_left:
+        mov rax, 0xFFFFEC52;                 // LR_KEY_LEFT
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lr_read_key() -> u64  (R66.M1-001 / #17)
+  //
+  // Read one KEY EVENT from the byte source. Runs the CSI FSM per the
+  // §FSM STATES header block. Consumes 1..N bytes; emits exactly one
+  // key event per call.
+  //
+  // Return contract (§RETURN CONTRACT above):
+  //   0x00..0xFF        raw byte (excluding 0x1B and 0x7F which are
+  //                      always consumed by the FSM)
+  //   LR_KEY_UP/.../LR_KEY_BACKSPACE  recognised key
+  //   LR_KEY_UNKNOWN    ESC or CSI sequence not mapped at #17
+  //   LR_KEY_EOF        byte source is exhausted
+  //   LR_ERR_READ_FAIL  read failure propagated from lr_read_one_byte
+  //
+  // Register plan (1 callee-save push + sub rsp,16 = 24 bytes prologue;
+  // rsp%16==0 at every nested SysV call):
+  //   r12       = FSM state (0=GROUND, 1=ESC, 2=CSI)
+  //   [rsp+0]   = one-byte scratch for lr_read_one_byte
+  //   [rsp+8]   = alignment pad (reserved)
+  //   rax       = decoded byte / return staging
+  //   rdi/r11   = call-arg staging
+  //
+  // Entry rsp%16==8 (return addr); one push (r12) = 8 bytes ->
+  // rsp%16==0; sub rsp,16 keeps rsp%16==0 for the nested SysV call
+  // into lr_read_one_byte.
+  // ==========================================================================
+  pub let lr_read_key : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-001 (#17): CSI key-event FSM sitting between lr_read_one_byte (byte source seam) and line_reader_read_line (line assembler). One event per call; 1..N bytes consumed per event. States: 0=GROUND, 1=ESC (saw 0x1B), 2=CSI (saw ESC ['); transitions per the §FSM STATES header block. The one-byte scratch lives at [rsp+0] (a stack slot rather than .bss so parallel invocations from a future multi-thread shell do not collide; today the shell is single-threaded but the discipline is cheap). Read-failure propagation: lr_read_one_byte's rax=0 becomes LR_KEY_EOF, negative-rax becomes LR_ERR_READ_FAIL (0xFFFFEC14); both are terminal (the FSM returns without consuming further bytes). ESC-family bytes that are not the CSI introducer '[' emit LR_KEY_UNKNOWN (an unrecognised ESC O, ESC ESC, etc. is dropped -- callers that want extended families widen the lr_es_esc dispatch). CSI parameter/intermediate bytes (0x20-0x3F) are collected but not stored today (the arrow-key finals do not need the parameters; extension to modifier-keyed arrows like CSI 1;5 A (Ctrl+Up) would add a param buffer). Final byte in [0x40, 0x7E] dispatches through lr_csi_final_to_key. Byte peeks via `xor rax, rax; mov_b rax, [rsp + 0]` per #1248. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0, 0x0A never (0x0A is a normal byte returned verbatim), 0x1B, 0x20, 0x3F, 0x40, 0x5B, 0x7E, 0x7F appear); large-imm sentinels stage via `mov r11, imm64; cmp rax, r11` when needed (none in this body -- the FSM only compares low-byte constants). Prologue: 1 callee-save push (r12=state) + sub rsp,16 = 24 bytes; rsp%16==0 for the nested SysV call into lr_read_one_byte. Matched epilogue at every return. Labels prefixed lr_rk_.",
+      block: {
+        push r12;
+        sub rsp, 16;
+
+        xor r12, r12;                        // state = 0 (GROUND)
+
+      lr_rk_loop:
+        // Read one byte into [rsp + 0].
+        mov rdi, rsp;                        // byte_ptr = &scratch
+        call lr_read_one_byte;
+        // rax = 1 on success, 0 on EOF, negative errno on failure.
+
+        cmp rax, 0;
+        je  lr_rk_eof;
+
+        // Signed-negative check: read failure.
+        cmp rax, 0;
+        jl  lr_rk_read_fail;
+
+        // Peek the just-read byte via the #1248 pattern.
+        xor rax, rax;
+        mov_b rax, [rsp + 0];
+
+        // Dispatch by state.
+        cmp r12, 0;
+        je  lr_rk_ground;
+        cmp r12, 1;
+        je  lr_rk_esc;
+        // else r12 == 2 (CSI)
+        jmp lr_rk_csi;
+
+      lr_rk_ground:
+        // GROUND-state byte dispatch.
+        cmp rax, 0x1B;                       // ESC
+        je  lr_rk_enter_esc;
+        cmp rax, 0x7F;                       // DEL / backspace
+        je  lr_rk_backspace_key;
+        // Any other byte: return it verbatim (rax already holds it).
+        jmp lr_rk_return;
+
+      lr_rk_enter_esc:
+        mov r12, 1;                          // state <- ESC
+        jmp lr_rk_loop;
+
+      lr_rk_backspace_key:
+        mov rax, 0xFFFFEC54;                 // LR_KEY_BACKSPACE
+        jmp lr_rk_return;
+
+      lr_rk_esc:
+        // Expect '[' to enter CSI. Anything else -> UNKNOWN.
+        cmp rax, 0x5B;                       // '['
+        je  lr_rk_enter_csi;
+        mov rax, 0xFFFFEC55;                 // LR_KEY_UNKNOWN
+        jmp lr_rk_return;
+
+      lr_rk_enter_csi:
+        mov r12, 2;                          // state <- CSI
+        jmp lr_rk_loop;
+
+      lr_rk_csi:
+        // Below the final-byte band -> parameter/intermediate; keep going.
+        cmp rax, 0x40;
+        jb  lr_rk_loop;
+        // Above the final-byte band -> defensive; keep going (should
+        // not happen for well-formed CSI, but a stray high-bit byte
+        // must not lock the FSM in CSI state forever).
+        cmp rax, 0x7E;
+        ja  lr_rk_loop;
+
+        // Final byte in [0x40, 0x7E]. Dispatch via lr_csi_final_to_key.
+        mov rdi, rax;                        // final_byte
+        call lr_csi_final_to_key;            // rax = LR_KEY_* or LR_KEY_UNKNOWN
+        jmp lr_rk_return;
+
+      lr_rk_return:
+        add rsp, 16;
+        pop r12;
+        ret;
+
+      lr_rk_eof:
+        mov rax, 0xFFFFEC56;                 // LR_KEY_EOF
+        add rsp, 16;
+        pop r12;
+        ret;
+
+      lr_rk_read_fail:
+        mov rax, 0xFFFFEC14;                 // LR_ERR_READ_FAIL
+        add rsp, 16;
+        pop r12;
         ret
       }
     }
@@ -201,24 +602,41 @@ module LineReader = structure {
   //                sentinel from the 0xFFFFEC1x band.
   //
   // See §RETURN CONTRACT in the module header for the full return
-  // matrix.
+  // matrix; §FSM STATES for the key-recognition state machine at #17.
   //
   // Register plan (3 callee-save pushes; rsp%16==0 at every nested
   // SysV call):
   //   r12 = current buffer pointer (advances as bytes land)
   //   r13 = buf_len (invariant across the loop)
   //   r14 = bytes-read count (drives buffer-full + return-value)
-  //   rdi = argument-staging register for shell_note / lr_read_one_byte
-  //   rax = return-value staging + syscall return
+  //   rdi = argument-staging register for shell_note / lr_read_key
+  //   rax = key-event / return-value staging
+  //   r11 = large-imm sentinel stage for LR_KEY_* / LR_ERR_* compares
   //
-  // Entry rsp%16==8 (return addr); 3 pushes = 24 bytes → rsp%16==0 at
-  // every nested `call` (`shell_note`, `lr_read_one_byte`). No extra
+  // Entry rsp%16==8 (return addr); 3 pushes = 24 bytes -> rsp%16==0 at
+  // every nested `call` (`shell_note`, `lr_read_key`). No extra
   // `sub rsp, 8` needed.
+  //
+  // Backspace side effect: LR_KEY_BACKSPACE decrements r14 and r12 if
+  // r14 > 0; the byte at the freed slot is not zeroed (the next
+  // append overwrites it, and the caller consumes r14 bytes only).
+  // The on-screen `\b \b` erase sequence is #18's contribution and
+  // is deliberately not landed here -- writing to fd 1 from inside
+  // the read loop would require re-entering shell_note's counter
+  // discipline and threading an "output during input" invariant that
+  // #17 does not need. #18 replaces the lr_rl_backspace body with the
+  // three-byte fd-1 write + the shrink #17 already does.
+  //
+  // Arrow keys / LR_KEY_UNKNOWN: recognised, then discarded. The
+  // FSM has consumed the bytes; the loop iterates. #19 replaces the
+  // LR_KEY_UP / LR_KEY_DOWN branches with a history-ring swap; #20
+  // replaces the LR_KEY_LEFT / LR_KEY_RIGHT branches with an in-buffer
+  // cursor move.
   // ==========================================================================
   pub let line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (buf: u64) (buf_len: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34): the LR_STUB tail is retired; line_reader_read_line now reads real bytes byte-at-a-time from fd 0 via the lr_read_one_byte seam. Same shape as the paideia-os monorepo's shell_read_line (src/user/shell.pdx:29). Three callee-save pushes (r12=buf-walker, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 (return addr) + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_one_byte). No `sub rsp, 8` needed. Gate rejects (buf==0 || buf_len==0) fail fast with LR_ERR_BAD_BUF before any read; SH_ST_PROMPTS bumps unconditionally at entry so a caller-side gate reject still records the prompt attempt. Loop: check buffer-full (return count if r14 >= r13), call lr_read_one_byte, dispatch by rax: 0 == EOF (LR_ERR_EOF at start, else return count so far); signed(rax) < 0 == read error (LR_ERR_READ_FAIL); else 1 byte was written, peek [r12] via xor+mov_b per #1248, increment count and pointer, jump back on non-newline, return count on newline (count includes the newline byte). Counter discipline: SH_ST_PROMPTS on entry, SH_ST_LINES on any bytes-written return, SH_ST_ERRORS on every error sentinel — the invariant PROMPTS - LINES - ERRORS == 0 holds over a full session. LR_ERR_READ_FAIL (0xFFFFEC14) is a new sentinel allocated here to distinguish an unrecoverable read failure from an EOF (0) or a start-EOF (LR_ERR_EOF); shell_main treats it as EOF for now (exit cleanly) with room for a future error-surfacing polish. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A appear); byte peek uses `xor rax, rax; mov_b rax, [r12]` per #1248. Labels prefixed lr_rl_.",
+      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17): byte-at-a-time line assembly over the key-event FSM. The pre-#17 body called lr_read_one_byte directly and treated every byte as verbatim buffer input; the #17 body calls lr_read_key which folds 0x1B [...final and 0x7F into LR_KEY_* sentinels. Raw bytes (0..0xFF, excluding 0x1B and 0x7F which the FSM consumes) still take the append path; the newline byte (0x0A) terminates as before. Backspace (LR_KEY_BACKSPACE): shrinks the buffer cursor + count by 1 if count > 0 (buffer-level erase only; on-screen `\\b \\b` is deferred to #18 per the header comment). Arrow keys (LR_KEY_UP/DOWN/LEFT/RIGHT): recognised then discarded; #19/#20 replace the no-op branches. LR_KEY_UNKNOWN (unmapped ESC or CSI): also discarded. LR_KEY_EOF: routes to lr_rl_eof (mid-stream EOF returns count so far; start EOF returns LR_ERR_EOF). LR_ERR_READ_FAIL: routes to lr_rl_read_fail. Three callee-save pushes (r12=buf-walker, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_key). No `sub rsp, 8` needed. Gate rejects (buf==0 || buf_len==0) fail fast with LR_ERR_BAD_BUF before any read; SH_ST_PROMPTS bumps unconditionally at entry so a caller-side gate reject still records the prompt attempt. Counter discipline unchanged from ENH-007: SH_ST_PROMPTS on entry, SH_ST_LINES on any bytes-written return, SH_ST_ERRORS on every error sentinel — the invariant PROMPTS - LINES - ERRORS == 0 holds. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A appear as low-byte compares; large-imm LR_KEY_* / LR_ERR_* sentinels stage via `mov r11, imm64; cmp rax, r11`); byte STORE uses `mov_b [r12], rax` (rax's low byte) per the history.pdx / command_record.pdx pattern; byte LOAD not needed in this body (the FSM already delivered the byte in rax). raw-mode entry / cooked-mode restore are NOT called from this body: R66.M1-001 places them as scaffolded no-ops that a future shell_main will call once at session start / teardown when the KIND_TTY cap seat is provisioned (per-session, not per-line, so a Ctrl-C exit does not leave the tty stuck in raw mode). Labels prefixed lr_rl_.",
       block: {
         push r12;
         push r13;
@@ -246,24 +664,43 @@ module LineReader = structure {
         cmp r14, r13;
         jae lr_rl_return_count;
 
-        // Read one byte through the seam. Slot at [r12].
-        mov rdi, r12;
-        call lr_read_one_byte;
-        // rax = 1 on success, 0 on EOF, negative errno on failure.
+        // Read one key event through the FSM.
+        call lr_read_key;
 
-        // EOF gate: rax == 0.
-        cmp rax, 0;
+        // Terminal sentinels first: EOF and READ_FAIL both leave the loop.
+        mov r11, 0xFFFFEC56;                 // LR_KEY_EOF
+        cmp rax, r11;
         je  lr_rl_eof;
 
-        // Read-error gate: signed(rax) < 0 (negative errno).
-        cmp rax, 0;
-        jl  lr_rl_read_fail;
+        mov r11, 0xFFFFEC14;                 // LR_ERR_READ_FAIL
+        cmp rax, r11;
+        je  lr_rl_read_fail;
 
-        // Success: one byte was written to [r12]. Peek + advance.
-        // Byte peek via #1248 pattern: xor + mov_b.
-        xor rax, rax;
-        mov_b rax, [r12];
+        // Backspace: shrink the buffer if any bytes accumulated.
+        mov r11, 0xFFFFEC54;                 // LR_KEY_BACKSPACE
+        cmp rax, r11;
+        je  lr_rl_backspace;
 
+        // Arrow keys / unknown: recognised but ignored at #17.
+        // (#19 replaces UP/DOWN branches; #20 replaces LEFT/RIGHT.)
+        mov r11, 0xFFFFEC50;                 // LR_KEY_UP
+        cmp rax, r11;
+        je  lr_rl_loop;
+        mov r11, 0xFFFFEC51;                 // LR_KEY_DOWN
+        cmp rax, r11;
+        je  lr_rl_loop;
+        mov r11, 0xFFFFEC52;                 // LR_KEY_LEFT
+        cmp rax, r11;
+        je  lr_rl_loop;
+        mov r11, 0xFFFFEC53;                 // LR_KEY_RIGHT
+        cmp rax, r11;
+        je  lr_rl_loop;
+        mov r11, 0xFFFFEC55;                 // LR_KEY_UNKNOWN
+        cmp rax, r11;
+        je  lr_rl_loop;
+
+        // Raw byte (0..0xFF): append to buffer.
+        mov_b [r12], rax;                    // byte store (low byte of rax)
         add r14, 1;                          // count++
         add r12, 1;                          // buf-walker++
 
@@ -271,6 +708,14 @@ module LineReader = structure {
         cmp rax, 0x0A;
         je  lr_rl_return_count;
 
+        jmp lr_rl_loop;
+
+      lr_rl_backspace:
+        // Shrink the buffer if count > 0; iterate either way.
+        cmp r14, 0;
+        je  lr_rl_loop;
+        sub r14, 1;
+        sub r12, 1;
         jmp lr_rl_loop;
 
       lr_rl_eof:

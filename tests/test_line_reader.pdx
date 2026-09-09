@@ -1,20 +1,45 @@
-// tests/test_line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34)
+// tests/test_line_reader.pdx -- shell.ENH-007 (paideia-os/shell#34) + R66.M1-001 (paideia-os/shell#17)
 //
-// TestLineReader module: fingerprint for the LineReader input gates.
+// TestLineReader module: fingerprint for the LineReader input gates
+// + the R66.M1-001 CSI final-byte lookup + the raw/cooked deferral
+// sentinel.
 //
 // =============================================================================
 // SCOPE
 // =============================================================================
 //
-// Two OFFLINE input-gate cases exercise the fast-fail paths of
-// `LineReader::line_reader_read_line` at ENH-007 landing time:
+// Offline input-gate cases for `LineReader::line_reader_read_line`
+// (from ENH-007):
 //
 //   tlr_case_bad_buf_null      -- buf == 0 -> LR_ERR_BAD_BUF
 //   tlr_case_bad_buf_len_zero  -- buf_len == 0 -> LR_ERR_BAD_BUF
 //
-// Both cases return before any read syscall issues (the gate check
-// precedes the loop entry), so they compile-clean and pass on any
-// paideia-as build without needing a live kernel.
+// Offline CSI-final-byte lookup cases for `LineReader::lr_csi_final_
+// to_key` (from R66.M1-001 / #17). This is a pure function -- no
+// syscall, no tty -- so every case runs entirely under the encoder-
+// half fingerprint discipline:
+//
+//   tlr_case_csi_a_up          -- 'A' (0x41) -> LR_KEY_UP
+//   tlr_case_csi_b_down        -- 'B' (0x42) -> LR_KEY_DOWN
+//   tlr_case_csi_c_right       -- 'C' (0x43) -> LR_KEY_RIGHT
+//   tlr_case_csi_d_left        -- 'D' (0x44) -> LR_KEY_LEFT
+//   tlr_case_csi_z_unknown     -- 'Z' (0x5A) -> LR_KEY_UNKNOWN
+//
+// Offline raw/cooked deferral cases for `lr_tty_set_raw` /
+// `lr_tty_set_cooked` (from R66.M1-001 / #17). Today both helpers
+// return LR_ERR_TTY_UNBOUND (0xFFFFEC12) because the KIND_TTY cap
+// seat is not reachable from the shell task (design/architecture.md
+// §3.3 items 3a, 3b). Pinning the deferral sentinel in a test
+// catches an accidental substrate flip that lands the runtime body
+// without also landing the KIND_TTY cap seat -- the sentinel would
+// change and this test would flag it before an operator sees a
+// stuck-in-raw-mode tty at reboot:
+//
+//   tlr_case_set_raw_deferred    -- lr_tty_set_raw   -> LR_ERR_TTY_UNBOUND
+//   tlr_case_set_cooked_deferred -- lr_tty_set_cooked -> LR_ERR_TTY_UNBOUND
+//
+// All cases compile-clean and pass on any paideia-as build without
+// needing a live kernel.
 //
 // =============================================================================
 // WHAT THIS MODULE DOES NOT EXERCISE
@@ -44,17 +69,27 @@
 // a submodule. Runtime read tests here would follow the same shape
 // and are tracked as a follow-on when that wiring lands.
 //
-// The gate cases exercised here are the FULL offline surface of
-// `line_reader_read_line`: every non-gate path involves at least one
-// `sys_read` invocation.
+// The full-FSM walk (`lr_read_key`'s state transitions across
+// multi-byte ESC [ A sequences) is likewise a live-kernel deferral --
+// exercising it requires the same byte-source mock as the read loop.
+// The pure lookup `lr_csi_final_to_key` covers the classification
+// half of the FSM offline; the state-machine driving of it is what
+// the boot smoke will cover once wired.
 //
 // =============================================================================
 // FAIL-CODE BAND 0xFFFFED9x
 // =============================================================================
 //
-//   0            TLR_PASS                       both cases passed
+//   0            TLR_PASS                       every case passed
 //   0xFFFFED90   TLR_FAIL_BAD_BUF_NULL          buf==0 did not return LR_ERR_BAD_BUF
 //   0xFFFFED91   TLR_FAIL_BAD_BUF_LEN_ZERO      buf_len==0 did not return LR_ERR_BAD_BUF
+//   0xFFFFED92   TLR_FAIL_CSI_A_UP              'A' did not return LR_KEY_UP
+//   0xFFFFED93   TLR_FAIL_CSI_B_DOWN            'B' did not return LR_KEY_DOWN
+//   0xFFFFED94   TLR_FAIL_CSI_C_RIGHT           'C' did not return LR_KEY_RIGHT
+//   0xFFFFED95   TLR_FAIL_CSI_D_LEFT            'D' did not return LR_KEY_LEFT
+//   0xFFFFED96   TLR_FAIL_CSI_Z_UNKNOWN         'Z' did not return LR_KEY_UNKNOWN
+//   0xFFFFED97   TLR_FAIL_SET_RAW_DEFERRED      lr_tty_set_raw did not return LR_ERR_TTY_UNBOUND
+//   0xFFFFED98   TLR_FAIL_SET_COOKED_DEFERRED   lr_tty_set_cooked did not return LR_ERR_TTY_UNBOUND
 //
 // The 0xFFFFED9x band extends the family:
 //   0xFFFFED0x TestCapsNarrow      0xFFFFED5x TestLexer
@@ -75,14 +110,15 @@
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF; large-imm sentinel
 //     compares stage via `mov r11, imm64; cmp rax, r11`.
-//   - r11 scratch for the large-imm sentinel compare (LR_ERR_BAD_BUF).
+//   - r11 scratch for the large-imm sentinel compares (LR_ERR_BAD_BUF,
+//     LR_KEY_*, LR_ERR_TTY_UNBOUND).
 //   - No byte reads in this driver; the gate checks return sentinels
 //     the driver compares as qwords.
 //   - Each case: `sub rsp, 8` prologue (no callee-save pushes; the
 //     args and return value ride through the caller-save registers).
 //     Entry rsp%16==8 (return addr from parent's call); sub 8 gives
-//     rsp%16==0 for the nested line_reader_read_line call. Matched
-//     `add rsp, 8` at every return.
+//     rsp%16==0 for the nested call. Matched `add rsp, 8` at every
+//     return.
 
 module TestLineReader = structure {
 
@@ -92,6 +128,13 @@ module TestLineReader = structure {
   pub let TLR_PASS                       : u64 = 0
   pub let TLR_FAIL_BAD_BUF_NULL          : u64 = 0xFFFFED90
   pub let TLR_FAIL_BAD_BUF_LEN_ZERO      : u64 = 0xFFFFED91
+  pub let TLR_FAIL_CSI_A_UP              : u64 = 0xFFFFED92
+  pub let TLR_FAIL_CSI_B_DOWN            : u64 = 0xFFFFED93
+  pub let TLR_FAIL_CSI_C_RIGHT           : u64 = 0xFFFFED94
+  pub let TLR_FAIL_CSI_D_LEFT            : u64 = 0xFFFFED95
+  pub let TLR_FAIL_CSI_Z_UNKNOWN         : u64 = 0xFFFFED96
+  pub let TLR_FAIL_SET_RAW_DEFERRED      : u64 = 0xFFFFED97
+  pub let TLR_FAIL_SET_COOKED_DEFERRED   : u64 = 0xFFFFED98
 
   // ==========================================================================
   // Fixture (.bss)
@@ -176,9 +219,219 @@ module TestLineReader = structure {
     }
 
   // ==========================================================================
+  // tlr_case_csi_a_up() -> u64  (R66.M1-001 / #17)
+  //
+  // Invoke lr_csi_final_to_key(0x41) and assert the return is
+  // LR_KEY_UP (0xFFFFEC50). The offline classifier half of the CSI
+  // FSM at #17.
+  // ==========================================================================
+  pub let tlr_case_csi_a_up : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17) offline CSI lookup case A: lr_csi_final_to_key(0x41 'A') must return LR_KEY_UP (0xFFFFEC50). The pure lookup half of the CSI FSM is exercisable without a live tty; this case pins the ECMA-48 A->UP mapping. Large-imm sentinel compare stages via `mov r11, imm64; cmp rax, r11`. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested call. Labels prefixed tlr_cau_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 0x41;                       // 'A'
+        call lr_csi_final_to_key;
+
+        mov r11, 0xFFFFEC50;                 // LR_KEY_UP
+        cmp rax, r11;
+        jne tlr_cau_fail;
+
+        xor rax, rax;                        // TLR_PASS
+        add rsp, 8;
+        ret;
+
+      tlr_cau_fail:
+        mov rax, 0xFFFFED92;                 // TLR_FAIL_CSI_A_UP
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_case_csi_b_down() -> u64
+  // ==========================================================================
+  pub let tlr_case_csi_b_down : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17) offline CSI lookup case B: lr_csi_final_to_key(0x42 'B') must return LR_KEY_DOWN (0xFFFFEC51). Prologue: `sub rsp, 8`. Labels prefixed tlr_cbd_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 0x42;                       // 'B'
+        call lr_csi_final_to_key;
+
+        mov r11, 0xFFFFEC51;                 // LR_KEY_DOWN
+        cmp rax, r11;
+        jne tlr_cbd_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tlr_cbd_fail:
+        mov rax, 0xFFFFED93;                 // TLR_FAIL_CSI_B_DOWN
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_case_csi_c_right() -> u64
+  // ==========================================================================
+  pub let tlr_case_csi_c_right : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17) offline CSI lookup case C: lr_csi_final_to_key(0x43 'C') must return LR_KEY_RIGHT (0xFFFFEC53). Prologue: `sub rsp, 8`. Labels prefixed tlr_ccr_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 0x43;                       // 'C'
+        call lr_csi_final_to_key;
+
+        mov r11, 0xFFFFEC53;                 // LR_KEY_RIGHT
+        cmp rax, r11;
+        jne tlr_ccr_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tlr_ccr_fail:
+        mov rax, 0xFFFFED94;                 // TLR_FAIL_CSI_C_RIGHT
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_case_csi_d_left() -> u64
+  // ==========================================================================
+  pub let tlr_case_csi_d_left : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17) offline CSI lookup case D: lr_csi_final_to_key(0x44 'D') must return LR_KEY_LEFT (0xFFFFEC52). Prologue: `sub rsp, 8`. Labels prefixed tlr_cdl_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 0x44;                       // 'D'
+        call lr_csi_final_to_key;
+
+        mov r11, 0xFFFFEC52;                 // LR_KEY_LEFT
+        cmp rax, r11;
+        jne tlr_cdl_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tlr_cdl_fail:
+        mov rax, 0xFFFFED95;                 // TLR_FAIL_CSI_D_LEFT
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_case_csi_z_unknown() -> u64
+  //
+  // 'Z' is not one of the four recognised arrow finals -- the lookup
+  // must fall through to LR_KEY_UNKNOWN. Also covers the extension
+  // contract: adding F1-F12 or Home/End later must not accidentally
+  // start returning something other than UNKNOWN for a byte the new
+  // case does not name.
+  // ==========================================================================
+  pub let tlr_case_csi_z_unknown : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17) offline CSI lookup case Z: lr_csi_final_to_key(0x5A 'Z') must return LR_KEY_UNKNOWN (0xFFFFEC55). Pins the fall-through contract; adding new finals later must not accidentally start returning something other than UNKNOWN for an unnamed byte. Prologue: `sub rsp, 8`. Labels prefixed tlr_czu_.",
+      block: {
+        sub rsp, 8;
+
+        mov rdi, 0x5A;                       // 'Z'
+        call lr_csi_final_to_key;
+
+        mov r11, 0xFFFFEC55;                 // LR_KEY_UNKNOWN
+        cmp rax, r11;
+        jne tlr_czu_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tlr_czu_fail:
+        mov rax, 0xFFFFED96;                 // TLR_FAIL_CSI_Z_UNKNOWN
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_case_set_raw_deferred() -> u64  (R66.M1-001 / #17)
+  //
+  // Pin the raw-mode deferral: today lr_tty_set_raw returns
+  // LR_ERR_TTY_UNBOUND (0xFFFFEC12) because the KIND_TTY cap seat is
+  // not reachable. A substrate flip that lands the runtime body
+  // without also landing the cap seat would silently break the raw-
+  // mode contract; this case catches that at build fingerprint time.
+  // ==========================================================================
+  pub let tlr_case_set_raw_deferred : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17) deferral pin: lr_tty_set_raw must return LR_ERR_TTY_UNBOUND (0xFFFFEC12) today because the KIND_TTY cap seat is not provisioned (design/architecture.md §3.3). When the substrate lands, this sentinel changes and the case fires -- flagging that the runtime toggle went live and shell_main must now call the toggles at startup / teardown to keep the tty out of a stuck raw state on Ctrl-C. Prologue: `sub rsp, 8`. Labels prefixed tlr_srd_.",
+      block: {
+        sub rsp, 8;
+
+        call lr_tty_set_raw;
+
+        mov r11, 0xFFFFEC12;                 // LR_ERR_TTY_UNBOUND
+        cmp rax, r11;
+        jne tlr_srd_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tlr_srd_fail:
+        mov rax, 0xFFFFED97;                 // TLR_FAIL_SET_RAW_DEFERRED
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // tlr_case_set_cooked_deferred() -> u64  (R66.M1-001 / #17)
+  // ==========================================================================
+  pub let tlr_case_set_cooked_deferred : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell.R66.M1-001 (#17) deferral pin: lr_tty_set_cooked must return LR_ERR_TTY_UNBOUND (0xFFFFEC12) today; same deferral rationale as tlr_case_set_raw_deferred. Prologue: `sub rsp, 8`. Labels prefixed tlr_scd_.",
+      block: {
+        sub rsp, 8;
+
+        call lr_tty_set_cooked;
+
+        mov r11, 0xFFFFEC12;                 // LR_ERR_TTY_UNBOUND
+        cmp rax, r11;
+        jne tlr_scd_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        ret;
+
+      tlr_scd_fail:
+        mov rax, 0xFFFFED98;                 // TLR_FAIL_SET_COOKED_DEFERRED
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // tlr_run_all() -> u64
   //
-  // Umbrella: run both cases in order; first non-zero return short-
+  // Umbrella: run every case in order; first non-zero return short-
   // circuits and propagates. Same shape as tcn_run_all / taf_run_all
   // / tsm_run_all / trm_run_all / tsf_run_all / tlx_run_all /
   // tpr_run_all / tbi_run_all / tex_run_all / tshm_run_all.
@@ -186,7 +439,7 @@ module TestLineReader = structure {
   pub let tlr_run_all : () -> u64 !{mem, sysreg} @{fs} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34) umbrella driver: sequential invocation of tlr_case_bad_buf_null then tlr_case_bad_buf_len_zero; short-circuit on first non-zero return. Same shape as every other tXX_run_all in tests/ -- a boot-time smoke harness invokes every umbrella in one loop with a uniform return-code contract. Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV calls. Labels prefixed tlr_ra_.",
+      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17) umbrella driver: sequential invocation of every tlr_case_* in the module; short-circuit on first non-zero return. Same shape as every other tXX_run_all in tests/ -- a boot-time smoke harness invokes every umbrella in one loop with a uniform return-code contract. The umbrella keeps the SUT's widest effect/cap set ({mem, sysreg} @{fs}) so the type-level annotation covers every nested call (line_reader_read_line's effects dominate the pure-lookup cases). Prologue: `sub rsp, 8` aligns rsp%16==0 for the nested SysV calls. Labels prefixed tlr_ra_.",
       block: {
         sub rsp, 8;                          // align rsp % 16
 
@@ -195,6 +448,34 @@ module TestLineReader = structure {
         jne tlr_ra_out;
 
         call tlr_case_bad_buf_len_zero;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_csi_a_up;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_csi_b_down;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_csi_c_right;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_csi_d_left;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_csi_z_unknown;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_set_raw_deferred;
+        cmp rax, 0;
+        jne tlr_ra_out;
+
+        call tlr_case_set_cooked_deferred;
         cmp rax, 0;
         jne tlr_ra_out;
 
