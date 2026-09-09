@@ -4,92 +4,41 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
-## Unreleased — R66.M1-001 (#17): raw-mode TTY input path + ESC-sequence recognition
+## Unreleased — R106.SHELL-003 (#42): tokenizer test infrastructure
 
-Lands the CSI key-recognition FSM that R66 milestone-1 builds on:
-`lr_read_key` sits between `lr_read_one_byte` (byte source) and
-`line_reader_read_line` (line assembler), consuming `ESC [` prefixes
-and 0x7F and emitting `LR_KEY_*` sentinels in the new 0xFFFFEC5x
-band. `line_reader_read_line` now dispatches on key events; the
-buffer-level backspace shrink lands here, on-screen `\b \b` echo
-is #18's contribution. Arrow keys are recognised-but-ignored so
-#19 (history recall) and #20 (cursor moves) need only replace the
-no-op branches. `lr_tty_set_raw` / `lr_tty_set_cooked` are
-scaffolded and return `LR_ERR_TTY_UNBOUND` today because the
-KIND_TTY cap seat is not reachable from the shell task (design/
-architecture.md §3.3 items 3a, 3b); the runtime toggle flips in
-`shell_main` once the substrate lands.
+Lands `tests/test_tokenizer.pdx` -- `TestTokenizer` module with a
+fourteen-case matrix over the R106.M1 `Tokenizer.tokenize` surface
+at `src/tokenizer.pdx`. Covers every documented behaviour: empty
+input, whitespace-only, bare single word, two whitespace-separated
+words, single-quoted fragment, double-quoted fragment, double-quote
+body backslash-escape, bare backslash-escape outside quotes,
+adjacent-fragment glue (`hello'a b'world` = ONE token), unterminated
+single-quote error, unterminated double-quote error, invalid-escape
+error (bare backslash at EOL), overflow error (cap=1 with two
+words), and bad-args error (null line_ptr with non-zero length).
+Fail-code band 0xFFFFEDBx claimed; `ttk_run_all()` matches the
+`tsf_run_all` / `tlx_run_all` umbrella shape so the paideia-os
+boot-time smoke can invoke it in one loop with the other drivers.
+
+The three #41-dependent test files the issue body names
+(`tokenizer_tilde.pdx`, `tokenizer_bare_cd.pdx`,
+`dispatch_argv_construction.pdx`) reference symbols the
+R106.SHELL-002 (#41) landing has not added yet -- the novel-tilde
+expansion inside the tokenizer, the ambiguous-target error in
+bare `cd`, and the dispatch-argv plumbing for a mid-argv `~alice`.
+Those tests land alongside #41 in the commit that first ships their
+SUT symbols; band 0xFFFFEDCx reserved. The shared `tests/harness.pdx`
+witness-primitive surface (`test_ok` / `test_fail`) lands with them
+so its first callers exist in the same commit.
 
 ### Added
 
-- `src/line_reader.pdx`:
-  - `LR_KEY_UP / DOWN / LEFT / RIGHT / BACKSPACE / UNKNOWN / EOF`
-    sentinels in the 0xFFFFEC5x band (disjoint from `LR_ERR_*` at
-    0xFFFFEC1x and from every raw byte 0x00..0xFF).
-  - `LR_TTY_OP_READ / SET_RAW / SET_COOKED` ordinal mirrors + the
-    `VMIN=1 / VTIME=0 / ECHO=OFF / ICANON=OFF` termios constants
-    for the future `sys_cap_invoke(tty_cap_slot, TTY_OP_SET_RAW,
-    …)` call site.
-  - `lr_tty_set_raw()` / `lr_tty_set_cooked()` scaffolded helpers
-    that return `LR_ERR_TTY_UNBOUND` today (deferred behind the
-    §3.3 cap-seat gap; header comment carries the full future
-    body).
-  - `lr_csi_final_to_key(final_byte)` — pure lookup from CSI
-    final byte ('A'/'B'/'C'/'D') to `LR_KEY_*`; falls through to
-    `LR_KEY_UNKNOWN` for any other byte. Offline-testable.
-  - `lr_read_key()` — the CSI FSM (GROUND / ESC / CSI states);
-    one key event per call.
-
-- `tests/test_line_reader.pdx`:
-  - `tlr_case_csi_a_up / b_down / c_right / d_left / z_unknown`
-    exercise `lr_csi_final_to_key` for every recognised arrow +
-    one unknown final.
-  - `tlr_case_set_raw_deferred / set_cooked_deferred` pin the
-    `LR_ERR_TTY_UNBOUND` deferral sentinel so a substrate flip
-    without the paired cap-seat landing surfaces at fingerprint
-    time, not at first Ctrl-C.
-  - `tlr_run_all` extended to sequence the seven new cases.
-
-### Changed
-
-- `src/line_reader.pdx` `line_reader_read_line`:
-  - Loop calls `lr_read_key` in place of `lr_read_one_byte`; the
-    dispatch consumes `LR_KEY_EOF / LR_ERR_READ_FAIL / LR_KEY_
-    BACKSPACE / LR_KEY_UP/DOWN/LEFT/RIGHT / LR_KEY_UNKNOWN` as
-    distinct cases before falling through to the raw-byte append.
-  - `LR_KEY_BACKSPACE` shrinks the buffer cursor + count by 1 if
-    count > 0; buffer content at the freed slot is left as-is
-    (subsequent byte overwrites). On-screen erase is #18.
-  - Arrow keys / `LR_KEY_UNKNOWN` iterate without side effect;
-    #19 replaces the UP/DOWN branches, #20 replaces LEFT/RIGHT.
-  - Byte store switched from the ENH-007 peek-and-count pattern
-    (byte was already in the buffer from `lr_read_one_byte`'s
-    direct fill) to an explicit `mov_b [r12], rax` (the FSM
-    delivers the byte in rax, not in a memory slot).
-
-### Unblocks
-
-- #18 R66.M1-002 (backspace erase on-screen) — the buffer-level
-  shrink is in place; #18 adds the fd-1 `\b \b` echo alongside.
-- #19 R66.M1-003 (history ring recall) — LR_KEY_UP / LR_KEY_DOWN
-  branches are recognised no-ops; #19 replaces them with the
-  history-ring swap body.
-- #20 R66.M1-004 (cursor-left/right in-place edit) — LR_KEY_LEFT
-  / LR_KEY_RIGHT branches are recognised no-ops; #20 replaces
-  them with the in-buffer cursor-move body.
-
-### Deferred (documented in `src/line_reader.pdx` header)
-
-- Runtime raw-mode toggle: requires `sys_cap_invoke` in the shell's
-  Syscall floor AND a shell-side KIND_TTY cap seat (design/
-  architecture.md §3.3 items 3a, 3b). Both are paideia-os side
-  landings; when both close, `shell_main` invokes `lr_tty_set_raw`
-  at startup and `lr_tty_set_cooked` at teardown (per-session,
-  not per-line, so Ctrl-C exit does not strand the tty).
-- Multi-byte FSM walk exercise (offline mock of `lr_read_one_byte`):
-  same deferral rationale as the ENH-007 read-loop matrix; the
-  boot-smoke harness picks it up when the shell satellite is
-  wired into the monorepo.
+- `tests/test_tokenizer.pdx` -- `TestTokenizer` module, fourteen
+  cases + `ttk_reset` fixture populator + `ttk_run_all` umbrella.
+- `manifest.pdxproj` `tests:` list gains the new test target so
+  `bash tools/build.sh` picks it up automatically.
+- `tests/README.md` ledger row for the new module + its band.
+- `STATUS.md` R106.SHELL-003 marked LANDED.
 
 ## Unreleased — ENH-009 (#36): drop `libpdx-elevate` (link-or-drop → drop)
 

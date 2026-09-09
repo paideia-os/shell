@@ -96,6 +96,7 @@ tests:
   - tests/test_shell_main.pdx      # ENH-006 (#33): shell_main entry + shell_repl_step + shell_argv_dispatch fingerprint
   - tests/test_line_reader.pdx     # ENH-007 (#34): line_reader_read_line + lr_read_one_byte input-gate fingerprint
   - tests/test_history.pdx         # ENH-008 (#35): history persist path format + flush skip paths fingerprint
+  - tests/test_tokenizer.pdx       # R106.SHELL-003 (#42): R106.M1 tokenize fingerprint matrix (14 cases)
 
 # --- Documentation targets ---------------------------------------------
 # `.pdxdoc` files shipped in the package under /pkgs/shell-1.0.0/doc/.

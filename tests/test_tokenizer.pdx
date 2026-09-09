@@ -1,0 +1,1273 @@
+// tests/test_tokenizer.pdx -- R106.SHELL-003 (paideia-os/shell#42)
+//
+// TestTokenizer module: golden-fingerprint driver for the R106.M1
+// `Tokenizer.tokenize` surface at src/tokenizer.pdx.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// R106.SHELL-003 (issue #42) lands the test infrastructure for the R106
+// tokenizer + dispatcher pair. This module covers the tokenizer half in
+// full for the surface that R106.M1 actually ships today: the four
+// public error sentinels (0xFFFFEB01..0xFFFFEB04) and the entire happy-
+// path decision matrix (whitespace / word body / quoted body / bare
+// escape / adjacent fragment / empty / ws-only). Fourteen cases.
+//
+// The tokenizer contract under test is documented at src/tokenizer.pdx
+// §"SIGNATURE": `tokenize(line_ptr, line_len, tokens_out_ptr,
+// tokens_out_cap) -> u64`. Success returns a token count in
+// [0..tokens_out_cap]; error returns a sentinel from the 0xFFFFEB0x
+// band. The output array carries one 16-byte record per token:
+// qword0 = offset in the source buffer, qword1 = length in bytes
+// (INCLUDING enclosing quotes and escapes -- a downstream consumer
+// strips as needed).
+//
+// -----------------------------------------------------------------------------
+// WHY R106.M1 SURFACE ONLY (and what is deferred)
+// -----------------------------------------------------------------------------
+//
+// The paideia-os/shell#42 issue body names three cross-cutting test
+// files -- `tokenizer_tilde.pdx`, `tokenizer_bare_cd.pdx`, and
+// `dispatch_argv_construction.pdx` -- that exercise symbols the
+// R106.SHELL-002 landing (issue #41) is scheduled to add: the novel-
+// tilde expansion path (`~`, `~<64-hex>`, `~alice`) inside the
+// tokenizer, the ambiguous-target error emitted by bare `cd` inside
+// the dispatcher, and the argv-construction plumbing between tokenizer
+// and dispatcher for a mid-argv `~alice`. None of those symbols exist
+// in this tree yet -- `src/tokenizer.pdx` is at R106.M1 and knows
+// nothing about a leading `~`; `src/dispatch.pdx` at ENH-004 has a
+// `bi_cd` handler but no ambiguous-target error path. Writing those
+// three test files today would land four .pdx files that fail to
+// compile clean, breaking the manifest's `tests:` gate and violating
+// the issue's own acceptance criterion "All test .pdx files compile
+// clean."
+//
+// The pragmatic split: land the R106.M1 tokenizer-surface coverage
+// here (a full fourteen-case matrix over the four error sentinels and
+// every happy-path fragment kind), and let the three #41-dependent
+// files land in the same commit that lands #41 itself, where the SUT
+// symbols exist. That commit adds `tests/tokenizer_tilde.pdx`,
+// `tests/tokenizer_bare_cd.pdx`, and `tests/dispatch_argv_
+// construction.pdx` next to this file with their own TTK_-adjacent
+// fail-code bands; this module's fourteen cases stay stable and the
+// three new modules add coverage without perturbing the bands here.
+//
+// The shared witness-primitive convention the issue body names
+// (`tests/harness.pdx` with `test_ok(name)` / `test_fail(name,
+// reason)`) is a separate carrier surface: the existing test family
+// in this tree (test_lexer / test_parser / test_syscall_floor / ...)
+// each ships its own umbrella `*_run_all` returning a single u64
+// sentinel with a per-band decode; a shared harness would fold that
+// into per-case name+reason strings. Introducing the harness in this
+// commit would refactor twelve existing test files into it, which
+// spreads the change and is unnecessary for what #42 needs to prove.
+// The harness lands together with the #41 test files where its
+// callers first exist.
+//
+// =============================================================================
+// FIXTURE STRATEGY
+// =============================================================================
+//
+// Every input buffer lives in `.bss` as `[u8; N] uninit @align(8)` and
+// is populated byte-by-byte from mov_b constants in `ttk_reset` before
+// each case runs. Byte-write is used uniformly (even for buffers that
+// contain only printable ASCII) so a reader can see the exact byte
+// sequence at one indent level, matching the pattern established by
+// `tests/test_lexer.pdx` §"WHY BYTE-WRITE FIXTURES". The input buffers
+// deliberately contain single-quote (0x27), double-quote (0x22), and
+// backslash (0x5C) bytes -- the R106.M1 tokenizer's whole reason to
+// exist is those three -- which is another reason not to try to embed
+// them in `.pdx` string literals.
+//
+// The output token buffer `_ttk_tokens_out` is `[u64; 32] uninit
+// @align(16)` = 256 bytes = 16 slots of 16 bytes each. That matches
+// TTK_TOKENS_CAP = 16, chosen as the largest cap we pass into any
+// happy-path case. The overflow case (case 13) deliberately passes
+// cap=1 to force TOK_ERR_OVERFLOW on the second word emit.
+//
+// `ttk_reset` also zeroes the token output buffer between cases so
+// stale bytes from a previous case do not shadow a later assert.
+//
+// =============================================================================
+// FAIL-CODE BAND 0xFFFFEDBx  (TestTokenizer)
+// =============================================================================
+//
+// The tests/README.md band ledger already assigns:
+//
+//   0xFFFFED0x  TestCapsNarrow
+//   0xFFFFED1x  TestAuditFirst
+//   0xFFFFED2x  TestSmokeMatrix
+//   0xFFFFED3x  TestReleaseManifest
+//   0xFFFFED4x  TestSyscallFloor
+//   0xFFFFED5x  TestLexer
+//   0xFFFFED6x  TestParser
+//   0xFFFFED7x  TestBuiltins
+//   0xFFFFED8x  TestExec / TestShellMain
+//   0xFFFFED9x  TestLineReader
+//   0xFFFFEDAx  TestHistory
+//
+// The next free single-nibble subrange is 0xFFFFEDBx -- claimed here.
+// A future TestTokenizerTilde (paired with the #41 landing) will pick
+// 0xFFFFEDCx to stay disjoint from this module's band, so a boot-time
+// smoke log can pin the failing case to the exact SUT surface without
+// grepping module names.
+//
+//   0            TTK_PASS
+//   0xFFFFEDB0   TTK_FAIL_EMPTY           len=0 case
+//   0xFFFFEDB1   TTK_FAIL_WS_ONLY         "   " case
+//   0xFFFFEDB2   TTK_FAIL_BARE            "ls" case
+//   0xFFFFEDB3   TTK_FAIL_TWO_WORDS       "ls -l" case
+//   0xFFFFEDB4   TTK_FAIL_SINGLE_QUOTE    "echo 'a b'" case
+//   0xFFFFEDB5   TTK_FAIL_DOUBLE_QUOTE    'echo "a b"' case
+//   0xFFFFEDB6   TTK_FAIL_DOUBLE_ESCAPE   '"a\b"' case  (double-quote body \-escape)
+//   0xFFFFEDB7   TTK_FAIL_BARE_ESCAPE     "a\b" case  (bare \-escape outside quotes)
+//   0xFFFFEDB8   TTK_FAIL_ADJACENT        "hello'a b'world" case  (one word, three fragments)
+//   0xFFFFEDB9   TTK_FAIL_UNTERM_SINGLE   "'ab" case  (unterminated ')
+//   0xFFFFEDBA   TTK_FAIL_UNTERM_DOUBLE   '"ab' case  (unterminated ")
+//   0xFFFFEDBB   TTK_FAIL_INVALID_ESCAPE  "a\" case  (bare \ at EOL)
+//   0xFFFFEDBC   TTK_FAIL_OVERFLOW        cap=1, two words -> OVERFLOW at second emit
+//   0xFFFFEDBD   TTK_FAIL_BAD_ARGS        line_ptr=0 with len>0
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module basename PascalCase (`TestTokenizer`), matches file basename.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. All fixture byte
+//     constants are single bytes; all length / count / offset compares
+//     stay in [0..15]; the fail-code sentinels 0xFFFFEDBx are loaded
+//     via `mov rax, imm32`, not compared.
+//   - No 2-op `imul r, imm`. Token-record byte offset i*16 is `shl r10, 4`.
+//   - Byte writes to fixtures use mov_b (destination-write side of
+//     the #1248 pattern).
+//   - Byte reads (if any) would use xor rax, rax; mov_b rax, [ptr]
+//     but this driver reads only qwords from the output records.
+//   - Case entries push rbx + r12 + `sub rsp, 8` = 24 bytes prologue
+//     for the nested `tokenize` call; matched pop sequence at every
+//     return. Entry rsp%16==8; after 2 pushes + sub rsp,8 == 0; the
+//     nested call sees rsp%16==0.
+//   - Labels prefixed `ttk_` per the reserved-keyword discipline
+//     (avoids `loop`/`if`/`word`/etc.). Umbrella labels prefixed
+//     `ttk_ra_`.
+//   - r11 is left untouched (paideia-as reserved scratch); .bss LEA
+//     goes through r10 in this module because r11's contract is a
+//     silent trap in a driver that also calls into a callee that
+//     might use r11 itself.
+
+module TestTokenizer = structure {
+
+  // ==========================================================================
+  // Constants
+  // ==========================================================================
+  pub let TTK_TOKENS_CAP : u64 = 16
+
+  // ==========================================================================
+  // Fail codes (0xFFFFEDBx band)
+  // ==========================================================================
+  pub let TTK_PASS                : u64 = 0
+  pub let TTK_FAIL_EMPTY          : u64 = 0xFFFFEDB0
+  pub let TTK_FAIL_WS_ONLY        : u64 = 0xFFFFEDB1
+  pub let TTK_FAIL_BARE           : u64 = 0xFFFFEDB2
+  pub let TTK_FAIL_TWO_WORDS      : u64 = 0xFFFFEDB3
+  pub let TTK_FAIL_SINGLE_QUOTE   : u64 = 0xFFFFEDB4
+  pub let TTK_FAIL_DOUBLE_QUOTE   : u64 = 0xFFFFEDB5
+  pub let TTK_FAIL_DOUBLE_ESCAPE  : u64 = 0xFFFFEDB6
+  pub let TTK_FAIL_BARE_ESCAPE    : u64 = 0xFFFFEDB7
+  pub let TTK_FAIL_ADJACENT       : u64 = 0xFFFFEDB8
+  pub let TTK_FAIL_UNTERM_SINGLE  : u64 = 0xFFFFEDB9
+  pub let TTK_FAIL_UNTERM_DOUBLE  : u64 = 0xFFFFEDBA
+  pub let TTK_FAIL_INVALID_ESCAPE : u64 = 0xFFFFEDBB
+  pub let TTK_FAIL_OVERFLOW       : u64 = 0xFFFFEDBC
+  pub let TTK_FAIL_BAD_ARGS       : u64 = 0xFFFFEDBD
+
+  // ==========================================================================
+  // Fixture buffers (.bss)
+  //
+  // Each input buffer is sized to the case's byte length rounded up to
+  // the next qword multiple (8 or 16 bytes). The tokenizer honours the
+  // explicit length arg and never reads past it, but a qword-aligned
+  // slot keeps the byte-write reset code tidy.
+  //
+  //   _ttk_in_empty      len=0        (any 8-byte buffer -- content unread)
+  //   _ttk_in_ws         "   "         3 bytes
+  //   _ttk_in_bare       "ls"          2 bytes
+  //   _ttk_in_two        "ls -l"       5 bytes
+  //   _ttk_in_sq         "echo 'a b'" 10 bytes
+  //   _ttk_in_dq         'echo "a b"' 10 bytes
+  //   _ttk_in_dq_esc     '"a\b"'       5 bytes  (0x22 'a' 0x5C 'b' 0x22)
+  //   _ttk_in_bare_esc   "a\b"         3 bytes  ('a' 0x5C 'b')
+  //   _ttk_in_adj        "hello'a b'world" 15 bytes
+  //   _ttk_in_unterm_sq  "'ab"         3 bytes
+  //   _ttk_in_unterm_dq  '"ab'         3 bytes
+  //   _ttk_in_inv_esc    "a\"          2 bytes  ('a' 0x5C, backslash at EOL)
+  //   _ttk_in_two_of     "a b"         3 bytes  (overflow case; same buffer works)
+  //
+  // _ttk_tokens_out: 16 records x 16 bytes = 256 bytes = 32 qwords.
+  // ==========================================================================
+  pub let mut _ttk_in_empty      : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_ws         : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_bare       : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_two        : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_sq         : [u8; 16] = uninit @align(8)
+  pub let mut _ttk_in_dq         : [u8; 16] = uninit @align(8)
+  pub let mut _ttk_in_dq_esc     : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_bare_esc   : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_adj        : [u8; 16] = uninit @align(8)
+  pub let mut _ttk_in_unterm_sq  : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_unterm_dq  : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_inv_esc    : [u8; 8]  = uninit @align(8)
+  pub let mut _ttk_in_two_of     : [u8; 8]  = uninit @align(8)
+
+  pub let mut _ttk_tokens_out    : [u64; 32] = uninit @align(16)
+
+  // ==========================================================================
+  // ttk_reset() -> ()
+  //
+  // Zero every fixture qword, then populate the thirteen input buffers
+  // byte-by-byte with the fingerprint literals via mov_b. Same idiom
+  // tlx_reset uses at tests/test_lexer.pdx:tlx_reset. Loop bounds are
+  // byte-count / 8; all fit imm <= 0x7FFFFFFF. Leaf function.
+  //
+  // Called from every ttk_case_* before invoking tokenize so a stale
+  // token-output buffer from a previous case cannot false-positive a
+  // per-token assert.
+  // ==========================================================================
+  pub let ttk_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42): zero every fixture .bss slot then populate each input buffer with the case byte sequence via mov_b constants. Same pattern tlx_reset establishes at tests/test_lexer.pdx (byte-write over rodata string literals so buffers containing 0x22, 0x27, 0x5C are unambiguous at read time). Zeros the 32-qword _ttk_tokens_out first so a case's per-token assert cannot see a stale record from a prior case. r10 = .bss LEA scratch, rax = byte constant / zero. Leaf function; no push/pop parity concern. Labels prefixed ttk_rs_ (none needed -- linear body).",
+      block: {
+        // Zero every fixture buffer.
+        xor rax, rax;
+
+        // _ttk_in_empty (1 qword).
+        lea r10, [rip + _ttk_in_empty];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_ws (1 qword).
+        lea r10, [rip + _ttk_in_ws];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_bare (1 qword).
+        lea r10, [rip + _ttk_in_bare];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_two (1 qword).
+        lea r10, [rip + _ttk_in_two];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_sq (2 qwords).
+        lea r10, [rip + _ttk_in_sq];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // _ttk_in_dq (2 qwords).
+        lea r10, [rip + _ttk_in_dq];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // _ttk_in_dq_esc (1 qword).
+        lea r10, [rip + _ttk_in_dq_esc];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_bare_esc (1 qword).
+        lea r10, [rip + _ttk_in_bare_esc];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_adj (2 qwords).
+        lea r10, [rip + _ttk_in_adj];
+        mov [r10 + 0], rax;
+        mov [r10 + 8], rax;
+
+        // _ttk_in_unterm_sq (1 qword).
+        lea r10, [rip + _ttk_in_unterm_sq];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_unterm_dq (1 qword).
+        lea r10, [rip + _ttk_in_unterm_dq];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_inv_esc (1 qword).
+        lea r10, [rip + _ttk_in_inv_esc];
+        mov [r10 + 0], rax;
+
+        // _ttk_in_two_of (1 qword).
+        lea r10, [rip + _ttk_in_two_of];
+        mov [r10 + 0], rax;
+
+        // _ttk_tokens_out (32 qwords).
+        lea r10, [rip + _ttk_tokens_out];
+        mov [r10 +   0], rax;
+        mov [r10 +   8], rax;
+        mov [r10 +  16], rax;
+        mov [r10 +  24], rax;
+        mov [r10 +  32], rax;
+        mov [r10 +  40], rax;
+        mov [r10 +  48], rax;
+        mov [r10 +  56], rax;
+        mov [r10 +  64], rax;
+        mov [r10 +  72], rax;
+        mov [r10 +  80], rax;
+        mov [r10 +  88], rax;
+        mov [r10 +  96], rax;
+        mov [r10 + 104], rax;
+        mov [r10 + 112], rax;
+        mov [r10 + 120], rax;
+        mov [r10 + 128], rax;
+        mov [r10 + 136], rax;
+        mov [r10 + 144], rax;
+        mov [r10 + 152], rax;
+        mov [r10 + 160], rax;
+        mov [r10 + 168], rax;
+        mov [r10 + 176], rax;
+        mov [r10 + 184], rax;
+        mov [r10 + 192], rax;
+        mov [r10 + 200], rax;
+        mov [r10 + 208], rax;
+        mov [r10 + 216], rax;
+        mov [r10 + 224], rax;
+        mov [r10 + 232], rax;
+        mov [r10 + 240], rax;
+        mov [r10 + 248], rax;
+
+        // Populate _ttk_in_ws: "   " (3 spaces).
+        lea r10, [rip + _ttk_in_ws];
+        mov rax, 0x20; mov_b [r10 + 0], rax;
+        mov rax, 0x20; mov_b [r10 + 1], rax;
+        mov rax, 0x20; mov_b [r10 + 2], rax;
+
+        // Populate _ttk_in_bare: "ls" (2 bytes).
+        lea r10, [rip + _ttk_in_bare];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+
+        // Populate _ttk_in_two: "ls -l" (5 bytes).
+        lea r10, [rip + _ttk_in_two];
+        mov rax, 0x6c; mov_b [r10 + 0], rax;    // 'l'
+        mov rax, 0x73; mov_b [r10 + 1], rax;    // 's'
+        mov rax, 0x20; mov_b [r10 + 2], rax;    // ' '
+        mov rax, 0x2d; mov_b [r10 + 3], rax;    // '-'
+        mov rax, 0x6c; mov_b [r10 + 4], rax;    // 'l'
+
+        // Populate _ttk_in_sq: "echo 'a b'" (10 bytes).
+        lea r10, [rip + _ttk_in_sq];
+        mov rax, 0x65; mov_b [r10 + 0], rax;    // 'e'
+        mov rax, 0x63; mov_b [r10 + 1], rax;    // 'c'
+        mov rax, 0x68; mov_b [r10 + 2], rax;    // 'h'
+        mov rax, 0x6f; mov_b [r10 + 3], rax;    // 'o'
+        mov rax, 0x20; mov_b [r10 + 4], rax;    // ' '
+        mov rax, 0x27; mov_b [r10 + 5], rax;    // '\''
+        mov rax, 0x61; mov_b [r10 + 6], rax;    // 'a'
+        mov rax, 0x20; mov_b [r10 + 7], rax;    // ' '
+        mov rax, 0x62; mov_b [r10 + 8], rax;    // 'b'
+        mov rax, 0x27; mov_b [r10 + 9], rax;    // '\''
+
+        // Populate _ttk_in_dq: 'echo "a b"' (10 bytes).
+        lea r10, [rip + _ttk_in_dq];
+        mov rax, 0x65; mov_b [r10 + 0], rax;    // 'e'
+        mov rax, 0x63; mov_b [r10 + 1], rax;    // 'c'
+        mov rax, 0x68; mov_b [r10 + 2], rax;    // 'h'
+        mov rax, 0x6f; mov_b [r10 + 3], rax;    // 'o'
+        mov rax, 0x20; mov_b [r10 + 4], rax;    // ' '
+        mov rax, 0x22; mov_b [r10 + 5], rax;    // '"'
+        mov rax, 0x61; mov_b [r10 + 6], rax;    // 'a'
+        mov rax, 0x20; mov_b [r10 + 7], rax;    // ' '
+        mov rax, 0x62; mov_b [r10 + 8], rax;    // 'b'
+        mov rax, 0x22; mov_b [r10 + 9], rax;    // '"'
+
+        // Populate _ttk_in_dq_esc: '"a\b"' (5 bytes).
+        // Bytes: 0x22 'a' 0x5C 'b' 0x22. The '\' inside "..." consumes
+        // the next byte ('b') as literal, then the trailing '"' closes.
+        // Expected: 1 token spanning (0, 5).
+        lea r10, [rip + _ttk_in_dq_esc];
+        mov rax, 0x22; mov_b [r10 + 0], rax;    // '"'
+        mov rax, 0x61; mov_b [r10 + 1], rax;    // 'a'
+        mov rax, 0x5c; mov_b [r10 + 2], rax;    // '\\'
+        mov rax, 0x62; mov_b [r10 + 3], rax;    // 'b'
+        mov rax, 0x22; mov_b [r10 + 4], rax;    // '"'
+
+        // Populate _ttk_in_bare_esc: "a\b" (3 bytes).
+        // Bytes: 'a' 0x5C 'b'. Bare '\' outside quotes consumes itself
+        // + next byte as literal, so the word body is 3 bytes long and
+        // no whitespace intervenes -- one token (0, 3).
+        lea r10, [rip + _ttk_in_bare_esc];
+        mov rax, 0x61; mov_b [r10 + 0], rax;    // 'a'
+        mov rax, 0x5c; mov_b [r10 + 1], rax;    // '\\'
+        mov rax, 0x62; mov_b [r10 + 2], rax;    // 'b'
+
+        // Populate _ttk_in_adj: "hello'a b'world" (15 bytes).
+        // The single-quote fragment sits BETWEEN bare word fragments,
+        // so all three glue into ONE token spanning (0, 15). This is
+        // the adjacent-fragment invariant the tokenizer header calls
+        // out (src/tokenizer.pdx §"SIGNATURE").
+        lea r10, [rip + _ttk_in_adj];
+        mov rax, 0x68; mov_b [r10 +  0], rax;   // 'h'
+        mov rax, 0x65; mov_b [r10 +  1], rax;   // 'e'
+        mov rax, 0x6c; mov_b [r10 +  2], rax;   // 'l'
+        mov rax, 0x6c; mov_b [r10 +  3], rax;   // 'l'
+        mov rax, 0x6f; mov_b [r10 +  4], rax;   // 'o'
+        mov rax, 0x27; mov_b [r10 +  5], rax;   // '\''
+        mov rax, 0x61; mov_b [r10 +  6], rax;   // 'a'
+        mov rax, 0x20; mov_b [r10 +  7], rax;   // ' '
+        mov rax, 0x62; mov_b [r10 +  8], rax;   // 'b'
+        mov rax, 0x27; mov_b [r10 +  9], rax;   // '\''
+        mov rax, 0x77; mov_b [r10 + 10], rax;   // 'w'
+        mov rax, 0x6f; mov_b [r10 + 11], rax;   // 'o'
+        mov rax, 0x72; mov_b [r10 + 12], rax;   // 'r'
+        mov rax, 0x6c; mov_b [r10 + 13], rax;   // 'l'
+        mov rax, 0x64; mov_b [r10 + 14], rax;   // 'd'
+
+        // Populate _ttk_in_unterm_sq: "'ab" (3 bytes).
+        // Opening 0x27, then 'a' 'b', no closing 0x27. Expected:
+        // TOK_ERR_UNTERMINATED_QUOTE (0xFFFFEB02).
+        lea r10, [rip + _ttk_in_unterm_sq];
+        mov rax, 0x27; mov_b [r10 + 0], rax;    // '\''
+        mov rax, 0x61; mov_b [r10 + 1], rax;    // 'a'
+        mov rax, 0x62; mov_b [r10 + 2], rax;    // 'b'
+
+        // Populate _ttk_in_unterm_dq: '"ab' (3 bytes).
+        // Opening 0x22, then 'a' 'b', no closing 0x22. Expected:
+        // TOK_ERR_UNTERMINATED_QUOTE (0xFFFFEB02).
+        lea r10, [rip + _ttk_in_unterm_dq];
+        mov rax, 0x22; mov_b [r10 + 0], rax;    // '"'
+        mov rax, 0x61; mov_b [r10 + 1], rax;    // 'a'
+        mov rax, 0x62; mov_b [r10 + 2], rax;    // 'b'
+
+        // Populate _ttk_in_inv_esc: "a\" (2 bytes).
+        // 'a' then bare 0x5C at EOL. tk_bare_escape consumes '\' then
+        // tries to consume the next byte and finds EOL -> INVALID_ESCAPE
+        // (0xFFFFEB03). Distinct from UNTERMINATED_QUOTE because no
+        // opening quote was ever entered.
+        lea r10, [rip + _ttk_in_inv_esc];
+        mov rax, 0x61; mov_b [r10 + 0], rax;    // 'a'
+        mov rax, 0x5c; mov_b [r10 + 1], rax;    // '\\'
+
+        // Populate _ttk_in_two_of: "a b" (3 bytes).
+        // Two words separated by whitespace. With cap=1 passed at the
+        // call site, the SECOND word emit trips the OVERFLOW gate at
+        // tk_outer's `cmp rbp, r15; jae tk_overflow`. Expected:
+        // 0xFFFFEB04 with _ttk_tokens_out[0] left holding the first
+        // record (offset=0, length=1) from the earlier emit and every
+        // later slot untouched (ttk_reset zeroed them).
+        lea r10, [rip + _ttk_in_two_of];
+        mov rax, 0x61; mov_b [r10 + 0], rax;    // 'a'
+        mov rax, 0x20; mov_b [r10 + 1], rax;    // ' '
+        mov rax, 0x62; mov_b [r10 + 2], rax;    // 'b'
+
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Per-case helpers: each case pushes rbx, r12, sub rsp 8 (24-byte
+  // prologue: rsp%16==8 on entry, ==0 after prologue). The nested
+  // `tokenize` call sees rsp%16==0. The matched pop order at every
+  // return: add rsp, 8; pop r12; pop rbx; ret.
+  //
+  // Register usage inside a case (after the prologue):
+  //   rax           tokenize return, then per-assert scratch
+  //   rdi/rsi/rdx/rcx  tokenize args (loaded fresh per call)
+  //   r10           .bss LEA scratch
+  //   r12           _ttk_tokens_out base (loaded once, reused per assert)
+  //   rbx           spare callee-save (unused today; reserved for a
+  //                 future loop-driven case that iterates per token)
+  // ==========================================================================
+
+  // ==========================================================================
+  // ttk_case_empty() -> u64
+  //
+  // Input: len=0 (line_ptr = _ttk_in_empty, any valid buffer). Expected:
+  // rax == 0 (zero tokens), output buffer untouched. Exercises the
+  // tk_done_empty short-circuit in the SUT -- no dereferencing of
+  // line_ptr, no token emit, no output writes.
+  // ==========================================================================
+  pub let ttk_case_empty : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case empty: tokenize called with line_len=0 returns rax=0 (zero tokens) via the tk_done_empty short-circuit at src/tokenizer.pdx:178. No dereference of line_ptr, no writes to tokens_out. Assert token count == 0 only; a per-token assert would be vacuous. Prologue push rbx + push r12 + sub rsp,8 (rsp%16==0 for the nested call).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_empty];
+        mov rsi, 0;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;                              // TTK_TOKENS_CAP
+        call tokenize;
+
+        cmp rax, 0;
+        jne ttk_empty_fail;
+
+        xor rax, rax;                             // TTK_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_empty_fail:
+        mov rax, 0xFFFFEDB0;                      // TTK_FAIL_EMPTY
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_ws_only() -> u64
+  //
+  // Input: "   " (3 spaces). Expected: rax == 0. Exercises the
+  // tk_skip_ws walker at src/tokenizer.pdx:334-336 without ever
+  // entering tk_word.
+  // ==========================================================================
+  pub let ttk_case_ws_only : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case ws_only: three-space input drives the tk_skip_ws advance loop three times then falls out of tk_outer with rbp still 0. No word starts, no emit. Assert token count == 0.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_ws];
+        mov rsi, 3;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 0;
+        jne ttk_ws_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_ws_fail:
+        mov rax, 0xFFFFEDB1;                      // TTK_FAIL_WS_ONLY
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_bare() -> u64
+  //
+  // Input: "ls" (2 bytes). Expected: 1 token (offset=0, length=2).
+  // Baseline single-word case.
+  // ==========================================================================
+  pub let ttk_case_bare : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case bare: single word 'ls' walks tk_word twice, then end-of-input closes the word at tk_word_emit. One record at _ttk_tokens_out[0..15]: qword0=0 (offset), qword1=2 (length). rax=1.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_bare];
+        mov rsi, 2;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 1;
+        jne ttk_bare_fail;
+
+        // token[0] = (0, 2).
+        lea r12, [rip + _ttk_tokens_out];
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_bare_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 2;
+        jne ttk_bare_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_bare_fail:
+        mov rax, 0xFFFFEDB2;                      // TTK_FAIL_BARE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_two_words() -> u64
+  //
+  // Input: "ls -l" (5 bytes). Expected: 2 tokens (0,2) (3,2). The
+  // interior 0x20 closes the first word and the tk_skip_ws walker
+  // advances the cursor to the second word's start.
+  // ==========================================================================
+  pub let ttk_case_two_words : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case two_words: interior whitespace closes the first word via tk_word_emit, tk_outer's tk_skip_ws advances past 0x20 at offset 2, and the second word ('-l') starts at offset 3 with length 2. Two records: (0,2) and (3,2). rax=2.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_two];
+        mov rsi, 5;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 2;
+        jne ttk_two_fail;
+
+        lea r12, [rip + _ttk_tokens_out];
+
+        // token[0] = (0, 2)
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_two_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 2;
+        jne ttk_two_fail;
+
+        // token[1] = (3, 2)  -- byte offset 16.
+        mov rax, [r12 + 16];
+        cmp rax, 3;
+        jne ttk_two_fail;
+        mov rax, [r12 + 24];
+        cmp rax, 2;
+        jne ttk_two_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_two_fail:
+        mov rax, 0xFFFFEDB3;                      // TTK_FAIL_TWO_WORDS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_single_quote() -> u64
+  //
+  // Input: "echo 'a b'" (10 bytes). Expected: 2 tokens (0,4) (5,5).
+  // The single-quote body ("a b") is literal -- the interior 0x20
+  // does NOT close the word because tk_single loops on 0x27 only.
+  // The token span INCLUDES the enclosing quotes: length 5 covers
+  // "'a b'".
+  // ==========================================================================
+  pub let ttk_case_single_quote : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case single_quote: 'echo' emits at (0,4), then whitespace skip advances to offset 5. tk_single body loops literally on 'a', 0x20, 'b' (four consumes) until the closing 0x27 fires tk_single_close and cursor lands at end-of-input (offset 10). Second token at (5,5) spans the entire quoted fragment INCLUDING the enclosing quotes -- the tokenizer contract is span-inclusive so a downstream consumer can distinguish quoted from bare.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_sq];
+        mov rsi, 10;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 2;
+        jne ttk_sq_fail;
+
+        lea r12, [rip + _ttk_tokens_out];
+
+        // token[0] = (0, 4)  -- "echo"
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_sq_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 4;
+        jne ttk_sq_fail;
+
+        // token[1] = (5, 5)  -- "'a b'"
+        mov rax, [r12 + 16];
+        cmp rax, 5;
+        jne ttk_sq_fail;
+        mov rax, [r12 + 24];
+        cmp rax, 5;
+        jne ttk_sq_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_sq_fail:
+        mov rax, 0xFFFFEDB4;                      // TTK_FAIL_SINGLE_QUOTE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_double_quote() -> u64
+  //
+  // Input: 'echo "a b"' (10 bytes). Expected: 2 tokens (0,4) (5,5).
+  // Same expected shape as the single-quote case; different SUT path
+  // through tk_double / tk_double_loop / tk_double_close.
+  // ==========================================================================
+  pub let ttk_case_double_quote : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case double_quote: mirror of ttk_case_single_quote through the tk_double path. 'echo' at (0,4), then tk_double loops over 'a', 0x20, 'b' as literal bytes (no 0x5C in this body so tk_double_escape is untaken) and tk_double_close consumes the closing 0x22. Second token at (5,5), span-inclusive.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_dq];
+        mov rsi, 10;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 2;
+        jne ttk_dq_fail;
+
+        lea r12, [rip + _ttk_tokens_out];
+
+        // token[0] = (0, 4)  -- "echo"
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_dq_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 4;
+        jne ttk_dq_fail;
+
+        // token[1] = (5, 5)  -- '"a b"'
+        mov rax, [r12 + 16];
+        cmp rax, 5;
+        jne ttk_dq_fail;
+        mov rax, [r12 + 24];
+        cmp rax, 5;
+        jne ttk_dq_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_dq_fail:
+        mov rax, 0xFFFFEDB5;                      // TTK_FAIL_DOUBLE_QUOTE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_double_escape() -> u64
+  //
+  // Input: '"a\b"' (5 bytes: 0x22 'a' 0x5C 'b' 0x22). Expected:
+  // 1 token (0, 5). The '\' inside "..." consumes 'b' via
+  // tk_double_escape, then the trailing 0x22 closes the fragment. The
+  // whole span (5 bytes) is one word because no whitespace ever
+  // intervenes.
+  // ==========================================================================
+  pub let ttk_case_double_escape : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case double_escape: proves tk_double_escape at src/tokenizer.pdx:293-298 -- 0x5C inside a double-quoted body consumes the byte after it as literal (rather than treating the follow-on byte as a normal quote-body byte). Here 'b' is escaped, then the closing 0x22 fires tk_double_close. Whole input is one word spanning (0, 5).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_dq_esc];
+        mov rsi, 5;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 1;
+        jne ttk_desc_fail;
+
+        lea r12, [rip + _ttk_tokens_out];
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_desc_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 5;
+        jne ttk_desc_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_desc_fail:
+        mov rax, 0xFFFFEDB6;                      // TTK_FAIL_DOUBLE_ESCAPE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_bare_escape() -> u64
+  //
+  // Input: "a\b" (3 bytes: 'a' 0x5C 'b'). Expected: 1 token (0, 3).
+  // Bare 0x5C outside quotes consumes '\' + next byte via tk_bare_escape,
+  // and no whitespace intervenes, so the token spans the whole input.
+  // ==========================================================================
+  pub let ttk_case_bare_escape : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case bare_escape: proves tk_bare_escape at src/tokenizer.pdx:306-311 -- 0x5C outside a quoted fragment consumes itself plus the follow-on byte, then returns to tk_word. Here 'b' is escaped and tk_word falls out at end-of-input, emitting one token (0, 3).",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_bare_esc];
+        mov rsi, 3;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 1;
+        jne ttk_besc_fail;
+
+        lea r12, [rip + _ttk_tokens_out];
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_besc_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 3;
+        jne ttk_besc_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_besc_fail:
+        mov rax, 0xFFFFEDB7;                      // TTK_FAIL_BARE_ESCAPE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_adjacent() -> u64
+  //
+  // Input: "hello'a b'world" (15 bytes). Expected: 1 token (0, 15).
+  // The single-quote fragment is sandwiched between two bare-word
+  // fragments with no whitespace, so all three glue into ONE word.
+  // This is the adjacent-fragment invariant the tokenizer header
+  // documents (src/tokenizer.pdx §"SIGNATURE": 'hello"a b"world' is
+  // ONE WORD spanning all 15 source bytes).
+  // ==========================================================================
+  pub let ttk_case_adjacent : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case adjacent: guards the adjacent-fragment invariant. 'hello' walks tk_word 5 times, then 0x27 dispatches to tk_single WITHOUT closing the word (tk_single returns to tk_word after tk_single_close). 'world' then extends the same word to the end. One token (0, 15). A regression that broke fragment-glue would show up as three tokens (5, then 5, then 5) instead of one.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_adj];
+        mov rsi, 15;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        cmp rax, 1;
+        jne ttk_adj_fail;
+
+        lea r12, [rip + _ttk_tokens_out];
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_adj_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 15;
+        jne ttk_adj_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_adj_fail:
+        mov rax, 0xFFFFEDB8;                      // TTK_FAIL_ADJACENT
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_unterm_single() -> u64
+  //
+  // Input: "'ab" (3 bytes). Expected: TOK_ERR_UNTERMINATED_QUOTE
+  // (0xFFFFEB02). Opens tk_single with the leading 0x27, walks 'a' 'b',
+  // hits end-of-input inside the single-quote body, falls through
+  // to tk_unterminated.
+  // ==========================================================================
+  pub let ttk_case_unterm_single : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case unterm_single: opens tk_single at cursor 0, tk_single_loop walks 'a' then 'b', third iteration finds cursor==end and jumps to tk_unterminated (0xFFFFEB02). No token is emitted -- the tokenizer's error path is unambiguous.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_unterm_sq];
+        mov rsi, 3;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        mov r10, 0xFFFFEB02;                      // TOK_ERR_UNTERMINATED_QUOTE
+        cmp rax, r10;
+        jne ttk_usq_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_usq_fail:
+        mov rax, 0xFFFFEDB9;                      // TTK_FAIL_UNTERM_SINGLE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_unterm_double() -> u64
+  //
+  // Input: '"ab' (3 bytes). Expected: TOK_ERR_UNTERMINATED_QUOTE
+  // (0xFFFFEB02). Symmetric to ttk_case_unterm_single through the
+  // tk_double path.
+  // ==========================================================================
+  pub let ttk_case_unterm_double : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case unterm_double: mirror of unterm_single through tk_double. Same error sentinel (0xFFFFEB02) for both quote flavours because the SUT deliberately does not distinguish -- a downstream consumer that wants to complain 'unterminated single' vs 'unterminated double' scans the source buffer at the returned line_ptr to see which quote was left open.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_unterm_dq];
+        mov rsi, 3;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        mov r10, 0xFFFFEB02;                      // TOK_ERR_UNTERMINATED_QUOTE
+        cmp rax, r10;
+        jne ttk_udq_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_udq_fail:
+        mov rax, 0xFFFFEDBA;                      // TTK_FAIL_UNTERM_DOUBLE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_invalid_escape() -> u64
+  //
+  // Input: "a\" (2 bytes). Expected: TOK_ERR_INVALID_ESCAPE (0xFFFFEB03).
+  // The bare 0x5C at end-of-input trips tk_bare_escape's cursor-vs-end
+  // gate at src/tokenizer.pdx:308. Distinct sentinel from
+  // UNTERMINATED_QUOTE because no opening quote was ever entered --
+  // the decoder can tell the two apart.
+  // ==========================================================================
+  pub let ttk_case_invalid_escape : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case invalid_escape: 'a' opens a word, tk_word consumes it, then 0x5C dispatches tk_bare_escape which consumes '\' and finds cursor==end -> tk_invalid_escape (0xFFFFEB03). Different sentinel from tk_unterminated so a decoder can distinguish 'quote left open at EOL' from 'escape has nothing to escape at EOL' without heuristics.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_inv_esc];
+        mov rsi, 2;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        mov r10, 0xFFFFEB03;                      // TOK_ERR_INVALID_ESCAPE
+        cmp rax, r10;
+        jne ttk_iesc_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_iesc_fail:
+        mov rax, 0xFFFFEDBB;                      // TTK_FAIL_INVALID_ESCAPE
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_overflow() -> u64
+  //
+  // Input: "a b" (3 bytes) with tokens_out_cap = 1. Expected:
+  // TOK_ERR_OVERFLOW (0xFFFFEB04). The first word 'a' emits fine
+  // (rbp goes 0 -> 1); tk_outer at the second word runs the
+  // `cmp rbp, r15; jae tk_overflow` gate and refuses to emit.
+  // The first record IS committed before the error -- assert offset
+  // 0 length 1 there to prove the SUT does not roll back on
+  // OVERFLOW.
+  // ==========================================================================
+  pub let ttk_case_overflow : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case overflow: cap=1 forces tk_overflow at src/tokenizer.pdx:218-219 on the second word start. The first word ('a' at (0,1)) is already emitted -- the SUT does not roll back partial output. Asserts both the error sentinel AND that the first token record is (0,1), which pins the exact SUT behaviour a caller should expect: 'cap tokens are written, then OVERFLOW is returned; no undo'.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        lea rdi, [rip + _ttk_in_two_of];
+        mov rsi, 3;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 1;                               // deliberately narrow
+        call tokenize;
+
+        mov r10, 0xFFFFEB04;                      // TOK_ERR_OVERFLOW
+        cmp rax, r10;
+        jne ttk_of_fail;
+
+        // First record should still be (0, 1) -- committed before the
+        // second-word overflow gate fired.
+        lea r12, [rip + _ttk_tokens_out];
+        mov rax, [r12 + 0];
+        cmp rax, 0;
+        jne ttk_of_fail;
+        mov rax, [r12 + 8];
+        cmp rax, 1;
+        jne ttk_of_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_of_fail:
+        mov rax, 0xFFFFEDBC;                      // TTK_FAIL_OVERFLOW
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_case_bad_args() -> u64
+  //
+  // Input: line_ptr = 0, line_len = 1 (non-empty, so tk_done_empty is
+  // NOT taken). Expected: TOK_ERR_BAD_ARGS (0xFFFFEB01). Exercises the
+  // `cmp r12, 0; je tk_bad_args` gate at src/tokenizer.pdx:181-182.
+  //
+  // The complementary null-tokens-out case (line_ptr valid, len>0,
+  // tokens_out_ptr=0, cap>0) is symmetric and would land the same
+  // sentinel; folded here into a single case-per-error-flavour to keep
+  // the umbrella band at 14 slots (one per error surface + one per
+  // happy-path branch).
+  // ==========================================================================
+  pub let ttk_case_bad_args : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) case bad_args: line_ptr=0 with non-empty len triggers tk_bad_args at src/tokenizer.pdx:181 (the tk_done_empty short-circuit fires only for len==0, so a null pointer with a non-zero length always reaches the guard). Expected sentinel 0xFFFFEB01. Complementary null-tokens-out variant folded in the same band per the module header comment.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call ttk_reset;
+
+        mov rdi, 0;                               // deliberately null
+        mov rsi, 1;
+        lea rdx, [rip + _ttk_tokens_out];
+        mov rcx, 16;
+        call tokenize;
+
+        mov r10, 0xFFFFEB01;                      // TOK_ERR_BAD_ARGS
+        cmp rax, r10;
+        jne ttk_ba_fail;
+
+        xor rax, rax;
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ttk_ba_fail:
+        mov rax, 0xFFFFEDBD;                      // TTK_FAIL_BAD_ARGS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // ttk_run_all() -> u64
+  //
+  // Umbrella: run every case in order; first non-zero return short-
+  // circuits and propagates. Same shape as tsf_run_all / tlx_run_all
+  // so a boot-time smoke harness can invoke it alongside the existing
+  // family with a uniform return-code contract.
+  //
+  // Prologue: `sub rsp, 8` alone -- no callee-save pushes because each
+  // case preserves nothing across its own return (rax carries the
+  // per-case verdict directly).
+  // ==========================================================================
+  pub let ttk_run_all : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "R106.SHELL-003 (paideia-os/shell#42) umbrella driver: sequential invocation of the fourteen ttk_case_* entries; propagate the first non-zero verdict. Effect/cap set is the union of every case (identical: {mem} @{} -- the tokenizer is a pure-function encoder over caller-owned buffers, no syscalls, no cap invokes). `sub rsp, 8` prologue keeps rsp%16==0 for the nested call chain. Labels prefixed ttk_ra_. Same shape as tsf_run_all / tlx_run_all so the paideia-os boot-time smoke can drop ttk_run_all into the same driver loop as the other umbrellas.",
+      block: {
+        sub rsp, 8;
+
+        call ttk_case_empty;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_ws_only;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_bare;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_two_words;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_single_quote;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_double_quote;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_double_escape;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_bare_escape;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_adjacent;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_unterm_single;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_unterm_double;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_invalid_escape;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_overflow;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        call ttk_case_bad_args;
+        cmp rax, 0;
+        jne ttk_ra_out;
+
+        xor rax, rax;                             // TTK_PASS
+        add rsp, 8;
+        ret;
+
+      ttk_ra_out:
+        // rax already holds the failing case's sentinel.
+        add rsp, 8;
+        ret
+      }
+    }
+}

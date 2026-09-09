@@ -61,7 +61,7 @@ Placeholder — each row lands as its issue closes.
 |-----------------|--------------------------------------------------------|---------|
 | R106.SHELL-001  | scaffold consolidation (.gitignore, README, STATUS, CHANGELOG) | LANDED  |
 | R106.SHELL-002  | tokenizer novel-tilde + bare-cd errors + dispatch entrypoint (#41) | pending |
-| R106.SHELL-003  | tokenizer + dispatcher test infrastructure (#42)       | pending |
+| R106.SHELL-003  | tokenizer + dispatcher test infrastructure (#42)       | LANDED  |
 | shell#44        | sys_fork syscall floor bump + live spawn fingerprint (unblocks #32 close) | LANDED  |
 
 Cross-repo pair: paideia-os R106.M4-KERNEL (kernel-side integration

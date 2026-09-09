@@ -31,6 +31,19 @@ returns 0 on all-pass or a distinct `0xFFFFED*x` fail code otherwise.
   on this module's `tsm_run_all()` returning 0. Fail code band
   0xFFFFED2x.
 
+- `test_tokenizer.pdx` (R106.SHELL-003, issue #42) —
+  `TestTokenizer` module: 14 test cases against R106.M1
+  `Tokenizer.tokenize` (src/tokenizer.pdx). Covers empty, ws-only,
+  bare, two-words, single-quote, double-quote, double-quote-escape,
+  bare-escape, adjacent-fragment glue, unterminated single,
+  unterminated double, invalid escape, overflow, and bad-args. Fail
+  code band 0xFFFFEDBx. Driver: `ttk_run_all()`. The three
+  #41-dependent test files (`tokenizer_tilde.pdx`,
+  `tokenizer_bare_cd.pdx`, `dispatch_argv_construction.pdx`) the
+  issue body names land alongside R106.SHELL-002 (#41) where the
+  novel-tilde / bare-cd-error / dispatch-argv-plumbing SUT symbols
+  first exist -- band 0xFFFFEDCx reserved.
+
 ## Driver entry points
 
 Each `*_run_all` returns:
@@ -39,8 +52,9 @@ Each `*_run_all` returns:
 - `0xFFFFED0x` — first failing case in test_caps_narrow.
 - `0xFFFFED1x` — first failing case in test_audit_first.
 - `0xFFFFED2x` — first failing case in test_smoke_matrix.
+- `0xFFFFEDBx` — first failing case in test_tokenizer.
 
-The three bands are disjoint from the shell's own 0xFFFFECxx band
+The bands are disjoint from the shell's own 0xFFFFECxx band
 so an operator reading a test-run log can distinguish "SUT rejected
 input" from "test framework detected the SUT did the wrong thing"
 by the high two bytes of the return alone.
