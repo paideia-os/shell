@@ -4,6 +4,55 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — Syscall floor extension: sys_yield (#47)
+
+Extends ENH-001's `Syscall` module with `SYS_YIELD = 5` + a
+matching arity-0 `sys_yield` wrapper. This is the precondition
+`design/architecture.md` §3.3 named for the KIND_TTY(read) seam
+migration (#46 step 3): once the seam swap flips
+`lr_read_one_byte` to `sys_cap_invoke(tty_cap_slot, TTY_OP_READ)`,
+the `TTY_READ_EMPTY` (0xFFFFEC35) branch will wrap in a
+`sys_yield; jmp poll_top` loop so the caller's blocking-read
+contract is preserved. No in-tree caller yet; the floor addition
+is landed ahead of #46 per ENH-001's floor-first / consumer-later
+staging pattern.
+
+### Added
+
+- `src/syscall.pdx` `SYS_YIELD : u64 = 5` — SC+ ID reserved for
+  `sys_yield`. Provenance is repo-side (`design/architecture.md`
+  §3.3): paideia-os `design/user/syscall-table.md` carries no row
+  at ID 5 today, so the shell reserves the shell-visible slot
+  ahead of the kernel dispatch wiring. Kernel-side substrate
+  (`src/kernel/core/sched/yield.pdx` `sched_yield`) already
+  exists and is reachable via KIND_SCHED_CTX OP_YIELD (op_code=5,
+  `src/kernel/core/cap/kind_sched.pdx`); wiring
+  `dispatch.pdx` to a direct sysno-5 arm is the paired paideia-os
+  landing #46 depends on.
+- `src/syscall.pdx` `sys_yield : () -> u64 !{sysreg} @{sched}` —
+  arity-0 wrapper (`mov rax, 5; syscall; ret`). Effect and
+  capability set match the R13 legacy `sys_yield` and the
+  kernel-side KIND_SCHED_CTX OP_YIELD posture: `sysreg` for
+  SYSCALL itself, `@{sched}` because the handler tail-calls into
+  `sched_pick_next` / `sched_switch`. No `mem` effect (yield
+  touches no user memory). Leaf function; SYSCALL clobbers
+  rcx/r11 (both SysV caller-save, harmless).
+
+### Changed
+
+- `src/syscall.pdx` module header — updated the "nine SC+ IDs"
+  exit criterion to "ten SC+ IDs" and refreshed the sysno-list
+  block comment to note SC+ ID 5's provenance (repo-side
+  `design/architecture.md` §3.3, ahead of the paideia-os
+  `syscall-table.md` row that a paired kernel-side landing will
+  add).
+
+### Unblocks
+
+- shell#46 step 3: the KIND_TTY(read) seam swap inside
+  `lr_read_one_byte` can now use `Syscall.sys_yield` verbatim
+  without a further shell-side floor extension.
+
 ## Unreleased — ENH-008: history persist to disk (#35)
 
 `history_encode_record`'s wire bytes now reach the filesystem. The

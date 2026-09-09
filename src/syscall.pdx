@@ -20,7 +20,9 @@
 // This module lands the FLOOR only. No caller in the repository is
 // wired up here -- that is ENH-002+. The exit criteria for #28 are:
 //   1. `syscall` instructions appear in `src/`.
-//   2. The nine SC+ IDs the shell needs are named symbolically.
+//   2. The ten SC+ IDs the shell needs are named symbolically
+//      (extended from nine at shell#47: SYS_YIELD = 5 added for the
+//      KIND_TTY(read) seam's TTY_READ_EMPTY yield-and-retry loop).
 //   3. Each wrapper compiles clean under paideia-as >= 0.21.
 //   4. The unit fingerprint (`tests/test_syscall_floor.pdx`) proves
 //      the shim shape by exercising `sys_getcwd` + `sys_write` when
@@ -113,22 +115,44 @@ module Syscall = structure {
   // authoritative table lives at `design/user/syscall-table.md`
   // (paideia-os).
   //
-  // The shell needs the following nine (the exhaustive list per
-  // `design/enhancement-plan.md` §4 Stage 0):
+  // The shell needs the following ten (originally nine per
+  // `design/enhancement-plan.md` §4 Stage 0; extended at shell#47 with
+  // SYS_YIELD = 5 for the KIND_TTY(read) seam's yield-and-retry loop):
   //   0   read     (line_reader: byte-at-a-time TTY read; ENH-007)
   //   1   write    (line_reader: prompt echo, `write` builtin; ENH-007)
   //   2   open     (path-search for exec, `.pds` script open; ENH-005)
   //   3   close    (exec cleanup, `.pds` script close; ENH-005)
+  //   5   yield    (line_reader: TTY_READ_EMPTY busy-poll; #47 -> #46)
   //   59  execve   (exec: replace child image with argv[0]; ENH-005)
   //   60  exit     (Shell::shell_main normal termination; ENH-006)
   //   61  wait4    (exec: block on child exit code; ENH-005)
   //   85  chdir    (builtin: cd; ENH-004)
   //   86  getcwd   (builtin: pwd, prompt render; ENH-004/006)
+  //
+  // SC+ ID 5 (sys_yield) provenance: the kernel-side substrate exists
+  // as `sched_yield` (paideia-os src/kernel/core/sched/yield.pdx) and
+  // is reachable today via KIND_SCHED_CTX OP_YIELD (op_code=5). Placing
+  // the direct-syscall wrapper at sysno 5 keeps the shell's floor
+  // aligned with the design/architecture.md §3.3 ledger which names
+  // `sys_yield` at SC+ ID 5 as the standard hook the TTY_READ_EMPTY
+  // (0xFFFFEC35) branch needs so the caller's blocking-read contract
+  // is preserved after the KIND_TTY(read) seam swap lands (#46). No
+  // paideia-os design/user/syscall-table.md row exists at ID 5 today
+  // (the frozen R15.M4 table's contiguous 0..4 block ends at
+  // cap_invoke; the shell#47 landing reserves the shell-visible slot
+  // in advance of the kernel-side dispatcher wiring). Until the kernel
+  // dispatch grows a `cmp rdi, 5; je dispatch_yield` arm, callers
+  // invoking sys_yield will observe -ENOSYS (0xFFFFFFFFFFFFFFDA) --
+  // acceptable at the floor-landing tempo because #47 has no in-tree
+  // caller (the #46 KIND_TTY(read) migration is where the wrapper is
+  // first exercised, and that landing pairs a kernel-side dispatch
+  // arm with the wrapper's first call site).
   // ==========================================================================
   pub let SYS_READ    : u64 = 0
   pub let SYS_WRITE   : u64 = 1
   pub let SYS_OPEN    : u64 = 2
   pub let SYS_CLOSE   : u64 = 3
+  pub let SYS_YIELD   : u64 = 5
   pub let SYS_EXECVE  : u64 = 59
   pub let SYS_EXIT    : u64 = 60
   pub let SYS_WAIT4   : u64 = 61
@@ -206,6 +230,48 @@ module Syscall = structure {
       justification: "shell.ENH-001 (#28): SC+ ID 3 wrapper. SysV rdi passes through (arity 1). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_close.pdx (landed R16.M3-002). Effect drops `mem` relative to sys_read/write because sys_close does not touch user memory; sysreg + fs stay per syscall_shim.pdx sys_close. Shell consumers: exec cleanup of open fds prior to sys_execve (ENH-005) and Pds body-file close after header parse (ENH-005). Leaf function.",
       block: {
         mov rax, 3;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_yield() -> u64
+  //
+  // Voluntary CPU release (cooperative multitasking hint). Returns
+  // 0 (YIELD_OK) or 1 (YIELD_NOOP: pick_next selected the same TCB)
+  // on success, or a negative errno / -ENOSYS while the kernel-side
+  // dispatch arm for sysno 5 is unwired. Arity 0 -- no SysV args, no
+  // shuffle.
+  //
+  // Consumer at v2.0: the LineReader's KIND_TTY(read) migration
+  // (shell#46) will wrap the seam's TTY_READ_EMPTY (0xFFFFEC35)
+  // branch in a `sys_yield; jmp poll_top` loop so the caller's
+  // blocking-read contract is preserved (see
+  // design/architecture.md §3.3 pseudocode block). Until #46 lands
+  // the wrapper is unused; the floor addition here (#47) is the
+  // dependency #46 step 3 blocks on.
+  //
+  // Kernel body: paideia-os `src/kernel/core/sched/yield.pdx`
+  // `sched_yield`. Today the syscall dispatcher (paideia-os
+  // src/kernel/core/syscall/dispatch.pdx) does NOT carry a
+  // `cmp rdi, 5; je dispatch_yield` arm, so a direct syscall with
+  // rax=5 falls through to `dispatch_enosys` (-ENOSYS). The paired
+  // kernel-side landing is expected to wire dispatch to a leaf
+  // wrapper that tail-calls `sched_yield` -- see the R13 legacy
+  // `sys_yield` (paideia-os design/audit/entries/r13-m5-003-
+  // syscall-table.md row 1) for the canonical shape (Rev-1 dropped
+  // the R13 assignment during the R17 SC+ freeze because no caller
+  // existed; the #46 seam is that caller, and the shell#47 wrapper
+  // reserves the shell's slot at the ID design/architecture.md §3.3
+  // named).
+  // ==========================================================================
+  pub let sys_yield : () -> u64 !{sysreg} @{sched} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {sched},
+      justification: "shell.ENH-001 extension (#47): SC+ ID 5 wrapper. Arity 0 -- no SysV args, no arg shuffle. Kernel body at paideia-os src/kernel/core/sched/yield.pdx `sched_yield` (landed R10-m3-002 / R9-m3-003 refactor); the kernel-side dispatcher arm for sysno 5 is expected to land alongside shell#46's KIND_TTY(read) seam migration so the wrapper's first in-tree caller (the TTY_READ_EMPTY yield-and-retry loop inside `lr_read_one_byte`) exercises a real handler. Effect and capability set match the R13 legacy sys_yield ({sysreg} + @{sched}) and the kernel-side KIND_SCHED_CTX OP_YIELD posture (paideia-os src/kernel/core/cap/kind_sched.pdx `kind_sched_invoke`): sysreg for SYSCALL itself, @{sched} because the handler tail-calls into sched_pick_next / sched_switch. No `mem` effect -- yield touches no user memory. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless to the wrapper's siblings). Provenance for SC+ ID 5: design/architecture.md §3.3 (this repo) names sys_yield at ID 5 as the standard hook for the KIND_TTY(read) seam's blocking-read contract preservation; paideia-os design/user/syscall-table.md carries no row at ID 5 today, so #47 reserves the shell-visible slot ahead of the kernel dispatch wiring (matches ENH-001's floor-first / consumer-later staging pattern -- see sibling sys_execve/sys_wait4 landing which preceded ENH-005's exec-path caller by one issue).",
+      block: {
+        mov rax, 5;
         syscall;
         ret
       }
