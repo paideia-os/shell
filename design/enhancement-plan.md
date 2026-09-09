@@ -214,7 +214,12 @@ shell.
   not exist yet.
 - **ENH-008** `history.pdx`: persist the bytes `history_encode_record`
   already produces, via the now-real `KIND_PDXFS_FILE` write path.
-- **ENH-009** `libpdx-elevate`: link it or drop it (§5).
+- **ENH-009** `libpdx-elevate`: link it or drop it (§5). **LANDED at
+  #36 — path (b) dropped.** `libpdx-elevate @ ^0.2` removed from
+  `manifest.pdxproj`, `SH_KIND_ELEVATE_CHANNEL` removed from
+  `src/shell.pdx`, README's dependency list refreshed. No consumer
+  path existed and `caps.decl` never held the KIND; carrying the dep
+  was a supply-chain claim the binary did not honour.
 
 ### Stage 6 — tell the truth (ENH-010, ENH-011)
 
@@ -222,45 +227,51 @@ Documentation and issue-tracker correctness. §6 and §7.
 
 ---
 
-## §5. The `libpdx-elevate` finding: mirrored, never linked
+## §5. The `libpdx-elevate` finding: mirrored, never linked — RESOLVED at #36
 
-The README calls elevate integration "*reserved*, and honestly so."
-That wording is accurate but understates how thin the connection is.
-Precisely:
+Historical statement of the problem (kept for provenance; see the
+"resolution" block below for what actually shipped):
 
 - **Declared as a build dependency:** `manifest.pdxproj:57` —
   `- libpdx-elevate @ ^0.2        # M5 reserved: .pds requires: elevate future`,
   with a five-line rationale at `manifest.pdxproj:47–51`.
 - **One mirrored constant:** `src/shell.pdx:88` —
   `pub let SH_KIND_ELEVATE_CHANNEL : u64 = 0x191`. Grep for that
-  symbol returns exactly two hits: its own definition and the comment
-  citing its upstream at `src/shell.pdx:71`. **It is never read by any
-  function in the repository.**
-- **Zero call sites:** no `elevate_client_*` symbol is called anywhere.
-  The nine other textual "elevate" hits in `src/` are all prose of the
+  symbol returned exactly two hits: its own definition and the comment
+  citing its upstream at `src/shell.pdx:71`. It was never read by any
+  function in the repository.
+- **Zero call sites:** no `elevate_client_*` symbol was called anywhere.
+  The remaining textual "elevate" hits in `src/` are all prose of the
   form "same shape as `elevate_client_lookup_broker`"
   (`src/line_reader.pdx:120`, `src/exec.pdx:84`, `src/shell.pdx:198`) —
-  the library is cited as a *coding-style precedent for stub and
-  counter idioms*, not invoked.
+  the library was cited as a *coding-style precedent for stub and
+  counter idioms*, not invoked. Those attributions remain in the
+  source (they are honest cross-repo credits, not build-time links);
+  what changed is the manifest line and the dead constant.
 - **Not even requested at the cap layer:** `caps.decl`'s `requires:`
-  block lists five KINDs and `KIND_ELEVATE_CHANNEL` is not among them.
-  The shell does not hold the cap, so it could not call the broker even
-  if it linked the client.
+  block lists five KINDs and `KIND_ELEVATE_CHANNEL` was not among them.
+  The shell did not hold the cap, so it could not have called the
+  broker even if it linked the client.
 
-So "mirrors, doesn't link" means, exactly: *one unused ordinal constant
-copied from the kernel, a manifest line reserving a version range, and
-three comments admiring the library's stub idiom.* A `.pds` script
-saying `requires: elevate` today would parse (`Pds` counts the pragma)
-and then be silently ignored — there is no consumer of the parsed
-capability list at all.
-
-ENH-009 forces the choice: either genuinely link the client and request
-`KIND_ELEVATE_CHANNEL` for privileged command paths, or drop the
-manifest dependency and the dead constant. Carrying a declared
-dependency that is never linked is a supply-chain claim the binary does
-not honour — and it is worse than a no-op, because `pkg` and the
-release manifest both surface `deps:` to users as a statement of what
-the program actually uses.
+**Resolution — #36 dropped it (path b).** The link path would have
+required, in one PR: (i) `caps.decl` to add `KIND_ELEVATE_CHANNEL(...)`
+so the cap-manifest verify at exec sees the request, (ii) a real
+`libpdx-elevate` client call on the privileged command path, and (iii)
+`Pds`'s parsed `requires: elevate` list to actually request elevation
+with a refusal path returning exit 4 (capability denied) per the
+README exit-code table. None of that infrastructure exists downstream
+of `Pds` today (the parsed capability list has no consumer at all);
+landing the link path meant designing the consumer end-to-end first.
+The drop landed instead: the `- libpdx-elevate @ ^0.2` line was
+removed from `manifest.pdxproj`, `pub let SH_KIND_ELEVATE_CHANNEL`
+was removed from `src/shell.pdx` (with an in-place note explaining
+the drop), `README.md`'s dependency list was refreshed to say elevate
+integration is out of scope until a consumer is scoped, and
+`design/architecture.md` §2.1 + §5's disjoint-bands paragraph were
+updated in step. When a real privileged `.pds` consumer is specified,
+re-add the dep, the KIND request, and the ordinal mirror together in
+the same PR — a re-sign round is cheap next to the supply-chain
+misrepresentation of a phantom link.
 
 ---
 
@@ -380,7 +391,7 @@ Milestone: **`v2.0 — real exec substrate`** (milestone #8).
 | ENH-006 | #33 | `Shell::shell_main` entry frame + REPL | 4 | #29, #30, #31, #32 | L |
 | ENH-007 | #34 | `line_reader.pdx` de-stub | 5 | #28, #33 | M |
 | ENH-008 | #35 | `history.pdx` de-stub (PdxFS write) | 5 | #28, #34 | M |
-| ENH-009 | #36 | `libpdx-elevate`: link it or drop it | 5 | #28, #32 | M |
+| ENH-009 | #36 | `libpdx-elevate`: link it or drop it (**LANDED — dropped**) | 5 | #28, #32 | M |
 | ENH-010 | #37 | Walk back the v1.0.0 claim | 6 | none | S |
 | ENH-011 | #38 | Correct + sequence the open R66/R73 issues | 6 | none | S |
 

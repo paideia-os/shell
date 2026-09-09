@@ -4,6 +4,69 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — ENH-009 (#36): drop `libpdx-elevate` (link-or-drop → drop)
+
+Removes the `libpdx-elevate @ ^0.2` manifest dependency, its
+mirrored `SH_KIND_ELEVATE_CHANNEL` constant, and the associated
+docs prose. The dep was declared as "reserved for a future
+`.pds requires: elevate` consumer" but no such consumer existed
+in the tree: `caps.decl`'s `requires:` block does not name
+`KIND_ELEVATE_CHANNEL`, no `elevate_client_*` symbol is called
+anywhere in `src/` or `tests/`, and `Pds`'s parsed `requires:`
+list has no reader. Carrying a declared dependency the binary
+never links is a supply-chain claim `pkg` and the release
+manifest would surface to users; the drop honours the artifact
+instead. When a real privileged `.pds` path is scoped end-to-end
+(broker call site, refusal exit 4 per the exit-code table, and
+the caps.decl request), re-add the dep, the ordinal mirror, and
+the caps.decl line in a single paired PR. See
+`design/enhancement-plan.md` §5.
+
+### Removed
+
+- `manifest.pdxproj` `- libpdx-elevate @ ^0.2` deps line. The
+  paragraph above the `deps:` block now records the drop and the
+  re-add contract instead of the "reserved" rationale.
+- `src/shell.pdx` `pub let SH_KIND_ELEVATE_CHANNEL : u64 = 0x191`
+  and the `SH_KIND_ELEVATE_CHANNEL` line in the KIND-mirror
+  comment. An in-place note in the same comment block explains
+  the drop and the re-add contract so a future reader sees why
+  0x191 is absent.
+
+### Changed
+
+- `src/shell.pdx` SCOPE prose — the "same reason libpdx-elevate
+  mirrors ELV_*" attribution is replaced with the libpdx-cap
+  RIGHTS_* precedent (the actual mirror discipline the shell
+  follows). The disjoint-error-band paragraph keeps
+  libpdx-elevate's `0xFFFFEAxx` window named as a placement
+  anchor -- so re-adding elevate later cannot collide -- but
+  frames it as historical.
+- `README.md` "Dependency chain" section -- the additional-deps
+  paragraph no longer lists `libpdx-elevate`, and a new
+  paragraph states elevate integration is out of scope until a
+  privileged `.pds` consumer is scoped end-to-end.
+- `design/architecture.md` §2.1 (KIND ordinal mirrors bullet)
+  and §5 (band-placement paragraph) refreshed in step with the
+  source drop; the mirror bullet drops
+  `SH_KIND_ELEVATE_CHANNEL = 0x191` from the enumerated list and
+  records the ENH-009 drop.
+- `design/enhancement-plan.md` §5 rewritten from "forces the
+  choice" to "resolution — dropped", with the historical
+  problem statement preserved for provenance; the roadmap table
+  row for ENH-009 marks the issue as landed.
+- `tests/test_caps_narrow.pdx` matrix-scope comment -- the
+  stale `TCN_KIND_ELEVATE = 0x191` mirror line is removed and
+  the "matrix does not touch KIND_ELEVATE_CHANNEL" paragraph now
+  cites the ENH-009 drop as the reason no in-tree ordinal
+  exists for the matrix to reference.
+
+### Unblocks
+
+- The release-manifest `deps:` block now reflects the symbols
+  the binary actually resolves. `pkg` output no longer
+  overstates the shell's runtime surface.
+
 ## Unreleased — Syscall floor extension: sys_yield (#47)
 
 Extends ENH-001's `Syscall` module with `SYS_YIELD = 5` + a

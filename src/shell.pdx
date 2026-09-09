@@ -10,15 +10,18 @@
 //
 //   * KIND ordinal mirrors (SH_KIND_*) so shell modules do not need to
 //     link paideia-os's kernel .o graph to name the KINDs the shell
-//     handles. Redeclared here for the same reason libpdx-elevate
-//     mirrors ELV_* -- the M4 smoke matrix catches any drift between
-//     the mirrored values here and the authoritative kernel values.
+//     handles. Same mirror discipline libpdx-cap uses for RIGHTS_* --
+//     the M4 smoke matrix catches any drift between the mirrored
+//     values here and the authoritative kernel values.
 //
 //   * The shell's error band (SH_* 0xFFFFECxx). Disjoint from the
-//     libpdx-cap band (0xFFFFFFxx), the libpdx-elevate band
-//     (0xFFFFEAxx / 0xFFFFE5Exx), and the kernel errno band
+//     libpdx-cap band (0xFFFFFFxx) and the kernel errno band
 //     (-EFAULT = 0xFFFFFFFFFFFFFFF2 ...). The high two bytes of the
-//     return tell a downstream consumer which layer refused.
+//     return tell a downstream consumer which layer refused. (The
+//     libpdx-elevate band 0xFFFFEAxx was previously named here as a
+//     disjointness anchor; ENH-009 (#36) dropped that dependency,
+//     but the shell band's placement inside the 0xFFFFECxx window
+//     stays chosen so re-adding elevate later does not collide.)
 //
 //   * An eight-slot _shell_stats counter table with bounded increment
 //     + bounded read (shell_note, shell_stat). Same shape as
@@ -68,7 +71,6 @@ module Shell = structure {
   // Mirror the authoritative values in paideia-os:
   //   SH_KIND_IPC_ENDPOINT      src/kernel/core/cap/kind.pdx:72
   //   SH_KIND_USER              src/kernel/core/cap/kind_user.pdx:122
-  //   SH_KIND_ELEVATE_CHANNEL   src/kernel/core/cap/kind_elevate_channel.pdx:80
   //   SH_KIND_PDXFS_FILE        src/kernel/core/cap/kind_pdxfs_file.pdx:82
   //   SH_KIND_SHELL_SESSION     allocated at shell.M2-001 (derived over USER)
   //   SH_KIND_TTY               placeholder ordinal 0x196 -- reserved for
@@ -82,10 +84,17 @@ module Shell = structure {
   //                             pins the real ordinal at the KIND_TTY
   //                             substrate PR; a mismatch is caught at
   //                             M4 by the smoke matrix.
+  //
+  // KIND_ELEVATE_CHANNEL (0x191, paideia-os
+  // src/kernel/core/cap/kind_elevate_channel.pdx:80) was previously
+  // mirrored here as `SH_KIND_ELEVATE_CHANNEL`. ENH-009 (#36) dropped
+  // the mirror -- caps.decl does not request the KIND and no in-tree
+  // caller reads it. A future privileged `.pds` path re-adds the
+  // ordinal in the same PR that lands the caps.decl request and the
+  // libpdx-elevate consumer inside `Pds`.
   // ==========================================================================
   pub let SH_KIND_IPC_ENDPOINT    : u64 = 5
   pub let SH_KIND_USER            : u64 = 0x190
-  pub let SH_KIND_ELEVATE_CHANNEL : u64 = 0x191
   pub let SH_KIND_SHELL_SESSION   : u64 = 0x194
   pub let SH_KIND_PDXFS_FILE      : u64 = 0x195
   pub let SH_KIND_TTY             : u64 = 0x196    // provisional, pin at substrate PR

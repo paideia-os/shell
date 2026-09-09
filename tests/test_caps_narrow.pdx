@@ -80,15 +80,19 @@
 // KIND ordinals used in the matrix (mirror of shell.pdx SH_KIND_*):
 //
 //   TCN_KIND_USER          = 0x190
-//   TCN_KIND_ELEVATE       = 0x191
 //   TCN_KIND_SHELL_SESSION = 0x194
 //   TCN_KIND_PDXFS_FILE    = 0x195
 //   TCN_KIND_TTY           = 0x196  (provisional; see caps.decl note)
 //   TCN_KIND_IPC_ENDPOINT  = 5
 //
-// The matrix does not touch KIND_ELEVATE_CHANNEL because the shell
+// The matrix does not name `KIND_ELEVATE_CHANNEL` (0x191). The shell
 // never delegates that cap to a child (elevate is client-to-broker
-// only; children go through libpdx-elevate to re-request).
+// only; children re-request via a broker path), and ENH-009 (#36)
+// dropped the shell's mirror of the ordinal in step with dropping
+// the `libpdx-elevate` manifest dep -- caps.decl does not request
+// the KIND, and no in-tree caller reads it. A future privileged
+// `.pds` consumer re-adds the ordinal (and the caps.decl request,
+// and this matrix's coverage) in the same PR.
 //
 // =============================================================================
 // RETURN CODES

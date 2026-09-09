@@ -56,17 +56,26 @@ sources:
 # (M2-003). libpdx-semantic-pipe provides the schema envelope helpers the
 # passthrough / completion modules rely on at M3. libpdx-audit provides the
 # audit_begin / audit_commit pair that CommandRecord wraps at M3-003.
-# libpdx-argv is used by pds.pdx to parse the .pds shebang line. libpdx-
-# elevate is reserved -- shell does not currently request elevated caps at
-# session start; if a future .pds asks for one via `requires: elevate`,
-# the dependency is already in the manifest so no re-signing round is
-# needed to add it.
+# libpdx-argv is used by pds.pdx to parse the .pds shebang line.
+#
+# libpdx-elevate was previously declared here as a "reserved" future dep
+# for `.pds` scripts asking `requires: elevate`. ENH-009 (#36) dropped it:
+# there was no consumer -- caps.decl did not request KIND_ELEVATE_CHANNEL,
+# no `elevate_client_*` symbol was called anywhere in the tree, and
+# `Pds`'s parsed `requires:` list had no in-tree reader. A declared
+# dependency the binary never links is a supply-chain claim `pkg` and the
+# release manifest would surface to users; carrying the line was worse
+# than a no-op. When a consumer path (privileged .pds → broker → refusal
+# exit 4) is scoped and specified end-to-end, re-add it in a paired PR
+# that also lands the KIND_ELEVATE_CHANNEL request in caps.decl and the
+# Pds consumer -- a re-sign round at that point is cheap next to the
+# supply-chain misrepresentation of a phantom link. See
+# design/enhancement-plan.md §5.
 deps:
   - libpdx-argv @ ^0.2
   - libpdx-cap @ ^0.3            # M2-003: cap-narrowing check at exec
   - libpdx-semantic-pipe @ ^0.2  # M3-001 + M3-002: passthrough + completion
   - libpdx-audit @ ^0.2          # M3-003: command_record_begin/close pair
-  - libpdx-elevate @ ^0.2        # M5 reserved: .pds `requires: elevate` future
 
 # --- Test targets ------------------------------------------------------
 # Test binaries built with `paideia-as build --tests`. The release lint

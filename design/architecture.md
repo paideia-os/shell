@@ -126,16 +126,21 @@ The Shell module owns:
 - **KIND ordinal mirrors.** The kernel's KIND ordinals the shell talks
   about (`SH_KIND_USER = 0x190`, `SH_KIND_IPC_ENDPOINT = 5`,
   `SH_KIND_SHELL_SESSION = 0x194`, `SH_KIND_PDXFS_FILE = 0x195`,
-  `SH_KIND_ELEVATE_CHANNEL = 0x191`). Redeclared here for the same
-  reason libpdx-elevate mirrors ELV_* — the shell repo is not
-  obligated to link paideia-os's kernel .o graph at build time. A
-  drift caught by the M4 smoke matrix; the `SH_` prefix documents the
-  mirror invariant.
+  `SH_KIND_TTY = 0x196`). Redeclared here so the shell repo is not
+  obligated to link paideia-os's kernel .o graph at build time; drift
+  is caught by the M4 smoke matrix, and the `SH_` prefix documents the
+  mirror invariant. `SH_KIND_ELEVATE_CHANNEL = 0x191` was previously
+  mirrored here; ENH-009 (#36) dropped it in lockstep with the
+  `libpdx-elevate` manifest dep, because nothing in the shell reads
+  the ordinal and `caps.decl` does not request the KIND. Re-add both
+  in the same PR that lands a real privileged `.pds` consumer.
 - **Return-code band `0xFFFFECxx`.** The shell's own error-code family,
   disjoint from the underlying kernel's syscall errno family
   (`-EFAULT = 0xFFFFFFFFFFFFFFF2` etc.) and from the R49 shared
-  libraries' bands (libpdx-cap 0xFFFFFFxx, libpdx-elevate 0xFFFFEAxx,
-  libpdx-audit TBD). See §5 for the full table.
+  libraries' bands (libpdx-cap 0xFFFFFFxx, libpdx-audit TBD). The
+  window's placement stays chosen so libpdx-elevate's
+  `0xFFFFEA00..0xFFFFEA0F` band does not collide if a future PR
+  re-adds the dep (ENH-009 (#36) drop). See §5 for the full table.
 - **Session-level `.bss` singleton.** An 8-slot stats counter table
   (`_shell_stats`), cache-line aligned, mirrors the shape of
   `ElevateBroker._elevate_broker_stats` and libpdx-cap's own singletons
@@ -1561,8 +1566,9 @@ the smoke matrix pulls both sides into one build.
 sit between CMDR and LX; see the M5 sections above for their full
 tables.)
 
-The band sits below libpdx-elevate's `0xFFFFEA00..0xFFFFEA0F` and
-above libpdx-cap's `0xFFFFFFxx` so a downstream consumer can tell
+The band sits above libpdx-cap's `0xFFFFFFxx` (and clear of
+libpdx-elevate's `0xFFFFEA00..0xFFFFEA0F` window, kept reserved
+across the ENH-009 (#36) drop) so a downstream consumer can tell
 which layer refused the operation from the high two bytes of the
 return alone.
 

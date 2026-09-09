@@ -81,9 +81,16 @@ infra) can move code in without setup friction.
   reuses the same parser for `-c` and script-arg extraction.
 
 Additional dependencies (libpdx-cap, libpdx-audit,
-libpdx-semantic-pipe, libpdx-elevate) are declared in
-`manifest.pdxproj` for the R49 encoder body and remain load-bearing
-under R106.
+libpdx-semantic-pipe) are declared in `manifest.pdxproj` for the R49
+encoder body and remain load-bearing under R106. `libpdx-elevate`
+was previously declared as a reserved future dep; ENH-009 (#36)
+dropped it because no consumer path existed (caps.decl did not
+request `KIND_ELEVATE_CHANNEL`, and no `elevate_client_*` symbol was
+called anywhere in the tree). Elevate integration is out of scope
+until a privileged `.pds` path is scoped end-to-end -- broker
+lookup, refusal exit code (4, per the exit-code table), and the
+paired `caps.decl` request all land in one PR with the dependency,
+not before.
 
 ## Cross-references
 
