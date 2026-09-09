@@ -66,6 +66,117 @@ the caps.decl line in a single paired PR. See
 - The release-manifest `deps:` block now reflects the symbols
   the binary actually resolves. `pkg` output no longer
   overstates the shell's runtime surface.
+## Unreleased — #39: exec-time reconciliation framing in sys_execve path (R90-XREPO.013.M2-001)
+
+Adds a NEW step (6a) to `exec_spawn_and_wait`'s parent branch,
+between successful `sys_wait4` and `command_record_close`:
+`exec_reconcile_publish(count)` publishes the child's reconciled
+cap-set count to a shell-per-job scratch (`_ex_reconciled_caps_count`)
+and emits the boot-visible fingerprint
+`SHELL RECONCILE n=<c>\n` via three `sys_write(1, ...)` calls
+(prefix + decimal count + newline). This wires the audit
+surface and the ordering that R90-XREPO.013.M2-001 requires:
+"invoke exec-time cap reconciliation for every child before
+returning control, publish the reconciled caps in the shell's
+per-job record."
+
+DEFERRED (documented in `src/exec.pdx` §DEFERRALS): the real
+user-space `sys_exec_reconcile_caps` syscall wrapper. The
+kernel-side substrate landed at paideia-os R90-XREPO.013.M0-001
+(`src/kernel/core/cap/reconcile.pdx` `cap_reconcile_at_exec`)
+as a kernel-internal function; its SC+ ID for the user-space
+wrapper is not yet allocated. When it lands, only the body of
+`exec_reconcile_publish` gains a `call sys_exec_reconcile_caps`
+between the publish and the fingerprint -- the call site in
+`exec_spawn_and_wait`, the publish slot, and the fingerprint
+shape all stay identical. The count published today equals the
+`child_decl_count` from step (2) (0 under the ENH-005
+placeholder inputs); when the parent-cap materialiser + real
+`caps.decl` parser land, the count reflects the kernel-narrowed
+cap-set the child actually received.
+
+Refs paideia-os/shell#39; sub-issue of paideia-os/paideia-os#2002
+(R90-XREPO.013 exec-time cap reconciliation adoption campaign).
+
+### Added
+
+- `src/exec.pdx` `EX_ERR_RECONCILE_FAIL : u64 = 0xFFFFEC2A` --
+  new 0xFFFFEC2x sub-band sentinel reserved for a non-zero
+  return from `exec_reconcile_publish`. Unreachable today (the
+  stub cannot fail); named for the future real-syscall landing
+  so callers may compile their reject branch against a stable
+  name without waiting on the substrate flip. Same close-then-
+  return discipline as `EX_ERR_WAIT_FAIL`: the audit record was
+  OPENed at step (4) and must be CLOSEd (exit=127) before
+  returning the sentinel to avoid an orphan OPEN in the audit
+  journal.
+
+- `src/exec.pdx` `_ex_reconciled_caps_count : u64` -- per-job
+  publish slot for the shell's reconciled cap-set count. Exposed
+  as `pub let mut` so downstream consumers (a future
+  `audit_commit` variant, R90-XREPO.013.M4-* boot smoke asserts)
+  can read it without wiring another cross-repo channel.
+
+- `src/exec.pdx` `_ex_fp_reconcile_scratch : [u8; 24]`,
+  `ex_fp_reconcile_str : [u8; 19] = "SHELL RECONCILE n=\0"`,
+  `EX_FP_RECONCILE_LEN : u64 = 18` -- fingerprint literals for
+  the parent-visible `SHELL RECONCILE n=<c>\n` emission. Scratch
+  sized identically to `_ex_fp_pid_scratch` (24 bytes = 20
+  digit-max + 4-byte 16-B align pad); the paideia-as fingerprint-
+  string N-rule (N = strlen + 1 for the trailing NUL) gives
+  N=19 for the 18-byte prefix.
+
+- `src/exec.pdx` `exec_reconcile_publish : (u64) -> u64 !{mem,
+  sysreg} @{fs}` -- publishes count to `_ex_reconciled_caps_count`
+  and emits the three-part fingerprint. 2-push (rbx, r12) +
+  `sub rsp, 8` = 24 bytes prologue; rsp % 16 == 0 at every
+  nested SysV call. r12 carries `count` across `sys_write` +
+  `history_format_u64_dec` so the .bss store and the fingerprint
+  read the same value. Labels prefixed `ex_rp_`. Returns 0
+  unconditionally today (reserved for a genuine kernel-OOM
+  return path when the real `sys_exec_reconcile_caps` lands).
+
+### Changed
+
+- `src/exec.pdx` `exec_spawn_and_wait` parent branch --
+  insert step (6a) between wait4 success and command_record_close:
+  `xor rdi, rdi; call exec_reconcile_publish; cmp rax, 0; jne
+  ex_sw_reconcile_fail`. r15 (child exit code) survives the
+  publish call per SysV callee-save (both `sys_write` and
+  `history_format_u64_dec` preserve r15).
+
+- `src/exec.pdx` `exec_spawn_and_wait` -- add
+  `ex_sw_reconcile_fail` reject arm: close audit with exit=127,
+  bump `SH_ST_ERRORS`, return `EX_ERR_RECONCILE_FAIL`. Matches
+  the `ex_sw_wait_fail` discipline for orphan-OPEN avoidance.
+
+- `src/exec.pdx` §M2 CALL GRAPH doc block -- add step (6a);
+  §DEFERRALS -- add "real `sys_exec_reconcile_caps` syscall
+  wiring"; sentinel enumeration -- extend 0xFFFFEC2x range to
+  0xFFFFEC2A.
+
+### Unblocks
+
+- R90-XREPO.013.M3-* (per-tool caps.decl adoption for ls / cat /
+  cp / mv / rm / mkdir / doc): the parent-visible fingerprint
+  is now emitted for every child, so a per-tool test can grep
+  for `SHELL RECONCILE n=<expected>` on the QEMU boot log once
+  the shell is wired into `bin_seeds.pdx`.
+
+### Notes
+
+- No new `test` mnemonics; every zero-check uses `cmp reg, 0`
+  per paideia-as reserved discipline.
+- `and rax, 0xFF` (existing) fits imm32 <= 0x7FFFFFFF; no new
+  large-immediate `and` forms introduced (the pitfall
+  `and r11, imm64` is not exercised).
+- Fingerprint string N-rule verified: `"SHELL RECONCILE n="`
+  strlen = 18, N = 19.
+- `_ex_fp_reconcile_scratch` kept separate from
+  `_ex_fp_pid_scratch` even though the two runs never overlap
+  in time -- future concurrent-child work will require distinct
+  per-fingerprint scratches, and separating them now is free
+  (24 bytes .bss).
 
 ## Unreleased — Syscall floor extension: sys_yield (#47)
 
