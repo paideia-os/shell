@@ -40,9 +40,12 @@ ELF entry (`Shell::shell_main`, per `manifest.pdxproj`) calls in order:
 - `Exec` (`src/exec.pdx`) — the exec path. `exec_spawn_and_wait(pool,
   bytes, argc) → u64` marshals argv from the parser's pool slice,
   narrows the child's cap set against the parent's, opens an audit
-  record BEFORE `sys_execve`, then blocks on `sys_wait4`. Real at
-  ENH-005 (#32); the sole substrate-scope gap remaining is the
-  fork-vs-execve pattern (see the module's §FORK GAP note).
+  record BEFORE `sys_fork`, then splits into a child branch that
+  calls `sys_execve` (and `sys_exit(127)` on failure) and a parent
+  branch that emits the `SHELL FORK OK pid=<n>` fingerprint,
+  `sys_wait4`s on the specific child pid, and closes the audit
+  record. Real at ENH-005 (#32) + shell#44 (fork retirement); the
+  §FORK GAP is retired.
 - `Lexer` / `Parser` / `Dispatch` / `Builtins` (`src/lexer.pdx` /
   `src/parser.pdx` / `src/dispatch.pdx` / `src/builtins.pdx`) —
   landed at ENH-002..ENH-004 (#29 / #30 / #31). Together they consume
@@ -1058,39 +1061,72 @@ body top-to-bottom sees each step in the same order as this doc.
    `audit_id` is a placeholder (`1`); `ts_begin_ns` is `0`. Both
    wire to libpdx-audit / `sys_clock_monotonic` when those
    substrates land.
+4a. **`sys_fork`** (shell#44). Splits the shell into parent + child.
+   Three arms:
+
+   - `rax < 0` (signed): fork failed (kernel OOM). Parent-side only.
+     Close audit with `exit=127`, bump SH_ST_ERRORS, return
+     `EX_ERR_FORK_FAIL` (0xFFFFEC29).
+   - `rax == 0`: this task is the CHILD. Fall through to (5)
+     `sys_execve` on the same argv. On execve failure the child
+     `sys_exit(127)` so the parent's `wait4` observes the POSIX
+     "command not found" exit code. The child MUST NOT touch the
+     audit record (its aspace is a cow-copy of the parent's) and
+     MUST NOT restore the callee-save prologue (`sys_exit` never
+     returns and neither does a successful `execve`).
+   - `rax > 0`: this task is the PARENT with the child pid in
+     `rax`. Stash the pid in `rbx`, emit the
+     `SHELL FORK OK pid=<n>\n` fingerprint via three
+     `sys_write(1, ...)` calls (prefix, decimal pid rendered via
+     `history_format_u64_dec`, newline), then continue to (6)
+     `sys_wait4(pid=child_pid, ...)`.
+
 5. **`sys_execve(path, _ex_argv_ptrs, envp=NULL)`**. `envp=NULL`
-   per D5 (no env-var leak to children). On success, `sys_execve`
-   never returns (kernel replaces the shell image). On failure,
-   returns a negative errno; the audit record is closed with
-   exit=127 before `EX_ERR_EXECVE_FAIL` is returned.
-6. **`sys_wait4(pid=-1, &_ex_wstatus, 0, 0)`**. Reaps the child;
-   `wstatus` low byte is the exit code per the M2 doc. Under the
-   current syscall floor (no `sys_fork`; see §4.3.FORK GAP below)
-   this call is structurally reachable only if `sys_execve`
-   returned failure, at which point `sys_wait4` will typically also
-   fail (`-ECHILD`); kept per the M2 CALL GRAPH ordering so a
-   future `sys_fork` insertion is a one-line change.
-7. **`command_record_close(exit_code)`**. CLOSED flag set;
-   HAS_ERROR set iff `exit_code != 0`. On any failure above, close
-   with `exit=127` so the audit journal never carries an orphaned
-   OPEN record.
+   per D5 (no env-var leak to children). CHILD-BRANCH ONLY after
+   shell#44 — the parent skips (5). On success, `sys_execve` never
+   returns (kernel replaces the child image). On failure the child
+   `sys_exit(127)`; the parent's `wait4` surfaces exit code 127.
+   The pre-shell#44 `EX_ERR_EXECVE_FAIL` parent-visible sentinel is
+   superseded by the child's exit-code surface for that failure
+   mode; the constant is retained for the old-decoder compat window.
+6. **`sys_wait4(pid=child_pid, &_ex_wstatus, 0, 0)`**. PARENT-BRANCH
+   ONLY after shell#44. Reaps the specific child forked at (4a);
+   `wstatus` low byte is the exit code per the M2 doc. Waiting on
+   the known pid narrows the reap window and future-proofs the body
+   for concurrent children when the pipeline shape lands. Refusal
+   (negative errno) maps to `EX_ERR_WAIT_FAIL` with an `exit=127`
+   audit close before returning.
+7. **`command_record_close(exit_code)`**. PARENT-BRANCH ONLY. CLOSED
+   flag set; HAS_ERROR set iff `exit_code != 0`. On any failure
+   above (fork fail, wait fail), close with `exit=127` so the audit
+   journal never carries an orphaned OPEN record.
 
-#### 4.3.FORK GAP
+#### 4.3.FORK GAP — RETIRED at shell#44
 
-A correct fork+execve+wait pattern requires `sys_fork` (SC+ 56),
-which the ENH-001 Syscall floor deliberately did not expose (the
-enhancement-plan §4 Stage 0 enumeration lists only the 9 sysnos the
-shell v2.0 plan consumes; fork was not enumerated). ENH-005 lands
-the ordered sequence as the doc specifies; runtime semantics under
-the current syscall floor: `sys_execve` either succeeds (never
-returns; shell becomes child) or fails (returns errno; audit close +
-`EX_ERR_EXECVE_FAIL`). `sys_wait4` is only reached if `sys_execve`
-returned failure. A future ENH that adds `sys_fork` makes `sys_wait4`
-meaningful without touching the ordered sequence in the body.
+Historical note: through ENH-005 (paideia-os/shell#32) this body
+executed the ordered sequence WITHOUT a fork, so `sys_execve` either
+succeeded (never returned; shell became child) or failed (returned
+errno; audit close + `EX_ERR_EXECVE_FAIL`). `sys_wait4` was
+structurally reachable only via the execve-failure edge and
+typically returned `-ECHILD`; the "no child to wait for" outcome was
+documented in the original §FORK GAP block that this section
+supersedes.
 
-The D3 property (audit-first, durable-before-child) is fully
-enforced today: `command_record_begin` runs BEFORE `sys_execve`, and
-no reject path skips it. That is the invariant the test suite
+shell#44 makes `wait4` meaningful. The kernel-side `sys_fork` body
+has been live since paideia-os R15-M6-003 (#554) with the
+R17-M0-724-D6 child-materialisation completion; the shell repo's
+ENH-001 Syscall floor deliberately omitted the wrapper because the
+ENH-005 spawn path did not need it. shell#44 adds SC+ 56 to the
+Syscall floor, splits `exec_spawn_and_wait` into `fork → parent-wait
+/ child-exec`, and emits a boot-smoke-observable fingerprint on the
+parent's timeline between fork and wait4.
+
+The D3 property (audit-first, durable-before-child) is STRONGER
+after shell#44 than before: `command_record_begin` runs BEFORE
+`sys_fork` so the audit record exists in the parent's aspace before
+the child even exists as a task — a reader replaying the audit
+journal sees the OPEN record with a timestamp strictly before the
+child's first schedule. That is the invariant the test suite
 falsifies.
 
 #### 4.3 pipeline

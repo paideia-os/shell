@@ -28,6 +28,19 @@
 //      the shim shape by exercising `sys_getcwd` + `sys_write` when
 //      run against a live kernel.
 //
+// shell#44 addendum: the floor grew from nine to ten wrappers with the
+// addition of SC+ 56 (sys_fork). The ENH-001 enumeration deliberately
+// omitted fork; ENH-005 landed a "sys_execve replaces the shell"
+// degenerate exec path with a documented §FORK GAP that shell#44
+// retires by adding the fork wrapper here and making
+// `exec_spawn_and_wait` fork-before-exec (child branch execs; parent
+// branch waits + closes the audit record). The kernel-side fork body
+// has been live since R15-M6-003 (paideia-os #554) with the R17-M0-724
+// enqueue completion; see paideia-os `src/kernel/core/syscall/handlers/
+// sys_fork.pdx` for the ground truth. The wrapper here matches the
+// monorepo canonical shim (paideia-os `src/user/syscall_shim.pdx`
+// `sys_fork`) byte-for-byte in its syscall body.
+//
 // =============================================================================
 // DESIGN DECISION: shared module (not inlined per callsite)
 // =============================================================================
@@ -115,14 +128,16 @@ module Syscall = structure {
   // authoritative table lives at `design/user/syscall-table.md`
   // (paideia-os).
   //
-  // The shell needs the following ten (originally nine per
-  // `design/enhancement-plan.md` §4 Stage 0; extended at shell#47 with
+  // The shell needs the following eleven wrappers (originally nine per
+  // `design/enhancement-plan.md` §4 Stage 0; extended at shell#44 with
+  // SYS_FORK = 56 for the fork-before-exec landing, and at shell#47 with
   // SYS_YIELD = 5 for the KIND_TTY(read) seam's yield-and-retry loop):
   //   0   read     (line_reader: byte-at-a-time TTY read; ENH-007)
   //   1   write    (line_reader: prompt echo, `write` builtin; ENH-007)
   //   2   open     (path-search for exec, `.pds` script open; ENH-005)
   //   3   close    (exec cleanup, `.pds` script close; ENH-005)
   //   5   yield    (line_reader: TTY_READ_EMPTY busy-poll; #47 -> #46)
+  //   56  fork     (exec: split parent+child before execve; shell#44)
   //   59  execve   (exec: replace child image with argv[0]; ENH-005)
   //   60  exit     (Shell::shell_main normal termination; ENH-006)
   //   61  wait4    (exec: block on child exit code; ENH-005)
@@ -153,6 +168,7 @@ module Syscall = structure {
   pub let SYS_OPEN    : u64 = 2
   pub let SYS_CLOSE   : u64 = 3
   pub let SYS_YIELD   : u64 = 5
+  pub let SYS_FORK    : u64 = 56
   pub let SYS_EXECVE  : u64 = 59
   pub let SYS_EXIT    : u64 = 60
   pub let SYS_WAIT4   : u64 = 61
@@ -272,6 +288,62 @@ module Syscall = structure {
       justification: "shell.ENH-001 extension (#47): SC+ ID 5 wrapper. Arity 0 -- no SysV args, no arg shuffle. Kernel body at paideia-os src/kernel/core/sched/yield.pdx `sched_yield` (landed R10-m3-002 / R9-m3-003 refactor); the kernel-side dispatcher arm for sysno 5 is expected to land alongside shell#46's KIND_TTY(read) seam migration so the wrapper's first in-tree caller (the TTY_READ_EMPTY yield-and-retry loop inside `lr_read_one_byte`) exercises a real handler. Effect and capability set match the R13 legacy sys_yield ({sysreg} + @{sched}) and the kernel-side KIND_SCHED_CTX OP_YIELD posture (paideia-os src/kernel/core/cap/kind_sched.pdx `kind_sched_invoke`): sysreg for SYSCALL itself, @{sched} because the handler tail-calls into sched_pick_next / sched_switch. No `mem` effect -- yield touches no user memory. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless to the wrapper's siblings). Provenance for SC+ ID 5: design/architecture.md §3.3 (this repo) names sys_yield at ID 5 as the standard hook for the KIND_TTY(read) seam's blocking-read contract preservation; paideia-os design/user/syscall-table.md carries no row at ID 5 today, so #47 reserves the shell-visible slot ahead of the kernel dispatch wiring (matches ENH-001's floor-first / consumer-later staging pattern -- see sibling sys_execve/sys_wait4 landing which preceded ENH-005's exec-path caller by one issue).",
       block: {
         mov rax, 5;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_fork() -> u64  (shell#44)
+  //
+  // Split the calling task into parent+child. Returns:
+  //   parent:  child pid (u32 zero-extended to u64, > 0)
+  //   child:   0
+  //   either:  a negative errno on failure (-EAGAIN if the pid pool /
+  //            aspace_create ran out; -ENOMEM if the copy-on-write
+  //            page-table clone OOM'd)
+  //
+  // Arity 0 -- no SysV -> SYSCALL argument shuffle. Kernel body at
+  // paideia-os `src/kernel/core/syscall/handlers/sys_fork.pdx`:
+  // `sys_fork_body` produces the child slab via task_new + aspace_clone
+  // _cow + fd_table copy, materialises the child's ring-3 landing (task
+  // state, rip/rsp/rflags snapshotted from the parent's syscall frame),
+  // then runq_enqueues the child. The kernel materialises the child's
+  // return value (0 in rax) at `sys_fork_child_landing` on the child's
+  // first schedule -- the wrapper here is agnostic to which side it
+  // returns to; the value in rax discriminates.
+  //
+  // Effect / capability set matches paideia-os syscall_shim.pdx
+  // sys_fork: {mem, sysreg} + @{sched, mem}. `mem` because the copy-on-
+  // write clone touches every reachable user PTE (page-table walk on
+  // the parent's aspace + install on the child's aspace); `sysreg` for
+  // the SYSCALL instruction; @{sched} because the child is enqueued on
+  // the runqueue; @{mem} because the aspace is duplicated. `fs` is NOT
+  // in the cap set -- the fd table is copied but no VFS walk is issued
+  // by fork itself; the fd inheritance-hold is a refcount++ on
+  // already-open vnodes.
+  //
+  // Sole shell consumer as of shell#44: exec_spawn_and_wait's fork-
+  // before-exec head. Splitting execve into fork+execve (POSIX shape)
+  // is what makes sys_wait4 structurally reachable on the parent
+  // timeline; prior to this landing the shell's exec path was a
+  // degenerate "sys_execve replaces the shell process itself" pattern
+  // (see the retired §FORK GAP block in src/exec.pdx). Leaf function.
+  //
+  // Return-value shape gotcha: the kernel writes the child's pid to
+  // BOTH rax (parent-visible) AND rdx (companion slot per the fork
+  // return-value convention that paideia-os follows -- rax has the pid
+  // for the parent, rdx has 0 as a marker). The wrapper does not need
+  // to consume rdx; it returns rax to its SysV caller as a u64. A
+  // caller that wants to discriminate parent from child in constant
+  // time can compare rax against 0 (child) vs > 0 (parent).
+  // ==========================================================================
+  pub let sys_fork : () -> u64 !{mem, sysreg} @{sched, mem} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem},
+      justification: "shell#44: SC+ ID 56 wrapper. Arity 0 -- no arg shuffle. Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_fork.pdx (landed R15-M6-003 #554; child-schedule materialisation R17-M0-724-D6 #724). Return convention: parent gets child pid in rax (u32 zero-extended); child gets 0 in rax (materialised by sys_fork_child_landing on the child's first schedule); either side gets a negative errno (-EAGAIN 0xFFFFFFFFFFFFFFF5 on pid-pool/aspace_create OOM; -ENOMEM 0xFFFFFFFFFFFFFFF4 on cow-clone leaf OOM). Effect + capability set matches paideia-os syscall_shim.pdx sys_fork byte-for-byte: {mem, sysreg} for the SYSCALL + the copy-on-write PTE walk; @{sched, mem} for runqueue enqueue + aspace duplication. `fs` deliberately absent -- fork copies the fd table (32 qwords) and refcount-holds the inherited vnodes but issues no VFS walk. Sole shell consumer at shell#44: exec_spawn_and_wait's fork-before-exec head (retires the ENH-005 §FORK GAP by making sys_wait4 structurally reachable on the parent timeline; child branch execs, parent branch waits + closes the audit record). Leaf function; syscall clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none (linear body).",
+      block: {
+        mov rax, 56;
         syscall;
         ret
       }

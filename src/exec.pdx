@@ -8,24 +8,29 @@
 //
 // The shell's exec path. Through v1.0.0 exec_spawn_and_wait was a
 // gate-and-stub (returned EX_STUB after argv validation). ENH-005
-// (paideia-os/shell#32) replaces that tail with the real 7-step
+// (paideia-os/shell#32) replaced that tail with the real 7-step
 // sequence the module's own §"M2 CALL GRAPH" (below) has documented
-// since M1. The shell now calls sys_execve, blocks on sys_wait4, and
-// returns the child's exit code with a ShellCommandRecord opened
-// BEFORE exec and closed AFTER wait -- D3 audit-first as a running-
-// system property, not just an encoder property (see test_audit_first.pdx
-// for the encoder half).
+// since M1. shell#44 then closes the last substrate gap by inserting
+// sys_fork (SC+ 56) between command_record_begin and sys_execve: the
+// shell now forks BEFORE exec so the parent's timeline survives to
+// wait on the child, close the audit record, and return the child's
+// exit code to the REPL. D3 audit-first stays intact as a running-
+// system property (see test_audit_first.pdx for the encoder half of
+// the same invariant); the parent-visible fingerprint proving fork
+// worked end-to-end is a `SHELL FORK OK pid=<n>\n` emission via
+// sys_write(1) between fork and wait4 (asserted by the QEMU boot
+// smoke; see design/architecture.md §4.3 and paideia-os
+// design/roadmap/rows-4-5-6-scoping.md §4.2).
 //
-// Post-ENH-005 the shell has spawned a process. The v1.0.0 walk-back
-// ("shell has never spawned a process") is retired. STATUS.md carries
-// the historical note; the exec path is now live-substrate-ready --
-// the only remaining substrate gap is a fork wrapper (SC+ 56) which
-// the ENH-005 code does not depend on structurally (see §FORK GAP
-// below).
+// Post-shell#44 the shell is a POSIX-shaped fork/exec/wait shell.
+// The v1.0.0 walk-back ("shell has never spawned a process") and the
+// ENH-005 walk-back ("shell has spawned but never survives the spawn")
+// are both retired. STATUS.md carries the historical notes; the exec
+// path is now substrate-complete.
 //
 // =============================================================================
-// M2 CALL GRAPH (LIVE after ENH-005; see §DEFERRALS below for the two
-// remaining substrate gaps)
+// M2 CALL GRAPH (LIVE after shell#44; see §DEFERRALS below for the
+// remaining sidecar-handoff work)
 // =============================================================================
 //
 // exec_spawn_and_wait executes this ordered sequence -- the ordering
@@ -71,65 +76,88 @@
 //       lands, insert the call here between (2) and (4). See
 //       §DEFERRALS.
 //   (4) command_record_begin -- audit-first, durable BEFORE the
-//       child image is loaded. This is where D3's "every user-facing
-//       operation emits an audit record BEFORE it emits any user-
-//       visible output" becomes a property of a running system, not
-//       just of the encoder. Failure at this gate (dst too small,
-//       argv_bytes > CMDR_ARGV_MAX, audit_id 0) returns
-//       EX_ERR_AUDIT_BEGIN_FAIL and DOES NOT PROCEED TO EXEC --
-//       the child never runs if the audit trail cannot record the
-//       attempt. audit_id is a placeholder (1) at ENH-005; when
-//       libpdx-audit is linked it will be the id returned by
-//       audit_begin.
+//       fork. This is where D3's "every user-facing operation emits
+//       an audit record BEFORE it emits any user-visible output"
+//       becomes a property of a running system, not just of the
+//       encoder. Failure at this gate (dst too small, argv_bytes >
+//       CMDR_ARGV_MAX, audit_id 0) returns EX_ERR_AUDIT_BEGIN_FAIL
+//       and DOES NOT PROCEED to fork or exec -- the child never
+//       runs if the audit trail cannot record the attempt.
+//       audit_id is a placeholder (1) at ENH-005; when libpdx-audit
+//       is linked it will be the id returned by audit_begin.
+//   (4a) sys_fork (shell#44). Retires the pre-shell#44 §FORK GAP.
+//        Three return arms:
+//        - rax < 0 (signed): fork failed (kernel OOM). Parent-side
+//          only. Close the audit record with exit=127 (fork failed
+//          before child image loaded) and return EX_ERR_FORK_FAIL.
+//        - rax == 0: this task is the CHILD. Fall through to (5)
+//          sys_execve on the same argv. If execve returns (i.e.
+//          fails), the child immediately sys_exit(127) so the
+//          parent's wait4 observes the POSIX "command not found"
+//          exit code. The child MUST NOT call command_record_close
+//          -- its aspace is a copy of the parent's, so a close from
+//          the child would mutate only the child's copy and the
+//          child image is about to be discarded by execve anyway.
+//        - rax > 0: this task is the PARENT. rax is the child pid.
+//          Emit the `SHELL FORK OK pid=<n>\n` fingerprint via
+//          sys_write(1) so the QEMU boot smoke can assert fork
+//          worked end-to-end. Then fall through to (6) sys_wait4
+//          against the specific child pid.
 //   (5) sys_execve(path, argv_ptrs, envp=NULL). Frozen ABI at
 //       design/user/execve-abi.md (R62): argc in rdi, argv in rsi,
 //       envp in rdx at the child's _start. envp is NULL per D5
-//       (shell does not leak env vars to children). Refusal (a
-//       returned value; sys_execve never returns on success)
-//       routes to EX_ERR_EXECVE_FAIL with an exit=127 command_
-//       record_close before returning.
-//   (6) sys_wait4(pid=-1, wstatus, 0, 0). Reaps the child; extract
-//       exit code from wstatus low byte per §M2 (line 63 of the
-//       original doc). Refusal (negative errno) maps to
-//       EX_ERR_WAIT_FAIL. See §FORK GAP -- in the current wiring
-//       (no sys_fork available) this call is only structurally
-//       reached because sys_execve returned failure, so wait4 will
-//       typically return -ECHILD; the code path exists in the
-//       ordered sequence so a future sys_fork insertion becomes a
-//       one-line addition rather than a re-architecting of the
-//       body.
-//   (7) command_record_close(exit_code). Pairs with (4). CLOSED
-//       flag set; HAS_ERROR set iff exit_code != 0. On any failure
-//       above (execve fail, wait fail) close is called with
-//       exit=127 so the audit journal never carries an
-//       orphaned OPEN record.
+//       (shell does not leak env vars to children). CHILD-BRANCH
+//       ONLY after shell#44 -- the parent skips (5) entirely. On
+//       execve success the child image is replaced and control
+//       never returns; on failure the child sys_exit(127) so the
+//       parent's wait4 sees the exit code (127 == POSIX
+//       "command not found / not executable"). The pre-shell#44
+//       EX_ERR_EXECVE_FAIL parent-visible sentinel is superseded
+//       by the child's exit-code surface for that failure mode;
+//       the sentinel constant is retained in Shell:: for the
+//       old-decoder compat window (see shell.pdx sentinel table).
+//   (6) sys_wait4(pid=child_pid, wstatus, 0, 0). PARENT-BRANCH
+//       ONLY after shell#44. Reaps the specific child forked at
+//       (4a) (POSIX-shaped: waiting on the known pid narrows the
+//       reap window and future-proofs the body for concurrent
+//       children when the pipeline shape lands). Refusal (negative
+//       errno) maps to EX_ERR_WAIT_FAIL with an exit=127 audit
+//       close before returning.
+//   (7) command_record_close(exit_code). PARENT-BRANCH ONLY. Pairs
+//       with (4). CLOSED flag set; HAS_ERROR set iff exit_code
+//       != 0. On any failure above (fork fail, wait fail) close
+//       is called with exit=127 so the audit journal never
+//       carries an orphaned OPEN record.
 //
 // =============================================================================
-// FORK GAP (documented; not blocking ENH-005)
+// FORK: LIVE (shell#44 retirement of the ENH-005 §FORK GAP)
 // =============================================================================
 //
-// A correct fork+execve+wait pattern requires sys_fork (SC+ 56), which
-// #28's Syscall floor DELIBERATELY did not expose (the enhancement-plan
-// §4 Stage 0 enumeration lists only the 9 sysnos the shell v2.0 plan
-// consumes; fork was not enumerated). Without sys_fork, the shell
-// process IS the parent AND the would-be child -- sys_execve replaces
-// the whole shell with the target image on success, and no wait4 is
-// reachable in the parent's timeline because the parent no longer
-// exists.
+// Historical note: through ENH-005 (paideia-os/shell#32) this body
+// executed the ordered sequence WITHOUT a fork, so sys_execve either
+// succeeded (never returned; shell became child) or failed (returned
+// errno; audit close + EX_ERR_EXECVE_FAIL). sys_wait4 was structurally
+// reachable only via the execve-failure edge and typically returned
+// -ECHILD; the "no child to wait for" outcome was documented in a
+// §FORK GAP block that is now retired.
 //
-// ENH-005 lands the ORDERED SEQUENCE as the doc specifies. Runtime
-// semantics under the current syscall floor: sys_execve either succeeds
-// (never returns; shell becomes child) or fails (returns errno; audit-
-// close + EX_ERR_EXECVE_FAIL). sys_wait4 is only reached if sys_execve
-// returned failure, at which point it will typically also fail (no
-// child to wait for) -- both paths are audited via command_record_close
-// with exit=127.
+// shell#44 makes wait4 meaningful. The kernel-side sys_fork body has
+// been live since paideia-os R15-M6-003 (#554) with the R17-M0-724-D6
+// child-materialisation completion; the shell repo's ENH-001 Syscall
+// floor deliberately omitted the wrapper because the ENH-005 spawn
+// path did not need it. shell#44 adds SC+ 56 to the Syscall floor,
+// splits exec_spawn_and_wait into fork -> parent-wait / child-exec,
+// and emits a boot-smoke-observable fingerprint on the parent's
+// timeline between fork and wait4 (`SHELL FORK OK pid=<n>\n` via
+// sys_write(1) -- the assertion that the QEMU smoke matches against
+// once the shell is wired into paideia-os `bin_seeds.pdx`).
 //
-// A future ENH adding sys_fork (or making sys_execve fork-and-exec
-// atomically) makes wait4 meaningful without touching the ordered
-// sequence in this body. The D3 property (audit-first, durable-before-
-// child) is fully enforced today: command_record_begin runs BEFORE
-// sys_execve, and no reject path skips it.
+// The D3 property (audit-first, durable-before-child) is stronger
+// after shell#44 than before: command_record_begin runs BEFORE
+// sys_fork so the audit record exists in the parent's aspace before
+// the child even exists as a task -- a reader replaying the audit
+// journal sees the OPEN record with a timestamp strictly before the
+// child's first schedule.
 //
 // =============================================================================
 // DEFERRALS (with follow-up hooks)
@@ -158,9 +186,10 @@
 //   - Module name PascalCase basename (`Exec`), no directory prefix.
 //   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
 //   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. Large immediates
-//     (0xFFFFEC21..0xFFFFEC28 error sentinels, the placeholder
-//     parent-cap fused qword, negative-errno gate values) via
-//     mov r10, imm64.
+//     (0xFFFFEC21..0xFFFFEC29 error sentinels, the placeholder
+//     parent-cap fused qword, negative-errno gate values,
+//     sys_wait4 pid==child_pid staging when the pid is <= 0x7FFFFFFF
+//     it fits imm32 directly) via mov r10, imm64.
 //   - r11 is scratch for .bss LEA reach on the M2 body; never touched
 //     by narrow_caps / command_record_* / sys_* wrappers (all
 //     documented to preserve r11 or, in the case of syscall wrappers,
@@ -535,8 +564,20 @@ module Exec = structure {
   // (dst too small, argv_bytes > CMDR_ARGV_MAX, or audit_id 0). The
   // D3 audit-first invariant forbids proceeding to sys_execve when
   // the audit record cannot be opened.
+  //
+  // EX_ERR_FORK_FAIL (shell#44): sys_fork returned a negative errno
+  // (kernel task_new / aspace_clone_cow OOM -- typically -EAGAIN
+  // 0xFFFFFFFFFFFFFFF5 or -ENOMEM 0xFFFFFFFFFFFFFFF4). Fork happens
+  // AFTER command_record_begin, so the audit record must be closed
+  // with exit=127 before returning this sentinel; otherwise the
+  // audit journal leaks an orphaned OPEN record. Distinct from
+  // EX_ERR_EXECVE_FAIL because a fork failure is a KERNEL resource
+  // exhaustion signal (worth surfacing to callers as its own
+  // condition), whereas an execve failure now surfaces as the
+  // child's exit code 127 (POSIX "command not found").
   pub let EX_ERR_ARGV_OVERFLOW    : u64 = 0xFFFFEC27
   pub let EX_ERR_AUDIT_BEGIN_FAIL : u64 = 0xFFFFEC28
+  pub let EX_ERR_FORK_FAIL        : u64 = 0xFFFFEC29
 
   // ==========================================================================
   // Singleton buffers (.bss)
@@ -580,6 +621,40 @@ module Exec = structure {
   pub let mut _ex_sidecar_buf : [u64; 32] = uninit @align(16)
   pub let mut _ex_audit_rec   : [u64; 520] = uninit @align(16)
   pub let mut _ex_wstatus     : u64       = uninit @align(8)
+
+  // ==========================================================================
+  // shell#44: live spawn fingerprint scratch + rodata literals
+  //
+  // Emitted between sys_fork (parent branch) and sys_wait4 as three
+  // sys_write(1, ...) calls:
+  //   (1) ex_fp_fork_ok_str  -- "SHELL FORK OK pid="  (18 bytes)
+  //   (2) _ex_fp_pid_scratch -- decimal pid rendered via
+  //                              history_format_u64_dec (up to 20 bytes)
+  //   (3) ex_fp_nl_str       -- "\n"                  (1 byte)
+  //
+  // history_format_u64_dec writes 1..20 ASCII digits without a NUL;
+  // 24-byte scratch gives 4 bytes of slack + 8-byte alignment for the
+  // sys_write pointer. The scratch buffer is a shell-global singleton
+  // (only one spawn is in flight at a time until per-stage fan-out
+  // lands in a future pipeline landing) so the sys_write can pass
+  // the buffer VA directly.
+  //
+  // N in `[u8; N]` = strlen+1 per the paideia-as fingerprint-string
+  // rule (feedback_pdx_encoder_pitfalls: N includes the trailing NUL).
+  // sys_write counts exclude the NUL, so the pid-prefix write passes
+  // rdx=18 and the newline write passes rdx=1.
+  //
+  // Fingerprint format is asserted by the paideia-os QEMU boot smoke
+  // (once the shell is wired into `bin_seeds.pdx`; that wiring is
+  // paideia-os-side, sequenced after #33 landed in this repo). The
+  // shell repo's local build proves the write sequence compiles;
+  // matching a grep against the boot log is the paideia-os half of
+  // the fingerprint.
+  // ==========================================================================
+  pub let mut _ex_fp_pid_scratch : [u8; 24] = uninit @align(8)
+  pub let ex_fp_fork_ok_str      : [u8; 19] = "SHELL FORK OK pid=\0"
+  pub let ex_fp_nl_str           : [u8; 2]  = "\n\0"
+  pub let EX_FP_FORK_OK_LEN      : u64 = 18   // "SHELL FORK OK pid=" strlen
 
   // ==========================================================================
   // exec_build_argv_ptrs(pool_ptr, argv_bytes, argc, dst_ptrs, dst_max)
@@ -720,15 +795,22 @@ module Exec = structure {
   //                                separator NULs and trailing NUL).
   // RDX (input): argc          -- word count in that slice
   //                                (_pr_stages[i].argc; 1..15).
-  // RAX (output): child exit code (0..255) on the substrate-live path
-  //                (never taken today without sys_fork; see §FORK GAP);
-  //                otherwise one of the 0xFFFFEC2x sentinels
-  //                (EX_ERR_BAD_ARGV, EX_ERR_ARGV_OVERFLOW,
-  //                EX_ERR_AUDIT_BEGIN_FAIL, EX_ERR_EXECVE_FAIL,
+  // RAX (output): child exit code (0..255) on the fork+exec+wait
+  //                success path (live substrate as of shell#44); the
+  //                child's exit code surfaces as-is, including 127
+  //                when the child's execve failed (POSIX "command not
+  //                found" convention). Otherwise one of the 0xFFFFEC2x
+  //                sentinels (EX_ERR_BAD_ARGV, EX_ERR_ARGV_OVERFLOW,
+  //                EX_ERR_AUDIT_BEGIN_FAIL, EX_ERR_FORK_FAIL,
   //                EX_ERR_WAIT_FAIL) or a propagated
   //                exec_narrow_child_caps sentinel
   //                (EX_ERR_MISSING_CAP, EX_ERR_WIDENING,
-  //                EX_ERR_SIDECAR_FULL).
+  //                EX_ERR_SIDECAR_FULL). EX_ERR_EXECVE_FAIL is retired
+  //                as of shell#44 (see the shell.pdx sentinel table);
+  //                the parent no longer sees it because the child
+  //                sys_exits with 127 on execve failure instead of
+  //                bubbling a shell-layer sentinel up to the parent
+  //                return path.
   //
   // Signature note: ENH-005 changes the arg shape from (argv, argv_count)
   // to (argv_pool_ptr, argv_bytes, argc). The v1.0.0 M1 skeleton
@@ -754,24 +836,42 @@ module Exec = structure {
   //   4. command_record_begin into _ex_audit_rec with the pool slice
   //      as argv text, audit_id=1 placeholder, ts_begin_ns=0. On
   //      failure return EX_ERR_AUDIT_BEGIN_FAIL WITHOUT calling
-  //      sys_execve -- the D3 audit-first invariant forbids exec
-  //      without a durable audit record.
+  //      sys_fork or sys_execve -- the D3 audit-first invariant
+  //      forbids proceeding without a durable audit record.
+  //   4a. shell#44: sys_fork.
+  //      - rax < 0 (signed): fork failed. Parent-side only. Close
+  //        audit with exit=127, bump SH_ST_ERRORS, return
+  //        EX_ERR_FORK_FAIL.
+  //      - rax == 0: this task is the CHILD. Fall through to (5).
+  //      - rax > 0: this task is the PARENT with child pid in rax.
+  //        Stash pid in rbx. Emit the SHELL FORK OK fingerprint
+  //        (three sys_write calls: prefix, decimal pid, newline).
+  //        Skip (5), jump directly to (6) sys_wait4(child_pid, ...).
   //   5. sys_execve(path=_ex_argv_ptrs[0], argv=_ex_argv_ptrs, envp=0).
-  //      envp=0 per D5 (no env-var leak to children). On success,
-  //      never returns. On failure, close audit with exit=127 and
-  //      return EX_ERR_EXECVE_FAIL.
-  //   6. sys_wait4(pid=-1, &_ex_wstatus, 0, 0). Structurally reachable
-  //      only if sys_execve returned failure in the current syscall
-  //      floor (no sys_fork); kept per the M2 CALL GRAPH ordering so
-  //      a future sys_fork insertion becomes a one-line change. On
-  //      negative errno, close audit with exit=127 and return
-  //      EX_ERR_WAIT_FAIL.
+  //      envp=0 per D5 (no env-var leak to children). CHILD-BRANCH
+  //      ONLY. On success the kernel replaces the child image and
+  //      control never returns; on failure the child sys_exit(127)
+  //      so the parent's wait4 sees exit code 127. Child MUST NOT
+  //      touch the audit record (its aspace is a cow-copy of the
+  //      parent's; a close from the child mutates only the child's
+  //      copy and the image is about to be discarded anyway) and
+  //      MUST NOT tear down the callee-save prologue (sys_exit
+  //      never returns; the child's stack dies with the aspace).
+  //   6. sys_wait4(pid=child_pid, &_ex_wstatus, 0, 0). PARENT-BRANCH
+  //      ONLY. Reaps the specific child forked at (4a). On negative
+  //      errno, close audit with exit=127 and return EX_ERR_WAIT_FAIL.
   //   7. command_record_close with (wstatus & 0xFF) as exit_code.
-  //      Bump SH_ST_EXITS (slot 3). Return exit_code in rax.
+  //      PARENT-BRANCH ONLY. Bump SH_ST_EXITS (slot 3). Return
+  //      exit_code in rax.
   //
   // Bumps SH_ST_SPAWNS on entry, SH_ST_EXITS on the happy tail, and
   // SH_ST_ERRORS on every reject path (either directly or via a
-  // downstream helper's own bump).
+  // downstream helper's own bump). The child branch performs no
+  // shell_note bumps (they would mutate only the child's copy of
+  // _shell_stats; a future observability landing could sys_write
+  // a tagged bump to a parent-visible channel, but shell#44 keeps
+  // scope tight and leaves per-child accounting to sys_wait4's
+  // wstatus surface).
   //
   // Register plan:
   //   r12 = argv_pool_ptr (callee-save; carried into command_record_begin
@@ -779,29 +879,37 @@ module Exec = structure {
   //   r13 = argv_bytes    (callee-save; carried into command_record_begin
   //         as argv_bytes)
   //   r14 = argc          (callee-save; carried into build_argv_ptrs)
-  //   r15 = exit code / temp; carries wstatus low byte on the happy
-  //         tail so command_record_close and the return see the same
-  //         value across the shell_note SH_ST_EXITS bump
-  //   rbx = reserved for the audit-close path (holds the "reason
-  //         exit code" 127 constant when routing execve/wait fail
-  //         through the close call)
+  //   r15 = exit code / temp; carries wstatus low byte on the parent
+  //         happy tail so command_record_close and the return see the
+  //         same value across the shell_note SH_ST_EXITS bump
+  //   rbx = shell#44: child pid on the parent branch of sys_fork,
+  //         carried across the fingerprint writes into sys_wait4 as
+  //         the reaped-pid arg. Also (pre-shell#44) reserved for the
+  //         audit-close "reason exit code" 127 constant when routing
+  //         execve/wait fail through the close call; that use is now
+  //         inline (mov rcx, 127) so rbx is free for the pid.
   //   r11 = .bss LEA scratch (per paideia-as convention)
   //
   // Prologue: 5 callee-save pushes (rbx, r12, r13, r14, r15) + `sub
   // rsp, 8` = 48 bytes. Entry rsp % 16 == 8; after 5 pushes rsp %
   // 16 == 0; `sub rsp, 8` preserves that. rsp % 16 == 0 at every
-  // nested SysV call. Matched epilogue at every return.
+  // nested SysV call. Matched epilogue at every PARENT return; the
+  // CHILD branch never reaches an epilogue (sys_exit on execve
+  // failure; kernel replaces image on execve success).
   //
   // Effect / capability set: {mem, sysreg} + @{sched, mem, fs} covers
   // the union of every downstream call. sys_execve contributes
-  // @{sched, mem}; command_record_begin contributes !{mem}; the
-  // pool byte reads contribute !{mem}. fs is included for kernel-
-  // side filesystem walk during sys_execve's ELF load.
+  // @{sched, mem}; sys_fork contributes the same; command_record_begin
+  // contributes !{mem}; the pool byte reads contribute !{mem}. fs is
+  // included for kernel-side filesystem walk during sys_execve's ELF
+  // load. history_format_u64_dec (used for the fingerprint pid render)
+  // contributes only !{mem} (leaf helper, no syscall) -- already
+  // subsumed by the mem effect.
   // ==========================================================================
   pub let exec_spawn_and_wait : (u64, u64, u64) -> u64 !{mem, sysreg} @{sched, mem, fs} =
     fn (argv_pool_ptr: u64) (argv_bytes: u64) (argc: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched, mem, fs},
-      justification: "shell.ENH-005 (#32): the exec-path REAL body. Replaces the v1.0.0 M1-003 EX_STUB tail with the ordered 7-step sequence the module's own §M2 CALL GRAPH has specified since M1. Sequence: (0) gate + SH_ST_SPAWNS bump; (1) exec_build_argv_ptrs into _ex_argv_ptrs from the parser's NUL-separated pool slice; (2) exec_narrow_child_caps into _ex_sidecar_buf with a placeholder parent cap (SH_KIND_SHELL_SESSION with RIGHTS_ALL, target_ptr=0) and child_decl_count=0 -- the narrowing trivially succeeds today and grows into real inputs when libpdx-cap and runtime cap-table introspection land; (3) cap_manifest_verify DEFERRED (libpdx-cap not linked in the shell repo); (4) command_record_begin into _ex_audit_rec BEFORE sys_execve -- the D3 audit-first invariant made into a running-system property (test_audit_first.pdx already covers the encoder half; this landing extends it to the live path). A non-zero begin routes to EX_ERR_AUDIT_BEGIN_FAIL WITHOUT proceeding to exec -- the child never runs if the audit record cannot be opened. (5) sys_execve with argv[0] as path, _ex_argv_ptrs as argv, envp=0 (D5: no env-var leak). sys_execve never returns on success (kernel replaces the shell image with the child's image); a returned value is failure. (6) sys_wait4(pid=-1) is structurally reachable only if sys_execve returned failure under the current sys_fork-less syscall floor; kept per doc ordering so a future sys_fork insertion becomes a one-line change (see §FORK GAP). (7) command_record_close with (wstatus & 0xFF) as exit_code; on execve/wait failure the close uses exit=127 so the audit journal never carries an orphaned OPEN record. Reject-path close discipline: every path that reached command_record_begin AND then failed calls command_record_close with an appropriate exit sentinel before returning the EX_ERR_* code -- otherwise the audit trail would show OPEN records with no matching CLOSE, defeating replay. The paideia-as no-`test`-mnemonic + `cmp reg, 0` discipline is followed at every branch; large immediates (placeholder parent-cap fused qword 0xFFFFFFFF01940001; sys_wait4 pid=-1 encoded as 0xFFFFFFFFFFFFFFFF) via mov r64, imm64 (paideia-as supports MOV imm64 in general; the pitfall is specifically `and r11, imm64` which we do not use here). Byte loads (in the helper) via `xor rax, rax; mov_b rax, [ptr]` with explicit `* 1` scale per #1248 + U1606. The `wstatus & 0xFF` extraction uses `and rax, 0xFF` (imm32, fits <= 0x7FFFFFFF). 5 callee-save pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 at every nested SysV call. Labels prefixed ex_sw_.",
+      justification: "shell.ENH-005 (#32) + shell#44 (fork-before-exec): the exec-path REAL body. shell#44 retires the ENH-005 §FORK GAP by inserting sys_fork between command_record_begin and sys_execve. Sequence: (0) gate + SH_ST_SPAWNS bump; (1) exec_build_argv_ptrs into _ex_argv_ptrs from the parser's NUL-separated pool slice; (2) exec_narrow_child_caps into _ex_sidecar_buf with a placeholder parent cap (SH_KIND_SHELL_SESSION with RIGHTS_ALL, target_ptr=0) and child_decl_count=0; (3) cap_manifest_verify DEFERRED (libpdx-cap not linked); (4) command_record_begin into _ex_audit_rec BEFORE fork (D3 audit-first as a running-system property: the audit record exists in the parent's aspace before the child even exists as a task). A non-zero begin routes to EX_ERR_AUDIT_BEGIN_FAIL WITHOUT proceeding to fork -- the child never runs if the audit record cannot be opened. (4a) sys_fork with three arms: rax<0 (signed jl) -> parent-only fork_fail close+return EX_ERR_FORK_FAIL; rax==0 -> child branch falls through to (5) sys_execve; rax>0 -> parent branch stashes pid in rbx, emits SHELL FORK OK fingerprint via three sys_write(1) calls (ex_fp_fork_ok_str+18 bytes, history_format_u64_dec pid rendering into _ex_fp_pid_scratch then sys_write(1, scratch, digit_count), ex_fp_nl_str+1 byte), then jumps to (6) sys_wait4(child_pid). (5) sys_execve with argv[0] as path, _ex_argv_ptrs as argv, envp=0 (D5). CHILD-BRANCH ONLY. Success never returns (kernel replaces image); failure returns errno and the child sys_exit(127) so the parent's wait4 sees exit code 127 (POSIX 'command not found' convention). Child does NOT touch the audit record or restore the callee-save prologue -- the aspace is a cow-copy that dies with sys_exit / execve. (6) sys_wait4(pid=child_pid, &_ex_wstatus, 0, 0) is now genuinely reachable on the parent timeline; on negative errno (signed jl) close audit with exit=127 and return EX_ERR_WAIT_FAIL. (7) command_record_close with (wstatus & 0xFF) as exit_code; the parent bumps SH_ST_EXITS and returns exit_code. Reject-path close discipline: every parent path that reached command_record_begin AND then failed (fork_fail, wait_fail) calls command_record_close(exit=127) before returning the EX_ERR_* code -- otherwise the audit trail would show OPEN records with no matching CLOSE, defeating replay. The paideia-as no-`test`-mnemonic + `cmp reg, 0` discipline is followed at every branch; large immediates (placeholder parent-cap fused qword 0xFFFFFFFF01940001; error sentinels 0xFFFFEC2x) via mov r64, imm64 or mov r32, imm32 (paideia-as supports MOV imm64 in general; the pitfall is `and r11, imm64` which we do not use here). Byte loads via `xor rax, rax; mov_b rax, [ptr]` with explicit `* 1` scale per #1248 + U1606. The `wstatus & 0xFF` extraction uses `and rax, 0xFF` (imm32 <= 0x7FFFFFFF). rbx is repurposed at shell#44 as the child-pid carrier on the parent branch (previously reserved as a scratch that was never actually used in the ENH-005 body). 5 callee-save pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 at every nested SysV call. Every nested syscall / library call in the parent path (shell_note, exec_build_argv_ptrs, exec_narrow_child_caps, command_record_begin, sys_fork, sys_write, history_format_u64_dec, sys_wait4, command_record_close) preserves r12/r13/r14/rbx per SysV callee-save rules. The child branch's sys_execve / sys_exit run against the same alignment (rsp % 16 == 0). Labels prefixed ex_sw_.",
       block: {
         push rbx;
         push r12;
@@ -880,7 +988,7 @@ module Exec = structure {
 
         // (3) cap_manifest_verify -- DEFERRED (libpdx-cap not linked).
 
-        // (4) command_record_begin -- audit-first, durable BEFORE exec.
+        // (4) command_record_begin -- audit-first, durable BEFORE fork.
         //   dst          = _ex_audit_rec
         //   dst_len      = EX_AUDIT_BUF_SIZE (4160)
         //   argv_ptr     = argv_pool_ptr (r12, the parser's pool slice)
@@ -897,33 +1005,92 @@ module Exec = structure {
         cmp rax, 0;
         jne ex_sw_audit_begin_fail;
 
-        // (5) sys_execve(path=argv[0], argv=_ex_argv_ptrs, envp=NULL).
-        // On success never returns (kernel replaces the shell image
-        // with the child's image). On failure returns a negative
-        // errno.
+        // (4a) sys_fork -- shell#44. Splits parent + child before
+        // execve. See §"FORK: LIVE" at the top of this file for why
+        // this call must sit AFTER command_record_begin (D3 audit-
+        // first: the audit record exists in the parent's aspace
+        // before the child even schedules).
         //
-        // See §FORK GAP for why sys_wait4 (step 6) is structurally
-        // reached only via a sys_execve failure in the current
-        // syscall floor. When sys_fork lands, insert `call sys_fork;
-        // cmp rax, 0; jne ex_sw_parent_wait;` BEFORE this block and
-        // the sys_execve call becomes the child branch; the parent
-        // branch falls into ex_sw_wait_head labelled below.
+        // Return arms:
+        //   rax < 0 (signed): fork failed. Parent-only. Close audit
+        //                     (exit=127) + return EX_ERR_FORK_FAIL.
+        //   rax == 0:         CHILD. Fall through to (5) sys_execve.
+        //   rax > 0:          PARENT. rax = child pid. Stash in rbx,
+        //                     emit fingerprint, jump to (6) wait4.
+        call sys_fork;
+        cmp rax, 0;
+        jl  ex_sw_fork_fail;
+        je  ex_sw_child_exec;
+
+        // (4a-parent) rax > 0 -- we are the parent with child pid.
+        mov rbx, rax;                        // rbx = child_pid (survives sys_write)
+
+        // Fingerprint (1): sys_write(1, "SHELL FORK OK pid=", 18).
+        mov rdi, 1;                          // stdout
+        lea rsi, [rip + ex_fp_fork_ok_str];
+        mov rdx, 18;                         // EX_FP_FORK_OK_LEN
+        call sys_write;
+        // Ignore return; a short write here is a boot-log oddity,
+        // not a spawn failure.
+
+        // Fingerprint (2): render decimal pid into _ex_fp_pid_scratch
+        // and sys_write the resulting digit count.
+        //   history_format_u64_dec(value=rbx, out_buf=_ex_fp_pid_scratch)
+        //   -> rax = digit count (1..20)
+        mov rdi, rbx;                        // value = child_pid
+        lea rsi, [rip + _ex_fp_pid_scratch]; // out_buf
+        call history_format_u64_dec;
+
+        // sys_write(1, _ex_fp_pid_scratch, digit_count)
+        mov rdx, rax;                        // count = digit_count
+        mov rdi, 1;
+        lea rsi, [rip + _ex_fp_pid_scratch];
+        call sys_write;
+
+        // Fingerprint (3): sys_write(1, "\n", 1).
+        mov rdi, 1;
+        lea rsi, [rip + ex_fp_nl_str];
+        mov rdx, 1;
+        call sys_write;
+
+        // Fall through to sys_wait4 on the parent's timeline.
+        jmp ex_sw_wait_head;
+
+      ex_sw_child_exec:
+        // (5) CHILD branch: sys_execve(path=argv[0], argv=_ex_argv_ptrs,
+        // envp=NULL). Success replaces this task's image with the
+        // child's; the kernel loads _start and control never returns
+        // to this body. Failure returns a negative errno; the child
+        // sys_exit(127) so the parent's wait4 sees exit code 127.
+        //
+        // The child does NOT touch the audit record: its aspace is
+        // a cow-copy of the parent's; a close here would mutate only
+        // the child's copy of _ex_audit_rec, and the child image is
+        // about to be discarded (either replaced by execve or torn
+        // down by sys_exit). The child ALSO does NOT restore the
+        // 5-callee-save prologue: sys_exit never returns and neither
+        // does a successful execve; the stack dies with the aspace.
         lea r11, [rip + _ex_argv_ptrs];
         mov rdi, [r11 + 0];                  // path = argv[0]
         lea rsi, [rip + _ex_argv_ptrs];      // argv
         xor rdx, rdx;                        // envp = NULL (D5)
         call sys_execve;
-        // Any return is failure. Route to execve-fail close + return.
-        jmp ex_sw_execve_fail_close;
+        // execve returned -> failure. Signal via exit code 127 so
+        // the parent's wait4 surfaces it naturally.
+        mov rdi, 127;
+        call sys_exit;
+        // sys_exit does not return; hlt is unreachable belt-and-
+        // suspenders in case the kernel ever regresses the exit
+        // handler (same discipline as init.pdx's tail-of-_start).
+        hlt;
 
-        // (6) sys_wait4(pid=-1, &_ex_wstatus, 0, 0). UNREACHABLE in
-        // the current syscall floor (sys_execve either succeeds and
-        // never returns, or fails and we route through
-        // ex_sw_execve_fail_close above). Kept for the ordered §M2
-        // CALL GRAPH sequence so a future sys_fork insertion makes
-        // the wait4 path live without touching the body's structure.
       ex_sw_wait_head:
-        mov rdi, 0xFFFFFFFFFFFFFFFF;         // pid = -1 (any child)
+        // (6) PARENT branch: sys_wait4(pid=child_pid, &_ex_wstatus,
+        // 0, 0). rbx carries the child pid from (4a-parent). Wait
+        // on the specific pid (not -1) so a future concurrent-
+        // pipeline landing observes narrow reap semantics without
+        // re-architecting this body.
+        mov rdi, rbx;                        // pid = child_pid
         lea rsi, [rip + _ex_wstatus];
         xor rdx, rdx;                        // options = 0
         xor rcx, rcx;                        // rusage = NULL
@@ -954,8 +1121,11 @@ module Exec = structure {
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
-      ex_sw_execve_fail_close:
-        // (7) Close audit with exit=127 (POSIX-style "exec failed").
+      ex_sw_fork_fail:
+        // (4a) sys_fork returned a negative errno. Parent-side only.
+        // Close audit with exit=127 (fork failed before child image
+        // loaded; POSIX has no dedicated exit code for "fork EAGAIN",
+        // 127 is the closest generic "spawn refused" surface).
         lea rdi, [rip + _ex_audit_rec];
         mov rsi, 4160;
         xor rdx, rdx;
@@ -963,7 +1133,7 @@ module Exec = structure {
         call command_record_close;
         mov rdi, 4;                          // SH_ST_ERRORS
         call shell_note;
-        mov rax, 0xFFFFEC22;                 // EX_ERR_EXECVE_FAIL
+        mov rax, 0xFFFFEC29;                 // EX_ERR_FORK_FAIL
         add rsp, 8;
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;

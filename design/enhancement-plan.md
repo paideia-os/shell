@@ -138,6 +138,14 @@ tools there inline their syscalls rather than link a shim, specifically
 to avoid object-set collisions. ENH-001 must decide, in-repo, whether
 `shell` links a `Syscall` module or inlines — and record the decision.
 
+**shell#44 addendum:** the ENH-001 enumeration lists nine sysnos and
+deliberately omits `fork` (SC+ 56); the ENH-005 spawn path was a
+degenerate "sys_execve replaces the shell" pattern that did not need
+it. shell#44 adds `sys_fork` as the tenth wrapper and rewires
+`exec_spawn_and_wait` to fork-before-exec, retiring the ENH-005
+§FORK GAP. See `CHANGELOG.md` "Unreleased — shell#44" and
+`design/architecture.md` §4.3.FORK GAP for the ground truth.
+
 ### Stage 1 — text becomes structure (ENH-002, ENH-003)
 
 - **Lexer** (`src/lexer.pdx`): a byte buffer → token stream. Words,

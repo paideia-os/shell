@@ -109,6 +109,90 @@ N for an N-stage line`, verified by the new
   mov_b [r10 + N], rax` idiom the other argv-string fixtures
   use; case-listing docstrings + `0xFFFFED8x` fail-code table +
   case count in `tshm_run_all` all bumped from 10 to 11.
+## Unreleased — shell#44: sys_fork syscall floor bump + live spawn fingerprint
+
+Retires the ENH-005 §FORK GAP. `exec_spawn_and_wait` now forks before
+exec: the child branch calls `sys_execve` (and `sys_exit(127)` on
+failure), while the parent branch emits a boot-log fingerprint and
+waits on the specific child pid. `sys_wait4` is genuinely reachable
+on the parent timeline for the first time; `command_record_close`
+runs on the parent side after wait so the audit journal always sees
+matched OPEN/CLOSE pairs.
+
+The `SHELL FORK OK pid=<n>\n` fingerprint is asserted by the paideia-
+os QEMU boot smoke once the shell is wired into `bin_seeds.pdx`
+(paideia-os-side, sequenced after shell#33 landed); the shell repo's
+local build proves the write sequence compiles.
+
+Unblocks the paideia-os `bin_seeds.pdx` seeding that
+`design/roadmap/rows-4-5-6-scoping.md` §4.2 has been waiting on
+since ENH-005 landed.
+
+### Added
+
+- `src/syscall.pdx` `Syscall::sys_fork` — SC+ 56 wrapper. Arity 0,
+  no arg shuffle; effects `{mem, sysreg}`, capabilities `{sched,
+  mem}`. Matches paideia-os `src/user/syscall_shim.pdx` `sys_fork`
+  byte-for-byte in its syscall body. The floor grows from 9 to 10
+  wrappers.
+- `src/syscall.pdx` `SYS_FORK : u64 = 56` — sysno constant.
+- `src/exec.pdx` `EX_ERR_FORK_FAIL` (0xFFFFEC29) — new sentinel for
+  the parent-side "sys_fork returned negative errno (kernel OOM,
+  typically -EAGAIN or -ENOMEM)" case. Distinct from
+  `EX_ERR_EXECVE_FAIL` because a fork failure is a kernel resource
+  exhaustion signal, whereas an execve failure now surfaces as the
+  child's exit code 127.
+- `src/exec.pdx` fingerprint rodata: `ex_fp_fork_ok_str`
+  ("SHELL FORK OK pid=" + NUL, 19 bytes; `EX_FP_FORK_OK_LEN = 18`
+  is the sys_write count) and `ex_fp_nl_str` ("\n" + NUL, 2 bytes).
+- `src/exec.pdx` `_ex_fp_pid_scratch : [u8; 24]` — .bss scratch
+  for the decimal pid render (20 digits max + 4 bytes slack /
+  8-byte alignment).
+- `src/shell.pdx` `EX_ERR_FORK_FAIL` mirror (0xFFFFEC29) alongside
+  the other `EX_ERR_*` sentinels.
+
+### Changed
+
+- `src/exec.pdx` `exec_spawn_and_wait` body: inserts `call sys_fork`
+  between `command_record_begin` and `sys_execve`. Three arms —
+  `jl` (signed) → parent fork-fail close + return
+  `EX_ERR_FORK_FAIL`; `je` → child sys_execve then `sys_exit(127)`
+  on failure; else (parent) → stash child pid in `rbx`, emit
+  fingerprint via three `sys_write(1)` calls (prefix, decimal pid
+  via `history_format_u64_dec`, newline), then `sys_wait4(pid=
+  child_pid, ...)` on the specific pid rather than the previous
+  `pid=-1`.
+- `src/exec.pdx` `EX_ERR_EXECVE_FAIL` is now unreachable from the
+  parent-visible return path (constant retained in `shell.pdx` for
+  the old-decoder compat window). The child branch replaces the
+  sentinel with `sys_exit(127)` so the parent's `wait4` surfaces
+  the failure as a POSIX-shaped exit code.
+- `src/exec.pdx` M2 CALL GRAPH doc: adds step (4a) sys_fork with
+  three-arm return convention; annotates (5) as CHILD-BRANCH ONLY
+  and (6)/(7) as PARENT-BRANCH ONLY.
+- `src/exec.pdx` §FORK GAP block: replaced by §"FORK: LIVE
+  (shell#44 retirement of the ENH-005 §FORK GAP)". Historical note
+  preserved.
+- `src/exec.pdx` register plan: `rbx` repurposed as the child-pid
+  carrier on the parent branch after fork (previously nominally
+  reserved as a scratch that was never actually used in the ENH-005
+  body).
+- `src/syscall.pdx` module docstring: bumps the "nine SC+ IDs" line
+  to "ten" and adds the SC+ 56 row.
+
+### Notes
+
+- No manifest / version bump: the CHANGELOG track stays `Unreleased`
+  through shell#44 alongside the existing ENH-008 entry.
+- Kernel-side ground truth: `sys_fork_body` at paideia-os
+  `src/kernel/core/syscall/handlers/sys_fork.pdx` (landed
+  R15-M6-003 #554; child-materialisation completion R17-M0-724-D6
+  #724). No paideia-os-side change is required to land shell#44;
+  the wrapper joins existing kernel infrastructure.
+- End-to-end runtime proof (`SHELL FORK OK pid=<n>` in the QEMU
+  boot log) requires paideia-os `bin_seeds.pdx` to seed the shell
+  ELF and land the boot smoke that asserts the string; that pair
+  is paideia-os-side and sequenced after shell#33.
 
 ## Unreleased — ENH-008: history persist to disk (#35)
 

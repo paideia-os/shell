@@ -123,15 +123,23 @@ module Shell = structure {
   // value) so any external tool that carried the sentinel in a
   // decoder table keeps decoding correctly; new code paths in the
   // shell no longer return it.
+  //
+  // EX_ERR_EXECVE_FAIL retired at shell#44: exec_spawn_and_wait now
+  // forks before exec, so the CHILD sys_exit(127) on execve failure
+  // and the parent's wait4 surfaces the exit code naturally instead
+  // of a shell-layer sentinel. The constant is retained (unchanged
+  // value) for the old-decoder compat window; the shell no longer
+  // returns it from the parent-visible return path.
   pub let EX_STUB                  : u64 = 0xFFFFEC20   // (retired at ENH-005)
   pub let EX_ERR_BAD_ARGV          : u64 = 0xFFFFEC21   // argv == 0, argv_bytes == 0, or argc == 0
-  pub let EX_ERR_EXECVE_FAIL       : u64 = 0xFFFFEC22   // sys_execve refused (or returned on failure)
+  pub let EX_ERR_EXECVE_FAIL       : u64 = 0xFFFFEC22   // (retired at shell#44; child sys_exits 127 now)
   pub let EX_ERR_WAIT_FAIL         : u64 = 0xFFFFEC23   // sys_wait4 returned negative errno
   pub let EX_ERR_MISSING_CAP       : u64 = 0xFFFFEC24   // narrow_child_caps: child needs KIND parent lacks
   pub let EX_ERR_WIDENING          : u64 = 0xFFFFEC25   // narrow_child_caps: child asks for rights parent lacks
   pub let EX_ERR_SIDECAR_FULL      : u64 = 0xFFFFEC26   // narrow_child_caps: dst < child_decl_count
   pub let EX_ERR_ARGV_OVERFLOW     : u64 = 0xFFFFEC27   // ENH-005: build_argv_ptrs argc >= EX_ARGV_PTRS_MAX
   pub let EX_ERR_AUDIT_BEGIN_FAIL  : u64 = 0xFFFFEC28   // ENH-005: command_record_begin returned non-zero (D3 gate)
+  pub let EX_ERR_FORK_FAIL         : u64 = 0xFFFFEC29   // shell#44: sys_fork returned negative errno (kernel OOM)
 
   // Lexer errors (0xFFFFECCx) -- ENH-002 (#29). Authoritative
   // definitions in src/lexer.pdx; mirrored here for the same reason

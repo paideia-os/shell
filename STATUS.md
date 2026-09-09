@@ -2,9 +2,10 @@
 
 > **v1.0.0 was a wire-format encoder suite; `shell` could not execute a
 > command.** ENH-001 (#28) landed the syscall floor, ENH-005 (#32)
-> landed the real exec path, and **ENH-006 (#33) lands
-> `Shell::shell_main` + REPL and flips `manifest.pdxproj` `kind` back
-> to `tool`**. The commit that lands #33 is the first at which `shell`
+> landed the real exec path, **shell#44 landed the fork-before-exec
+> pattern that retires the ENH-005 §FORK GAP**, and **ENH-006 (#33)
+> lands `Shell::shell_main` + REPL and flips `manifest.pdxproj` `kind`
+> back to `tool`**. The commit that lands #33 is the first at which `shell`
 > is a shell: `src/shell.pdx` now defines `shell_main` (the ELF entry
 > the manifest has declared since M1), a CLI flag walker
 > (`shell_argv_dispatch`) that recognises `-c` / `--no-history` /
@@ -61,6 +62,7 @@ Placeholder — each row lands as its issue closes.
 | R106.SHELL-001  | scaffold consolidation (.gitignore, README, STATUS, CHANGELOG) | LANDED  |
 | R106.SHELL-002  | tokenizer novel-tilde + bare-cd errors + dispatch entrypoint (#41) | pending |
 | R106.SHELL-003  | tokenizer + dispatcher test infrastructure (#42)       | pending |
+| shell#44        | sys_fork syscall floor bump + live spawn fingerprint (unblocks #32 close) | LANDED  |
 
 Cross-repo pair: paideia-os R106.M4-KERNEL (kernel-side integration
 surface).
