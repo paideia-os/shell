@@ -198,7 +198,8 @@ module Shell = structure {
   //   8  SH_ST_PASSTHRU      pipe_passthrough_forward entries      (M3-001)
   //   9  SH_ST_COMPLETIONS   completion_encode_record entries      (M3-002)
   //   10 SH_ST_AUDITS        command_record_begin + _close entries (M3-003)
-  //   11..15                 reserved for M4/M5 (audit fingerprints,
+  //   11 SH_ST_STAGES        shell_repl_step per-stage attempts     (#45)
+  //   12..15                 reserved for M4/M5 (audit fingerprints,
   //                          smoke matrix, dual-signed release counters)
   //
   // The table grew from 8 to 16 at M3 to accommodate the three new
@@ -226,6 +227,7 @@ module Shell = structure {
   pub let SH_ST_PASSTHRU    : u64 = 8   // M3-001
   pub let SH_ST_COMPLETIONS : u64 = 9   // M3-002
   pub let SH_ST_AUDITS      : u64 = 10  // M3-003
+  pub let SH_ST_STAGES      : u64 = 11  // #45: per-stage attempts in shell_repl_step
   pub let SH_ST_MAX         : u64 = 16
 
   // ==========================================================================
@@ -329,9 +331,13 @@ module Shell = structure {
   //     used by the argv walker.
   //   * shell_argv_dispatch -- walk argv[1..argc], parse -c / --no-
   //     history / --no-cap:<KIND> / positional <script.pds>.
-  //   * shell_repl_step(line_ptr, line_len) -- lex -> parse -> dispatch
-  //     -> exec pipeline for one line. Pipeline-of-stages fan-out is
-  //     future work; ENH-006 handles _pr_stages[0] only.
+  //   * shell_repl_step(line_ptr, line_len) -- lex -> parse -> per-stage
+  //     (dispatch -> exec) walk for one line. At ENH-006 (#33) this
+  //     handled _pr_stages[0] only and silently dropped [1..]; #45
+  //     widened the body to loop over all stages. True parallel per-
+  //     stage execution + pipe-fd wiring stays deferred until shell#44
+  //     lands sys_fork; see the shell_repl_step §FORK-GAP + PIPE-WIRING
+  //     DEFERRALS block for what is / is not covered by #45 alone.
   //   * shell_main (@no_frame) -- ELF entry frame. Reads argc/argv from
   //     the initial SysV process stack, mints the session cap, then
   //     enters the interactive REPL (or -c one-shot).
@@ -701,40 +707,85 @@ module Shell = structure {
   // ==========================================================================
   // shell_repl_step(line_ptr, line_len) -> u64
   //
-  // Feed one command line through lex -> parse -> dispatch -> exec.
-  // Pipeline-of-stages fan-out is future work; ENH-006 executes
-  // Parser::_pr_stages[0] only. When per-stage forking + pipe wiring
-  // lands, the outer stage walk slots in here without touching the
-  // per-stage body.
+  // Feed one command line through lex -> parse -> per-stage(dispatch ->
+  // exec). #45 removes the pre-fix silent-drop of _pr_stages[1..]:
+  // ENH-006 (#33) landed a body that ran only stage[0] and ignored the
+  // rest; the parser was already producing N stages (verified by #30's
+  // tsm_case_pipeline golden), so a two-stage `ls | cat` line ran only
+  // `ls` and `| cat` disappeared without an error. This body now walks
+  // i in [0, _pr_stage_count) and, per stage, resolves the argv slice,
+  // dispatches builtins, and calls exec_spawn_and_wait on BI_MISS.
   //
-  // Return:
-  //   SR_OK (0)                empty line, or handler/exec returned 0
-  //   dispatch_line return     builtin hit (BI_OK / BI_ERR_*)
-  //   exec_spawn_and_wait rc   builtin miss (child exit code or
-  //                             EX_ERR_*)
-  //   LX_ERR_*                 lexer refused input
-  //   PR_ERR_*                 parser refused token stream
+  // Return (POSIX pipeline exit-code convention):
+  //   SR_OK (0)                empty line, or every stage returned 0
+  //   last stage's rc          arbitrary N-stage line -- final stage
+  //                             wins (dispatch_line / exec_spawn_and_
+  //                             wait's return, whichever ran that
+  //                             stage's body)
+  //   LX_ERR_*                 lexer refused the input line
+  //   PR_ERR_*                 parser refused the token stream
   //
-  // Register plan (5 callee-save pushes + sub 8 = 48 bytes; rsp%16==0
-  // at every nested SysV call):
-  //   r12 = line_ptr
-  //   r13 = line_len
-  //   r14 = argv_ptr (resolved from _pr_argv_pool + stage.argv_offset)
-  //   r15 = argv_bytes
-  //   rbx = argc
+  // ------------------------------------------------------------------
+  // FORK-GAP + PIPE-WIRING DEFERRALS (documented; not blocking #45)
+  // ------------------------------------------------------------------
+  // Two pieces of the true pipeline semantics remain deferred:
+  //   * sys_fork (SC+56) is not yet in the shell syscall floor
+  //     (paideia-os/shell#44 tracks the bump). Without fork,
+  //     exec_spawn_and_wait either succeeds and never returns
+  //     (kernel replaces the shell image with the child's image --
+  //     stages 1..N never run in that timeline, but that is the
+  //     fork-gap's structural consequence, NOT a stage-walk bug)
+  //     or fails with EX_ERR_EXECVE_FAIL (control returns to this
+  //     body, the loop advances to the next stage, and the next
+  //     exec attempt happens).
+  //   * Pipe fd wiring between stages (sys_pipe + per-stage stdin/
+  //     stdout dup) needs the sys_pipe SC+22 wrapper and only
+  //     matters once fork lands (a wired pipe between stages 0 and
+  //     1 is meaningless when stage 0 replaces the shell image).
+  // Post-#44 the fingerprint `ls | cat` produces `ls`'s output
+  // routed through `cat` on stdout; today the fingerprint is
+  // `SH_ST_STAGES bumps by N for an N-stage line`, which the
+  // stage-walk delivers.
+  //
+  // ------------------------------------------------------------------
+  // REGISTER PLAN
+  // ------------------------------------------------------------------
+  //   During lex+parse (pre-loop):
+  //     r12 = line_ptr (from rdi)
+  //     r13 = line_len (from rsi)
+  //   Post-parse, r12/r13 are repurposed for the loop:
+  //     r12 = i (stage index)
+  //     r13 = stage_count
+  //   Loop body:
+  //     rbx = last_rc (starts 0; carries the pipeline's return)
+  //     r14 = per-stage argv_ptr (_pr_argv_pool + argv_offset)
+  //     r15 = per-stage argv_bytes
+  //     [rsp + 0] = per-stage argc (stack scratch; both dispatch_line
+  //                                 and exec_spawn_and_wait read argc
+  //                                 as their last arg, so we materialise
+  //                                 it fresh per call from the stack)
+  //     [rsp + 8] = alignment pad (reserved)
+  //     r10 = arithmetic scratch (stage-record byte offset compute)
+  //     r11 = .bss LEA scratch / large-imm stage
+  //
+  // Prologue: 5 callee-save pushes (rbx, r12, r13, r14, r15) + `sub
+  // rsp, 16` = 56 bytes. Entry rsp%16==8 (return addr); after 5
+  // pushes rsp%16==0; `sub rsp, 16` preserves that, so rsp%16==0 at
+  // every nested SysV call. Matched epilogue at every return.
   // ==========================================================================
   pub let shell_repl_step : (u64, u64) -> u64 !{mem, sysreg} @{sched, mem, fs} =
     fn (line_ptr: u64) (line_len: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched, mem, fs},
-      justification: "shell.ENH-006 (#33): one-line REPL step. Runs lexer_reset + lexer_tokenize on the caller's line buffer, then parser_reset + parser_parse over the same buffer (the parser consumes tokens the lexer just published in _lx_tokens). Empty-line and whitespace-only-line short-circuit to SR_OK -- an empty _pr_stage_count is not an error, it is a user pressing Enter on an empty prompt. Non-empty: resolve stage[0]'s argv slice from Parser::_pr_argv_pool + _pr_stages[0].argv_offset, then dispatch_line first (builtin match returns handler code directly); on BI_MISS derive a KIND_SHELL_SESSION SS_RIGHTS_CHILD sub-cap into _sm_child_cap via session_derive_subcap (the child cap the future InitCap sidecar handoff will carry; today the derivation runs but the wire slot is not yet consumed by sys_execve -- see Exec §DEFERRALS) then invoke exec_spawn_and_wait with the pool-slice signature (pool_ptr, argv_bytes, argc). Pipeline stages 1..stage_count are ignored at ENH-006; the outer stage walk is a future addition here without touching the per-stage body. Effect/cap set is the union of every downstream call: {mem, sysreg} + @{sched, mem, fs} (matches exec_spawn_and_wait's widest set). Prologue: 5 callee-save pushes (rbx argc, r12 line_ptr, r13 line_len, r14 argv_ptr, r15 argv_bytes) + `sub rsp, 8` = 48 bytes; rsp%16==0 at every nested SysV call. Large-immediate compare 0xFFFFECE0 (BI_MISS) stages via `mov r11, imm64; cmp rax, r11` per paideia-as imm32 discipline. Labels prefixed sr_.",
+      justification: "shell.ENH-006 (#33) + #45: one-line REPL step with FULL stage walk. Runs lexer_reset + lexer_tokenize on the caller's line buffer, then parser_reset + parser_parse over the same buffer (the parser consumes tokens the lexer just published in _lx_tokens). Empty-line and whitespace-only-line short-circuit to SR_OK -- an empty _pr_stage_count is not an error, it is a user pressing Enter on an empty prompt. Non-empty: iterate i in [0, _pr_stage_count), and per stage (a) bump SH_ST_STAGES (slot 11, per-attempt fingerprint), (b) resolve the stage's argv slice from Parser::_pr_argv_pool + _pr_stages[i].argv_offset (stage-rec byte offset = i * 24 computed via r10 shl/add/shl to avoid the 2-op `imul r,imm` pitfall from feedback_pdx_encoder_pitfalls), (c) call dispatch_line first (builtin match returns handler code directly); on BI_MISS derive a KIND_SHELL_SESSION SS_RIGHTS_CHILD sub-cap into _sm_child_cap via session_derive_subcap (the child cap the future InitCap sidecar handoff will carry; today the derivation runs but the wire slot is not yet consumed by sys_execve -- see Exec §DEFERRALS) then invoke exec_spawn_and_wait with the pool-slice signature (pool_ptr, argv_bytes, argc). Each stage's rc overwrites the accumulator; the pipeline's final rc == last stage's rc (POSIX pipeline exit-code convention). The pre-#45 body ran only _pr_stages[0] and silently dropped _pr_stages[1..]; the new stage-walk removes that silent drop. Pipe-fd wiring between stages and true parallel per-stage execution are STILL deferred: without sys_fork (shell#44) each exec_spawn_and_wait call either replaces the shell image (success on stage 0 -> stages 1..N never run in that timeline, structural consequence of the fork-gap not of the stage-walk) or fails with EX_ERR_EXECVE_FAIL (parent continues to the next stage). Post-#44 the fingerprint 'ls | cat' produces piped output; today the fingerprint is 'SH_ST_STAGES bumps by N for an N-stage line' which the stage-walk delivers and TestShellMain::tshm_case_repl_pipe_stages verifies. Non-zero return from lexer_tokenize or parser_parse propagates verbatim (LX_ERR_* / PR_ERR_*). Effect/cap set is the union of every downstream call: {mem, sysreg} + @{sched, mem, fs} (matches exec_spawn_and_wait's widest set). Prologue: 5 callee-save pushes (rbx last_rc, r12 line_ptr then stage index i, r13 line_len then stage_count, r14 per-stage argv_ptr, r15 per-stage argv_bytes) + `sub rsp, 16` (local scratch [rsp+0] = per-stage argc; [rsp+8] alignment pad) = 56 bytes prologue; rsp%16==0 at every nested SysV call. Repurposing r12/r13 after parse is safe because line_ptr/line_len are unused past the parser_parse call. Large-immediate compare 0xFFFFECE0 (BI_MISS) stages via `mov r11, imm64; cmp rax, r11` per paideia-as imm32 discipline. Stage-index bumps `mov rdi, 11` (SH_ST_STAGES) fit imm32. Scaled memory accesses use explicit `* 1` index scale per the #1248 / U1606 mitigation. Labels prefixed sr_.",
       block: {
         push rbx;
         push r12;
         push r13;
         push r14;
         push r15;
-        sub rsp, 8;
+        sub rsp, 16;
 
+        // Pre-loop: r12 = line_ptr, r13 = line_len (used by lex+parse).
         mov r12, rdi;
         mov r13, rsi;
 
@@ -764,33 +815,60 @@ module Shell = structure {
         cmp rax, 0;
         je  sr_ok_empty;                     // whitespace-only line
 
-        // Resolve stage[0].argv_offset, argv_bytes, argc.
-        lea r11, [rip + _pr_stages];
-        mov r14, [r11 + 0];                  // argv_offset
-        mov r15, [r11 + 8];                  // argv_bytes
-        mov rbx, [r11 + 16];                 // argc
+        // Repurpose r12 = i (stage index), r13 = stage_count.
+        // rbx = last_rc.
+        xor r12, r12;                        // i = 0
+        mov r13, rax;                        // stage_count
+        xor rbx, rbx;                        // last_rc = 0
 
-        // argv_ptr = _pr_argv_pool + argv_offset
+      sr_stage_loop:
+        cmp r12, r13;
+        jae sr_stage_done;
+
+        // Stage record byte offset r10 = i * 24 = (i * 3) << 3.
+        mov r10, r12;
+        shl r10, 1;                          // r10 = i * 2
+        add r10, r12;                        // r10 = i * 3
+        shl r10, 3;                          // r10 = i * 24
+
+        // Load argv_offset, argv_bytes, argc from _pr_stages[i].
+        lea r11, [rip + _pr_stages];
+        mov r14, [r11 + r10 * 1 + 0];        // argv_offset
+        mov r15, [r11 + r10 * 1 + 8];        // argv_bytes
+        mov rax, [r11 + r10 * 1 + 16];       // argc
+        mov [rsp + 0], rax;                  // stash argc for the two nested calls
+
+        // argv_ptr = _pr_argv_pool + argv_offset (fold into r14).
         lea r11, [rip + _pr_argv_pool];
         add r14, r11;
 
-        // Try builtin dispatch first.
+        // (a) Per-attempt fingerprint bump.
+        mov rdi, 11;                         // SH_ST_STAGES
+        call shell_note;
+
+        // (b) dispatch_line(argv_ptr, argc).
         mov rdi, r14;
-        mov rsi, rbx;
+        mov rsi, [rsp + 0];
         call dispatch_line;
 
-        // If not BI_MISS (0xFFFFECE0), return whatever dispatch_line
-        // gave us (BI_OK on success, BI_ERR_* on handler reject).
+        // If not BI_MISS (0xFFFFECE0): builtin hit (BI_OK or BI_ERR_*).
+        // Record rc into last_rc and advance to the next stage.
         mov r11, 0xFFFFECE0;                 // BI_MISS
         cmp rax, r11;
-        jne sr_propagate;
+        je  sr_stage_exec;
+        mov rbx, rax;                        // last_rc = dispatch rc
+        jmp sr_stage_next;
 
-        // Builtin miss -> derive child sub-cap then external exec.
+      sr_stage_exec:
+        // (c) Builtin miss -> derive child sub-cap then external exec.
         // The derived cap lands in _sm_child_cap. Today the wire slot
         // is not consumed by sys_execve (Exec §DEFERRALS: kernel ABI
         // does not accept a sidecar arg yet); the derivation still
         // runs so the session-cap wiring is exercised and complete
-        // when the sidecar plumbing lands.
+        // when the sidecar plumbing lands. Per-stage derivation is
+        // correct even under the fork-gap because the target for
+        // stage[i] is a distinct child from stage[i-1]; re-deriving
+        // per iteration keeps that invariant when #44 lands.
         lea rdi, [rip + _sm_child_cap];
         mov rsi, 1;                          // slot 1 in child's cap_table
         mov rdx, 1;                          // parent session_id placeholder
@@ -801,12 +879,28 @@ module Shell = structure {
         // exec_spawn_and_wait(argv_ptr, argv_bytes, argc).
         mov rdi, r14;
         mov rsi, r15;
-        mov rdx, rbx;
+        mov rdx, [rsp + 0];
         call exec_spawn_and_wait;
-        // Fall through with rax = exit code or EX_ERR_*.
+        mov rbx, rax;                        // last_rc = exec rc
+
+      sr_stage_next:
+        add r12, 1;
+        jmp sr_stage_loop;
+
+      sr_stage_done:
+        // Return the last stage's rc (POSIX pipeline convention).
+        mov rax, rbx;
+        add rsp, 16;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
 
       sr_propagate:
-        add rsp, 8;
+        // Lex or parse rejected -- rax already holds the sentinel.
+        add rsp, 16;
         pop r15;
         pop r14;
         pop r13;
@@ -816,7 +910,7 @@ module Shell = structure {
 
       sr_ok_empty:
         xor rax, rax;                        // SR_OK
-        add rsp, 8;
+        add rsp, 16;
         pop r15;
         pop r14;
         pop r13;

@@ -52,6 +52,63 @@ staging pattern.
 - shell#46 step 3: the KIND_TTY(read) seam swap inside
   `lr_read_one_byte` can now use `Syscall.sys_yield` verbatim
   without a further shell-side floor extension.
+## Unreleased — #45: shell_repl_step full stage walk
+
+`shell_repl_step` (`src/shell.pdx`) now iterates every stage the
+parser produced. The ENH-006 (#33) landing body ran only
+`_pr_stages[0]` and silently dropped `_pr_stages[1..]` -- a two-
+stage line like `ls | cat` ran `ls` alone and `| cat` disappeared
+without an error even though the parser had already emitted a
+correct two-stage table (verified by #30's `tsm_case_pipeline`
+golden). #45 replaces the stage[0]-only body with a loop over
+`[0, _pr_stage_count)` that per stage resolves the argv slice,
+tries `dispatch_line` first, and on `BI_MISS` derives the child
+sub-cap + calls `exec_spawn_and_wait`. The pipeline's return is
+the last stage's rc, matching the POSIX pipeline exit-code
+convention.
+
+Pipe-fd wiring (`sys_pipe` + per-stage stdin/stdout dup) and true
+parallel per-stage execution stay deferred until `sys_fork`
+(SC+56) lands under shell#44. Without fork, `exec_spawn_and_wait`
+either succeeds and never returns (kernel replaces the shell
+image) or fails with `EX_ERR_EXECVE_FAIL` (parent continues to
+the next stage). Post-#44 the fingerprint `ls | cat` produces
+piped output; #45's fingerprint today is `SH_ST_STAGES bumps by
+N for an N-stage line`, verified by the new
+`tshm_case_repl_pipe_stages` case.
+
+### Added
+
+- `src/shell.pdx` `SH_ST_STAGES` (slot 11) — one bump per
+  attempted stage inside `shell_repl_step`. Extends the shell
+  stats table from 11 to 12 populated slots; slots 12..15 stay
+  reserved for M4/M5. `shell_reset`'s 0..16 zero-loop already
+  covers the new slot without a bound change.
+- `tests/test_shell_main.pdx` `_tshm_arg_cd_pipe_cd` fixture
+  (`"cd | cd\0"`, 8 bytes) + `tshm_case_repl_pipe_stages` case
+  in the `0xFFFFED8A` fail sub-band. Asserts the two-stage line
+  returns `BI_ERR_CD_NO_ARG` (last stage wins) AND
+  `SH_ST_STAGES` bumps by exactly 2. Wired into `tshm_run_all`
+  after `tshm_case_repl_cd_noarg`.
+
+### Changed
+
+- `src/shell.pdx` `shell_repl_step` — body now walks
+  `[0, _pr_stage_count)` instead of executing only stage[0].
+  Register plan: `r12` repurposed post-parse from `line_ptr` to
+  the stage index `i`; `r13` from `line_len` to `stage_count`;
+  `rbx` from `argc` to `last_rc`; per-stage `argc` moves to a
+  `[rsp + 0]` stack slot (prologue widens `sub rsp, 8` to
+  `sub rsp, 16`; 56-byte prologue keeps `rsp % 16 == 0`).
+- `src/shell.pdx` slot-map comment + `SH_ST_STAGES` constant
+  block extended; the ENH-006 top-of-section header note now
+  points at the shell_repl_step §FORK-GAP + PIPE-WIRING
+  DEFERRALS block for what is / is not covered by #45.
+- `tests/test_shell_main.pdx` `tshm_reset` populates the new
+  `_tshm_arg_cd_pipe_cd` fixture with the same `mov rax, <lit>;
+  mov_b [r10 + N], rax` idiom the other argv-string fixtures
+  use; case-listing docstrings + `0xFFFFED8x` fail-code table +
+  case count in `tshm_run_all` all bumped from 10 to 11.
 
 ## Unreleased — ENH-008: history persist to disk (#35)
 

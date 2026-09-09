@@ -21,6 +21,8 @@
 //   tshm_case_argv_unknown     argv = ["shell","--foo"] -> SM_ERR_ARG_FLAG_UNKNOWN
 //   tshm_case_repl_empty       shell_repl_step("",0) -> SR_OK
 //   tshm_case_repl_cd_noarg    shell_repl_step("cd",2) -> BI_ERR_CD_NO_ARG
+//   tshm_case_repl_pipe_stages shell_repl_step("cd | cd",7) -> BI_ERR_CD_NO_ARG
+//                              AND SH_ST_STAGES bumps by 2 (paideia-os/shell#45)
 //
 // Deliberately NOT tested here (documented deferrals):
 //
@@ -65,6 +67,7 @@
 //   0xFFFFED87   TSHM_FAIL_ARGV_UNKNOWN          unknown flag did not raise error
 //   0xFFFFED88   TSHM_FAIL_REPL_EMPTY            empty-line did not return SR_OK
 //   0xFFFFED89   TSHM_FAIL_REPL_CD_NOARG        "cd" did not reach bi_cd(argc=1)
+//   0xFFFFED8A   TSHM_FAIL_REPL_PIPE_STAGES     "cd | cd" dropped a stage (#45)
 //
 // The 0xFFFFED8x band extends the family:
 //   0xFFFFED0x TestCapsNarrow  0xFFFFED4x TestSyscallFloor
@@ -108,6 +111,7 @@ module TestShellMain = structure {
   pub let TSHM_FAIL_ARGV_UNKNOWN   : u64 = 0xFFFFED87
   pub let TSHM_FAIL_REPL_EMPTY     : u64 = 0xFFFFED88
   pub let TSHM_FAIL_REPL_CD_NOARG  : u64 = 0xFFFFED89
+  pub let TSHM_FAIL_REPL_PIPE_STAGES : u64 = 0xFFFFED8A
 
   // ==========================================================================
   // Fixture buffers (.bss)
@@ -120,6 +124,8 @@ module TestShellMain = structure {
   //   _tshm_arg_script  "/tmp/s.pds\0"   11 bytes
   //   _tshm_arg_unknown "--foo\0"        6 bytes
   //   _tshm_arg_cd      "cd\0"           3 bytes
+  //   _tshm_arg_cd_pipe_cd
+  //                     "cd | cd\0"      8 bytes (#45 stage-walk fingerprint)
   //   _tshm_hello       "hello\0"        6 bytes
   //   _tshm_hell        "hell\0"         5 bytes
   //   _tshm_argv        [u64; 4]         shared argv[] scratch
@@ -134,6 +140,7 @@ module TestShellMain = structure {
   pub let mut _tshm_arg_script  : [u8; 16] = uninit @align(8)
   pub let mut _tshm_arg_unknown : [u8; 8]  = uninit @align(8)
   pub let mut _tshm_arg_cd      : [u8; 8]  = uninit @align(8)
+  pub let mut _tshm_arg_cd_pipe_cd : [u8; 8] = uninit @align(8)
   pub let mut _tshm_hello       : [u8; 8]  = uninit @align(8)
   pub let mut _tshm_hell        : [u8; 8]  = uninit @align(8)
   pub let mut _tshm_argv        : [u64; 4] = uninit @align(16)
@@ -238,6 +245,17 @@ module TestShellMain = structure {
         mov rax, 0x63; mov_b [r10 + 0], rax;
         mov rax, 0x64; mov_b [r10 + 1], rax;
         xor rax, rax;  mov_b [r10 + 2], rax;
+
+        // _tshm_arg_cd_pipe_cd: "cd | cd\0" (8 bytes) -- #45 fingerprint
+        lea r10, [rip + _tshm_arg_cd_pipe_cd];
+        mov rax, 0x63; mov_b [r10 + 0], rax;   // 'c'
+        mov rax, 0x64; mov_b [r10 + 1], rax;   // 'd'
+        mov rax, 0x20; mov_b [r10 + 2], rax;   // ' '
+        mov rax, 0x7C; mov_b [r10 + 3], rax;   // '|'
+        mov rax, 0x20; mov_b [r10 + 4], rax;   // ' '
+        mov rax, 0x63; mov_b [r10 + 5], rax;   // 'c'
+        mov rax, 0x64; mov_b [r10 + 6], rax;   // 'd'
+        xor rax, rax;  mov_b [r10 + 7], rax;   // NUL
 
         // _tshm_hello: "hello\0" (6 bytes)
         lea r10, [rip + _tshm_hello];
@@ -746,9 +764,82 @@ module TestShellMain = structure {
     }
 
   // ==========================================================================
+  // tshm_case_repl_pipe_stages() -> u64
+  //
+  // shell.#45 fingerprint: shell_repl_step must NOT silently drop
+  // _pr_stages[1..]. Feeds "cd | cd" (2 stages, both builtins) and
+  // asserts (a) rax == BI_ERR_CD_NO_ARG (last stage's rc, per the
+  // POSIX pipeline exit-code convention -- both stages hit bi_cd
+  // with argc=1 which returns BI_ERR_CD_NO_ARG), and (b) SH_ST_STAGES
+  // (slot 11) bumped by exactly 2 across the call (one bump per
+  // attempted stage). The pre-#45 body ran only stage[0] and returned
+  // BI_ERR_CD_NO_ARG from that stage alone with SH_ST_STAGES bumped by
+  // 0 (the slot did not exist), indistinguishable from the fix at the
+  // return-code level -- which is why the SH_ST_STAGES delta is the
+  // load-bearing half of the fingerprint.
+  //
+  // Chosen shape rationale: both stages must be builtins (dispatch
+  // hits, no exec attempt) so the case body does not risk touching
+  // sys_execve, which would either replace the driver image (killing
+  // the test binary) or return a live-kernel-dependent errno. Using
+  // `cd` twice reproduces the multi-stage walk without leaving the
+  // pure-function surface -- same discipline tshm_case_repl_cd_noarg
+  // established for the single-stage case.
+  //
+  // r12 across shell_repl_step: shell_repl_step's own prologue pushes
+  // r12, so the SH_ST_STAGES baseline we cache there before the call
+  // survives.
+  // ==========================================================================
+  pub let tshm_case_repl_pipe_stages : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, mem, fs},
+      justification: "shell.#45: multi-stage pipeline fingerprint. Runs shell_repl_step on 'cd | cd' (7-byte input, argc=1 each stage, both dispatch to bi_cd which returns BI_ERR_CD_NO_ARG for argc<2). Asserts two invariants: (a) return code == 0xFFFFECE1 (BI_ERR_CD_NO_ARG) which under the last-stage-wins POSIX convention proves the second `cd` executed (a pre-#45 stage[0]-only body ALSO returned BI_ERR_CD_NO_ARG from just stage[0], so this is a necessary-but-not-sufficient check); (b) SH_ST_STAGES (slot 11) bumped by exactly 2 across the call, which is the load-bearing half of the fingerprint -- a pre-#45 body would bump it by 0 (slot did not exist) or 1 (single-stage attempt), never 2. Baseline snapshot cached in r12 across the shell_repl_step call because shell_repl_step preserves callee-save r12 in its own prologue. 2 callee-save pushes (rbx, r12) + sub 8 = 24 bytes prologue for the three nested SysV calls (shell_stat, shell_repl_step, shell_stat). Large-imm compares 0xFFFFECE1 (BI_ERR_CD_NO_ARG expected rc) and 0xFFFFED8A (TSHM_FAIL_REPL_PIPE_STAGES reject sentinel) stage via `mov r11, imm64; cmp rax, r11`. Every other compare uses `cmp reg, imm` with imm <= 0x7FFFFFFF. Uses _tshm_arg_cd_pipe_cd (populated by tshm_reset) as the input buffer. Labels prefixed tshm_ps_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tshm_reset;
+
+        // Snapshot SH_ST_STAGES (slot 11) baseline into r12. Prior
+        // cases in this run may have bumped the slot; the invariant
+        // is the DELTA across shell_repl_step, not the absolute value.
+        mov rdi, 11;                         // SH_ST_STAGES
+        call shell_stat;
+        mov r12, rax;                        // baseline
+
+        // shell_repl_step(&_tshm_arg_cd_pipe_cd, 7).
+        lea rdi, [rip + _tshm_arg_cd_pipe_cd];
+        mov rsi, 7;
+        call shell_repl_step;
+
+        // (a) Return code == BI_ERR_CD_NO_ARG (last stage's rc).
+        mov r11, 0xFFFFECE1;                 // BI_ERR_CD_NO_ARG
+        cmp rax, r11;
+        jne tshm_ps_fail;
+
+        // (b) SH_ST_STAGES should have bumped by exactly 2.
+        mov rdi, 11;
+        call shell_stat;
+        sub rax, r12;
+        cmp rax, 2;
+        jne tshm_ps_fail;
+
+        xor rax, rax;
+        add rsp, 8; pop r12; pop rbx;
+        ret;
+
+      tshm_ps_fail:
+        mov rax, 0xFFFFED8A;                 // TSHM_FAIL_REPL_PIPE_STAGES
+        add rsp, 8; pop r12; pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // tshm_run_all() -> u64
   //
-  // Drive all 10 cases in issue order. Short-circuit on the first
+  // Drive all 11 cases in issue order. Short-circuit on the first
   // non-zero return.
   //
   // Prologue: 1 push (rbx) + `sub rsp, 8` = 16 bytes; rsp%16==0 for
@@ -757,7 +848,7 @@ module TestShellMain = structure {
   pub let tshm_run_all : () -> u64 !{mem, sysreg} @{sched, mem, fs} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched, mem, fs},
-      justification: "shell.ENH-006 (#33): drive all 10 TestShellMain cases in fingerprint order (strlen, streq, str_prefix, argv_c, argv_nohist, argv_nocap, argv_script, argv_unknown, repl_empty, repl_cd_noarg). Short-circuit on first non-zero. Effect/cap set is the union of every case; the widest is {mem, sysreg} @{sched, mem, fs} (repl_empty / repl_cd_noarg inherit shell_repl_step's declared union). 1 push + sub 8 = 16 bytes prologue; rsp%16==0 at every nested case call. Labels prefixed tshm_ra_.",
+      justification: "shell.ENH-006 (#33) + #45: drive all 11 TestShellMain cases in fingerprint order (strlen, streq, str_prefix, argv_c, argv_nohist, argv_nocap, argv_script, argv_unknown, repl_empty, repl_cd_noarg, repl_pipe_stages). Short-circuit on first non-zero. Effect/cap set is the union of every case; the widest is {mem, sysreg} @{sched, mem, fs} (repl_empty / repl_cd_noarg / repl_pipe_stages inherit shell_repl_step's declared union). 1 push + sub 8 = 16 bytes prologue; rsp%16==0 at every nested case call. Labels prefixed tshm_ra_.",
       block: {
         push rbx;
         sub rsp, 8;
@@ -799,6 +890,10 @@ module TestShellMain = structure {
         jne tshm_ra_out;
 
         call tshm_case_repl_cd_noarg;
+        cmp rax, 0;
+        jne tshm_ra_out;
+
+        call tshm_case_repl_pipe_stages;
 
       tshm_ra_out:
         add rsp, 8;
