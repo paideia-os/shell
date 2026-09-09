@@ -451,6 +451,17 @@ module Shell = structure {
   pub let sm_err_unknown_flag_str : [u8; 21] = "shell: unknown flag\n\0"
   pub let sm_err_session_mint_str : [u8; 28] = "shell: session_mint failed\n\0"
 
+  // ENH-006 (#33): entry-frame fingerprint. Emitted once at shell_main
+  // entry to stderr so a boot-time smoke driver can prove the ELF entry
+  // symbol resolved and the entry body executed (both were the concern
+  // in the #33 reopen review). Also grep-able as a rodata string in the
+  // built binary before boot -- proves the entry frame compiled with the
+  // right symbol name even on a system whose linker cannot yet resolve
+  // `entry = Shell::shell_main` from the manifest. Body is 14 bytes
+  // ("SHELL MAIN OK\n"); `[u8; 15]` = strlen + NUL per the paideia-as
+  // fingerprint-string sizing rule.
+  pub let sm_fp_entry_str         : [u8; 15] = "SHELL MAIN OK\n\0"
+
   // ==========================================================================
   // sm_strlen(ptr) -> u64
   //
@@ -941,6 +952,7 @@ module Shell = structure {
   //
   // Sequence:
   //   0. Read argc/argv from initial stack (r15/r14).
+  //   0a. Emit `SHELL MAIN OK\n` fingerprint to stderr (once).
   //   1. shell_reset -- clear stats counters.
   //   2. shell_argv_dispatch -- populate _sm_opt_* singletons.
   //   3. dispatch_init -- populate builtin table + reset env table.
@@ -970,12 +982,27 @@ module Shell = structure {
   pub let shell_main : () -> () !{mem, sysreg} @{sched, mem, fs} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched, mem, fs},
-      justification: "shell.ENH-006 (#33) + ENH-007 (#34): the shell's ELF entry frame. Reads argc/argv from the SysV initial process stack (argc at [rsp+0], argv qwords at [rsp+8..], argv[argc]==NULL); envp/InitCap follow but are untouched at ENH-006 (D5: no env; sidecar loader-managed). Sequence: shell_reset -> shell_argv_dispatch (unknown flag -> stderr `shell: unknown flag\\n` + sys_exit(1)) -> dispatch_init -> session_mint into _sm_session_cap with SM_SESSION_ID (bad-return -> stderr `shell: session_mint failed\\n` + sys_exit(1)) -> either one shell_repl_step (if -c) then sys_exit(0), or the interactive REPL loop. Interactive loop: `$ ` prompt via sys_write(fd=1, 2), line via line_reader_read_line into _sm_line_buf (cap 4096), shell_repl_step, history_encode_record into _sm_hist_buf ring (unless --no-history), repeat. EOF is signalled by line_reader returning 0 (mid-stream EOF caught nowhere else -- shouldn't happen after ENH-007 since 0-byte-at-start returns LR_ERR_EOF, but preserved defensively), LR_ERR_EOF (0xFFFFEC13; 0-byte read at start), or LR_ERR_READ_FAIL (0xFFFFEC14; unrecoverable read errno). LR_ERR_BAD_BUF (0xFFFFEC11) is also treated as EOF defensively -- the alternative is a spin on a misbehaving line reader. LR_STUB is RETIRED at ENH-007 and no longer handled here. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (large-imm sentinels 0xFFFFEC1x stage via `mov r11, imm64; cmp rax, r11`). r15/r14 hold argc/argv_base across nested calls; every callee that uses those regs preserves them per SysV (verified: dispatch_line, exec_spawn_and_wait, lexer_tokenize, parser_parse, session_mint, line_reader_read_line, dispatch_init, shell_reset -- none clobber r14/r15 without a matching push+pop). r13 holds the interactive line length across shell_repl_step + history_encode_record; both push r13 in their prologues so the value survives. @no_frame: this function is the ELF entry point (manifest.pdxproj `entry = Shell::shell_main`), so no push/pop parity is set up; rsp % 16 == 0 at process entry (SysV) and remains so at every nested `call` since no local stack activity happens in this body. History ring append: dst = _sm_hist_buf + _sm_hist_used; skips when _sm_hist_used >= 8192 (ring full or would-underflow the remaining-capacity compute) or when the remaining capacity is < 32 bytes (smallest useful record is 24-byte header + 1 byte + 7 bytes pad = 32). Labels prefixed sm_. Never returns; sys_exit terminates the task on every exit path.",
+      justification: "shell.ENH-006 (#33) + ENH-007 (#34): the shell's ELF entry frame. Reads argc/argv from the SysV initial process stack (argc at [rsp+0], argv qwords at [rsp+8..], argv[argc]==NULL); envp/InitCap follow but are untouched at ENH-006 (D5: no env; sidecar loader-managed). Sequence: SHELL MAIN OK fingerprint sys_write (fd=2, sm_fp_entry_str, 14) -> shell_reset -> shell_argv_dispatch (unknown flag -> stderr `shell: unknown flag\\n` + sys_exit(1)) -> dispatch_init -> session_mint into _sm_session_cap with SM_SESSION_ID (bad-return -> stderr `shell: session_mint failed\\n` + sys_exit(1)) -> either one shell_repl_step (if -c) then sys_exit(0), or the interactive REPL loop. Interactive loop: `$ ` prompt via sys_write(fd=1, 2), line via line_reader_read_line into _sm_line_buf (cap 4096), shell_repl_step, history_encode_record into _sm_hist_buf ring (unless --no-history), repeat. EOF is signalled by line_reader returning 0 (mid-stream EOF caught nowhere else -- shouldn't happen after ENH-007 since 0-byte-at-start returns LR_ERR_EOF, but preserved defensively), LR_ERR_EOF (0xFFFFEC13; 0-byte read at start), or LR_ERR_READ_FAIL (0xFFFFEC14; unrecoverable read errno). LR_ERR_BAD_BUF (0xFFFFEC11) is also treated as EOF defensively -- the alternative is a spin on a misbehaving line reader. LR_STUB is RETIRED at ENH-007 and no longer handled here. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (large-imm sentinels 0xFFFFEC1x stage via `mov r11, imm64; cmp rax, r11`). r15/r14 hold argc/argv_base across nested calls; every callee that uses those regs preserves them per SysV (verified: dispatch_line, exec_spawn_and_wait, lexer_tokenize, parser_parse, session_mint, line_reader_read_line, dispatch_init, shell_reset -- none clobber r14/r15 without a matching push+pop). r13 holds the interactive line length across shell_repl_step + history_encode_record; both push r13 in their prologues so the value survives. @no_frame: this function is the ELF entry point (manifest.pdxproj `entry = Shell::shell_main`), so no push/pop parity is set up; rsp % 16 == 0 at process entry (SysV) and remains so at every nested `call` since no local stack activity happens in this body. History ring append: dst = _sm_hist_buf + _sm_hist_used; skips when _sm_hist_used >= 8192 (ring full or would-underflow the remaining-capacity compute) or when the remaining capacity is < 32 bytes (smallest useful record is 24-byte header + 1 byte + 7 bytes pad = 32). Labels prefixed sm_. Never returns; sys_exit terminates the task on every exit path.",
       block: {
         // Read argc / argv from initial stack.
         mov r15, [rsp + 0];                  // argc
         mov r14, rsp;
         add r14, 8;                          // argv_base = &argv[0]
+
+        // (0) Fingerprint beacon: sys_write(2, "SHELL MAIN OK\n", 14).
+        //     One-shot, unconditional, first business after argc/argv are
+        //     latched. Proves at runtime that the ELF entry symbol
+        //     resolved and the entry frame executed -- the two concerns
+        //     the debugger review of 7f3a860 raised when it reopened #33.
+        //     sys_write preserves r14/r15 (leaf syscall wrapper: only
+        //     rax/rcx/r11 clobbered per SysV syscall convention). The
+        //     stderr choice matches the argv/session error paths; a
+        //     boot-time smoke can grep either fd 2 or the built binary
+        //     for the sm_fp_entry_str rodata blob.
+        mov rdi, 2;
+        lea rsi, [rip + sm_fp_entry_str];
+        mov rdx, 14;                         // strlen (exclude NUL)
+        call sys_write;
 
         // (1) Reset stats.
         call shell_reset;
