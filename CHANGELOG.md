@@ -4,6 +4,61 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — R73.M1-006 (#26): job-control + tab-completion fingerprints
+
+Lands the observability handle for R73 job-control (bg/fg/jobs/tab-
+completion). No caller yet — the row-add / row-complete / match-set
+wires land with #22 (sys_setpgid, pgrp mint), #23 (bg/fg + wait4
+tracking), #24 (`jobs` builtin), #25 (tab-completion driver). The tag
+byte counts are locked at this landing so future callers just call the
+emit helpers without a round-trip on the fingerprint spec.
+
+**New file `src/jobs.pdx` (module `Jobs`):**
+
+- `_jb_jobs_table : [u64; 48] = uninit @align(64)` — 16 rows × 24 bytes
+  each. Row layout: `{jid: u64, pid: u64, state: u32, exit_status: u32}`.
+  Empty today; #22/#23 install the writers.
+- `JB_TABLE_MAX = 16`, `JB_ROW_SIZE = 24`, plus row-field byte offsets
+  (`JB_ROW_OFF_JID / _PID / _STATE / _EXIT_STATUS`) and state
+  vocabulary placeholders (`JB_STATE_FREE / _BG / _STOPPED / _WAITED`).
+- Rodata `jb_fp_job_ok_prefix` (18 bytes visible: `shell job ok -- n=`),
+  `jb_fp_job_ok_sep_pid` (5 bytes: ` pid=`), `jb_fp_job_ok_sep_state`
+  (7 bytes: ` state=`). Each `[u8; N]` = strlen + 1 per the paideia-as
+  fingerprint-string rule.
+- `shell_fp_job_ok(n, pid, state) -> ()` — single-write fingerprint
+  witness emitting `shell job ok -- n=<N> pid=<P> state=<S>\n` to fd 2.
+  Prologue: 4 callee-save pushes + `sub rsp, 104` = 136 bytes; 104-byte
+  stack scratch covers the 91-byte worst-case composition.
+
+**Extended `src/completion.pdx` (module `Completion`):**
+
+- Rodata `cp_fp_complete_ok_prefix` (28 bytes visible:
+  `shell complete ok -- prefix=`), `cp_fp_complete_ok_sep_matches`
+  (9 bytes: ` matches=`), `cp_fp_complete_ok_nl` (1 byte: `\n`).
+- `shell_fp_complete_ok(prefix_ptr, prefix_len, matches) -> ()` —
+  five-sys_write fingerprint witness emitting
+  `shell complete ok -- prefix=<X> matches=<M>\n` to fd 2. Multi-write
+  keeps arbitrary-length `<X>` off the stack (COMP_NAME_MAX == 512).
+  Prologue: 3 callee-save pushes + `sub rsp, 32` = 56 bytes.
+
+**Extended `src/shell.pdx` (module `Shell`):**
+
+- Two new stats slot constants: `SH_ST_JOBS = 14`, `SH_ST_JOBS_COMPLETED
+  = 15`. Both live inside the existing 16-slot `_shell_stats` table (no
+  layout change; slots 13..15 were already reserved). Bumped by the
+  future #22/#23 sites around `shell_fp_job_ok`, not inside the witness,
+  so a state-transition-only call and a fresh row-add call can bump
+  different counters.
+
+**Manifest:** `src/jobs.pdx` added to the `sources:` list of
+`manifest.pdxproj` between `src/command_record.pdx` and
+`src/release_manifest.pdx`.
+
+Encoder pitfalls check: no `test` mnemonic, no `and r, imm64`, no
+2-operand `imul r, imm`; every `cmp reg, imm` uses imm ≤ 0x7FFFFFFF
+(byte-count literals 18, 5, 7, 27, 9 fit trivially); every byte
+memory access uses the `xor + mov_b + [ptr + idx * 1]` pattern.
+
 ## Unreleased — R66.M1-004 (#20): cursor-left/right in-place edit
 
 Fills in the LEFT/RIGHT arrow branches R66.M1-001 (#17) landed as

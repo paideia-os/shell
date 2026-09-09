@@ -407,4 +407,154 @@ module Completion = structure {
         ret
       }
     }
+
+  // ==========================================================================
+  // R73.M1-006 (#26): tab-completion fingerprint witness.
+  //
+  // Emits the line `shell complete ok -- prefix=<X> matches=<M>\n` to fd
+  // 2 (stderr) at the point the registry-walk driver produces a match
+  // set. Called by the future tab-completion driver (R73.M1-005 (#25))
+  // AFTER each match-set finalises so a boot-time smoke driver
+  // (paideia-os side) can grep stderr for the fingerprint and cross-
+  // check `<M>` against the driver's own count.
+  //
+  // The witness is a STUB TODAY -- no in-tree caller yet (the tab-
+  // completion driver at #25 has not landed). The wire tag and byte
+  // counts are locked at this landing so the future driver just calls
+  // this helper without a round-trip on the fingerprint spec.
+  //
+  // Wire format:
+  //   shell complete ok -- prefix=<X> matches=<M>\n
+  //
+  // <X> is the raw prefix bytes the user typed (variable length; UTF-8
+  // passthrough), <M> the decimal-rendered match count. Emission uses
+  // multi-write (five sys_write calls) rather than a single-buffer
+  // composition so the user prefix can be arbitrary length without a
+  // bounded stack scratch -- COMP_NAME_MAX is 512 bytes but the
+  // prefix passed here is a partial-word that could in principle reach
+  // that ceiling (e.g. a pasted long path being tab-completed). The
+  // five writes are strictly sequential from a single-threaded shell,
+  // so a stderr reader sees the composed line atomically at the
+  // process level; a POSIX-style stderr file (no line buffering) may
+  // still interleave with a concurrent stderr writer, but the shell is
+  // single-threaded at HEAD and the R66.M1-003 history_ring_witness
+  // uses the same discipline without observed interleave.
+  //
+  // Rodata blobs:
+  //   cp_fp_complete_ok_prefix        "shell complete ok -- prefix=" (28 bytes)
+  //   cp_fp_complete_ok_sep_matches   " matches="                    (9 bytes)
+  //   cp_fp_complete_ok_nl            "\n"                           (1 byte)
+  //
+  // Each `[u8; N]` = strlen + 1 per the paideia-as fingerprint-string
+  // rule (feedback_pdx_encoder_pitfalls). The trailing NUL is NEVER
+  // emitted; the sys_write byte count spells the visible strlen.
+  // ==========================================================================
+  pub let cp_fp_complete_ok_prefix      : [u8; 29] = "shell complete ok -- prefix=\0"
+  pub let cp_fp_complete_ok_sep_matches : [u8; 10] = " matches=\0"
+  pub let cp_fp_complete_ok_nl          : [u8; 2]  = "\n\0"
+
+  // Wire lengths (excluding the trailing NUL). Named so the sys_write
+  // byte count is symbolic and stays in sync with the string above at
+  // edit time.
+  pub let cp_fp_complete_ok_prefix_len      : u64 = 28
+  pub let cp_fp_complete_ok_sep_matches_len : u64 = 9
+
+  // ==========================================================================
+  // shell_fp_complete_ok(prefix_ptr, prefix_len, matches) -> ()
+  //
+  // Signature: shell_fp_complete_ok : (u64, u64, u64) -> () !{mem, sysreg} @{fs}
+  // RDI (input): prefix_ptr  -- VA of the raw prefix bytes (caller-owned;
+  //                             NOT NUL-terminated, wire uses prefix_len)
+  // RSI (input): prefix_len  -- prefix byte length (0..COMP_NAME_MAX);
+  //                             0 emits `prefix=` with an empty value
+  //                             which is a legitimate fingerprint (the
+  //                             user pressed TAB on an empty prompt to
+  //                             list all top-level command candidates)
+  // RDX (input): matches     -- decimal-rendered match count
+  //
+  // Emits five sequential sys_write calls to fd 2:
+  //   (1) `shell complete ok -- prefix=` (28 bytes rodata)
+  //   (2) [prefix_ptr, prefix_len)       (variable; skipped if prefix_len==0)
+  //   (3) ` matches=`                    (9 bytes rodata)
+  //   (4) [scratch, digit_count)         (decimal-rendered matches)
+  //   (5) `\n`                           (1 byte rodata)
+  //
+  // No counter bump inside this body -- the caller (future R73.M1-005
+  // tab-completion driver) is expected to bump SH_ST_COMPLETIONS (slot
+  // 9) at the same time it calls the encoder for each match; the
+  // witness only observes the finalised match set.
+  //
+  // Register plan:
+  //   r12 = prefix_ptr cache (callee-save across 5 sys_write calls)
+  //   r13 = prefix_len cache (same)
+  //   r14 = matches cache    (same)
+  //   rax, rcx, rdi, rsi, rdx = short-scratch (call args)
+  //   [rsp + 0 .. rsp + 31] = 32-byte decimal-render scratch
+  //     (20 bytes max for u64 render + 12 bytes headroom = round to
+  //      32 for the SysV rsp%16==0 invariant across nested calls)
+  //
+  // Prologue: 3 callee-save pushes + `sub rsp, 32` = 56 bytes. Entry
+  // rsp%16==8; 3 pushes -> rsp%16 = (8-24) mod 16 = 0; sub rsp, 32 ->
+  // rsp%16 = (0-32) mod 16 = 0. Nested calls all see rsp%16==0.
+  //
+  // Labels prefixed `cp_cw_`.
+  // ==========================================================================
+  pub let shell_fp_complete_ok : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (prefix_ptr: u64) (prefix_len: u64) (matches: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R73.M1-006 (#26): tab-completion fingerprint witness. Emits `shell complete ok -- prefix=<X> matches=<M>\\n` to fd 2 via five sequential sys_write calls: (1) the 27-byte prefix `shell complete ok -- prefix=`, (2) the caller-owned prefix bytes at [prefix_ptr, prefix_len) verbatim (skipped when prefix_len==0 -- legitimate fingerprint for `TAB on empty prompt lists all top-level candidates`), (3) the 9-byte ` matches=` separator, (4) the decimal-rendered matches count via History::history_format_u64_dec into a 32-byte stack scratch, (5) the 1-byte `\\n` terminator. Multi-write rather than single-buffer composition because prefix_len can reach COMP_NAME_MAX (512 bytes -- a pasted long path being tab-completed); a stack scratch large enough would push the prologue past 600 bytes, and a bounded copy would truncate legitimate prefixes. The five writes are strictly sequential in a single-threaded shell so the composed line reaches stderr atomically at process granularity. No counter bump inside -- the caller (future R73.M1-005 tab-completion driver) bumps SH_ST_COMPLETIONS (slot 9, already reserved by the encoder path) at match-generation time; the witness observes the finalised set only. Prologue: 3 callee-save pushes (r12 prefix_ptr, r13 prefix_len, r14 matches) + sub rsp, 32 = 56 bytes; entry rsp%16==8, 3 pushes -> rsp%16 = (8-24) mod 16 = 0, sub rsp, 32 -> rsp%16 = 0, every nested sys_write / format_u64_dec sees rsp%16==0. All byte-count literals (27, 9, 1) fit imm <= 0x7FFFFFFF trivially. r11 unused in this body (rodata reaches use direct LEA into rsi as sys_write's buf arg, no intermediate stash). Cross-module call to history_format_u64_dec is linker-resolved by symbol name (same discipline as Shell::history_ring_witness in src/shell.pdx line ~1147). Labels prefixed cp_cw_.",
+      block: {
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 32;
+
+        mov r12, rdi;                        // prefix_ptr cache
+        mov r13, rsi;                        // prefix_len cache
+        mov r14, rdx;                        // matches cache
+
+        // (1) sys_write(fd=2, cp_fp_complete_ok_prefix, 27)
+        mov rdi, 2;
+        lea rsi, [rip + cp_fp_complete_ok_prefix];
+        mov rdx, 28;                         // cp_fp_complete_ok_prefix_len
+        call sys_write;
+
+        // (2) If prefix_len > 0: sys_write(fd=2, prefix_ptr, prefix_len)
+        cmp r13, 0;
+        je  cp_cw_skip_prefix;
+        mov rdi, 2;
+        mov rsi, r12;
+        mov rdx, r13;
+        call sys_write;
+      cp_cw_skip_prefix:
+
+        // (3) sys_write(fd=2, cp_fp_complete_ok_sep_matches, 9)
+        mov rdi, 2;
+        lea rsi, [rip + cp_fp_complete_ok_sep_matches];
+        mov rdx, 9;                          // cp_fp_complete_ok_sep_matches_len
+        call sys_write;
+
+        // (4) Render matches decimal into stack scratch, then sys_write.
+        mov rdi, r14;                        // value = matches
+        mov rsi, rsp;                        // out_buf = scratch base
+        call history_format_u64_dec;
+        // rax = digit count (1..20)
+        mov rdi, 2;
+        mov rsi, rsp;
+        mov rdx, rax;
+        call sys_write;
+
+        // (5) sys_write(fd=2, cp_fp_complete_ok_nl, 1)
+        mov rdi, 2;
+        lea rsi, [rip + cp_fp_complete_ok_nl];
+        mov rdx, 1;
+        call sys_write;
+
+        add rsp, 32;
+        pop r14;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
 }

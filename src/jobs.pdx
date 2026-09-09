@@ -1,0 +1,342 @@
+// src/jobs.pdx -- R73.M1-006 (paideia-os/shell#26)
+//
+// Jobs module: job-control observability handle + jobs-table skeleton.
+//
+// =============================================================================
+// SCOPE
+// =============================================================================
+//
+// This lands the observability half of R73 job-control (bg/fg/jobs/
+// tab-completion). It ships:
+//
+//   * `_jb_jobs_table` -- .bss skeleton, 16 rows * 24 bytes each. Row
+//     layout: {jid: u64, pid: u64, state: u32, exit_status: u32}. The
+//     row size 24 (== 3 qwords) is 8-multiple so `[u64; 48]` (48 * 8 =
+//     384 bytes) covers the whole table with u64-aligned access. Empty
+//     today (no reader / writer); the row-add wire lands with #22
+//     (sys_setpgid, pgrp mint) and the row-complete wire with #23
+//     (bg/fg + wait4 tracking).
+//
+//   * `shell_fp_job_ok(n, pid, state)` -- fingerprint witness that emits
+//     the line `shell job ok -- n=<N> pid=<P> state=<S>\n` to fd 2
+//     (stderr). Called by the future row-add site in #22/#23 after a
+//     state transition (bg foreground->background via ^Z, wait4 return,
+//     fg background->foreground, etc.). The witness ONLY emits the
+//     fingerprint -- counter bump (SH_ST_JOBS, slot 14) is the caller's
+//     responsibility so a caller that emits the fingerprint but does
+//     NOT install a new row (e.g. a state-only transition on an
+//     existing jid) bumps a different counter than a caller that DOES
+//     install a new row.
+//
+// The `shell complete ok -- prefix=<X> matches=<M>` fingerprint witness
+// for R73.M1-005 (#25, tab-completion) lands in src/completion.pdx
+// alongside `Completion::completion_encode_record` that it observes.
+// The two witnesses live in separate modules so each one sits next to
+// the state the fingerprint describes, matching the tree's inline-
+// emission convention (issue #26 body: "this repo emits fingerprints
+// inline via shell_note at the call site of the feature they
+// describe, not from a standalone fingerprint module").
+//
+// =============================================================================
+// FINGERPRINT WIRE FORMAT
+// =============================================================================
+//
+// One emission is the ASCII text:
+//
+//   shell job ok -- n=<N> pid=<P> state=<S>\n
+//
+// where <N>, <P>, <S> are decimal-rendered u64 values (leading zeros
+// omitted; 0 renders as one '0' byte). Written to fd 2 as ONE
+// sys_write of at most 91 bytes (18-byte prefix + 20-byte n + 5-byte
+// " pid=" + 20-byte pid + 7-byte " state=" + 20-byte state + 1-byte
+// '\n'). One-write atomicity keeps the fingerprint intact even when a
+// concurrent writer to stderr (a child stage in the same pipeline, once
+// #44 sys_fork lands) is emitting bytes simultaneously.
+//
+// =============================================================================
+// JOBS TABLE LAYOUT (skeleton -- no reader/writer today)
+// =============================================================================
+//
+// 16 rows * 24 bytes = 384 bytes (48 qwords), @align(64) so the table
+// starts on a cache-line boundary. Row byte offset i => i * 24. Field
+// offsets within a row:
+//
+//   +0    u64 jid           1..JB_TABLE_MAX; 0 means "row unused"
+//   +8    u64 pid           child pid (>= 1 when row is active)
+//   +16   u32 state         JB_STATE_* (bg, stopped, waited, ...)
+//   +20   u32 exit_status   wait4 low byte on JB_STATE_WAITED; 0 else
+//
+// The 24-byte row fits 2 fully-populated u64 fields + 1 fused u64
+// (state | exit_status << 32), which is the shape #22/#23 will write:
+// one qword store for the jid, one for the pid, one for the fused
+// state/exit_status pair. All three stores are naturally aligned; no
+// intra-row torn writes on x86-64.
+//
+// JB_STATE_* values are placeholders here; the state vocabulary is
+// pinned when #22 lands the actual signal-handling paths (SIGTSTP,
+// SIGCONT, SIGCHLD) that drive the transitions.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Jobs`), no directory prefix.
+//   - No `test` mnemonic; every zero-check uses `cmp reg, 0`.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF (byte-count literals
+//     18, 5, 7 fit trivially).
+//   - Large immediates: none in this module. sys_write's fd=2 is a
+//     small integer, string byte-counts are also small.
+//   - r11 reserved as .bss LEA scratch for the rodata prefix / sep
+//     blobs (per the shell.pdx pattern of `lea r11, [rip + sym]` for
+//     every RIP-relative reach).
+//   - Byte reads via `xor rax, rax; mov_b rax, [ptr]`; byte writes via
+//     `mov_b [ptr], rax`, both with explicit `* 1` index scale per
+//     the #1248 / U1606 mitigation.
+//   - `shell_fp_job_ok`: 4 callee-save pushes (rbx cursor, r12 n cache,
+//     r13 pid cache, r14 state cache) + `sub rsp, 104` = 136 bytes
+//     prologue. Entry rsp%16==8; 4 pushes -> rsp%16==8; sub rsp, 104
+//     -> rsp%16==0 (since (8 - 32 - 104) mod 16 == 0). Nested calls to
+//     `history_format_u64_dec`, `sys_write` all see rsp%16==0.
+//   - Fingerprint-string sizing: `[u8; N]` = strlen + 1 per the
+//     paideia-as fingerprint-string rule (feedback_pdx_encoder_pitfalls).
+//   - Labels prefixed `jb_` (jb_jw_prefix_head, jb_jw_pid_head, etc.).
+
+module Jobs = structure {
+
+  // ==========================================================================
+  // Table capacity + row layout constants
+  // ==========================================================================
+
+  // Maximum jobs tracked in _jb_jobs_table. 16 rows chosen so the table
+  // fits in 6 cache lines (16 * 24 = 384 bytes). A live shell rarely
+  // has > 4 backgrounded jobs at once; 16 is generous. Fits imm <=
+  // 0x7FFFFFFF trivially.
+  pub let JB_TABLE_MAX : u64 = 16
+
+  // One row size in bytes. 24 = 3 qwords (jid, pid, fused state |
+  // exit_status). Row byte offset for i is i * 24; #22/#23 compute this
+  // via shl+add+shl (i*3<<3) to avoid the 2-op `imul r,imm` pitfall
+  // from feedback_pdx_encoder_pitfalls.
+  pub let JB_ROW_SIZE  : u64 = 24
+
+  // Row field byte offsets within one 24-byte row.
+  pub let JB_ROW_OFF_JID         : u64 = 0
+  pub let JB_ROW_OFF_PID         : u64 = 8
+  pub let JB_ROW_OFF_STATE       : u64 = 16
+  pub let JB_ROW_OFF_EXIT_STATUS : u64 = 20
+
+  // State vocabulary (placeholders; pinned when #22 lands signal path).
+  //
+  //   JB_STATE_FREE     row is unused (jid==0 also implies free)
+  //   JB_STATE_BG       job running in the background
+  //   JB_STATE_STOPPED  job stopped (^Z / SIGTSTP)
+  //   JB_STATE_WAITED   wait4 has returned; exit_status is meaningful
+  pub let JB_STATE_FREE    : u64 = 0
+  pub let JB_STATE_BG      : u64 = 1
+  pub let JB_STATE_STOPPED : u64 = 2
+  pub let JB_STATE_WAITED  : u64 = 3
+
+  // ==========================================================================
+  // .bss jobs table skeleton
+  //
+  // 16 rows * 24 bytes = 384 bytes total. Declared as [u64; 48] so field
+  // access is naturally u64-aligned; the low 24 bytes of each row hold
+  // the four documented fields (jid, pid, state|reserved, exit_status
+  // fused into the third qword's high 32 bits). @align(64) puts the
+  // table on a cache-line boundary so an SMP variant of the row-scan
+  // path (unlikely in a single-threaded shell, but cheap) does not
+  // straddle a line for row 0.
+  //
+  // Empty today -- no reader / writer. #22 (sys_setpgid + pgrp mint)
+  // and #23 (bg/fg + wait4 tracking) install the writers; the readers
+  // are `bg`/`fg`/`jobs` builtins landing in the same wave.
+  // ==========================================================================
+  pub let mut _jb_jobs_table : [u64; 48] = uninit @align(64)
+
+  // ==========================================================================
+  // Fingerprint rodata blobs
+  //
+  // Each `[u8; N]` = strlen + 1 per the paideia-as fingerprint-string
+  // rule (feedback_pdx_encoder_pitfalls). The trailing NUL is NEVER
+  // emitted to sys_write; the sys_write byte count spells the visible
+  // strlen and stops before the NUL.
+  //
+  //   jb_fp_job_ok_prefix        "shell job ok -- n=" (18 bytes)
+  //   jb_fp_job_ok_sep_pid       " pid="              (5 bytes)
+  //   jb_fp_job_ok_sep_state     " state="            (7 bytes)
+  //
+  // The overall wire assembles as:
+  //   [prefix 18] [n decimal 1..20] [sep_pid 5] [pid decimal 1..20]
+  //   [sep_state 7] [state decimal 1..20] [newline 1]
+  // Worst case 18 + 20 + 5 + 20 + 7 + 20 + 1 = 91 bytes; the 104-byte
+  // stack scratch has 13 bytes of headroom (rounded up to keep the
+  // SysV rsp%16==0 invariant across nested calls; see prologue math
+  // above).
+  // ==========================================================================
+  pub let jb_fp_job_ok_prefix    : [u8; 19] = "shell job ok -- n=\0"
+  pub let jb_fp_job_ok_sep_pid   : [u8; 6]  = " pid=\0"
+  pub let jb_fp_job_ok_sep_state : [u8; 8]  = " state=\0"
+
+  // Wire lengths (excluding the trailing NUL each rodata blob carries
+  // for `[u8; strlen+1]` sizing). Named so the sys_write byte count is
+  // symbolic and stays in sync with the string above at edit time.
+  pub let jb_fp_job_ok_prefix_len    : u64 = 18
+  pub let jb_fp_job_ok_sep_pid_len   : u64 = 5
+  pub let jb_fp_job_ok_sep_state_len : u64 = 7
+
+  // ==========================================================================
+  // shell_fp_job_ok(n, pid, state) -> ()
+  //
+  // Signature: shell_fp_job_ok : (u64, u64, u64) -> () !{mem, sysreg} @{fs}
+  // RDI (input): n      -- job identifier (jid); typically 1..JB_TABLE_MAX
+  // RSI (input): pid    -- child pid (>= 1); rendered decimal
+  // RDX (input): state  -- JB_STATE_* value; rendered decimal
+  //
+  // Emits ONE sys_write of the composed line
+  //   `shell job ok -- n=<N> pid=<P> state=<S>\n`
+  // to fd 2 (stderr). Single-write atomicity so a concurrent stderr
+  // writer (future post-fork child, or the R66.M1-003 history witness)
+  // cannot interleave bytes with this fingerprint's characters.
+  //
+  // The witness is a STUB TODAY -- no in-tree caller (job-add wire lands
+  // with #22, job-complete wire with #23). The tag byte counts are
+  // locked at this landing so future callers just call the helper; the
+  // wire format is the public contract a boot-time smoke driver (paideia-
+  // os side) can grep for once the caller lands.
+  //
+  // Register plan:
+  //   rbx = scratch cursor into the stack composition buffer (also the
+  //         final sys_write count; both roles collapse into one register)
+  //   r12 = n cache      (callee-save across format_u64_dec + sys_write)
+  //   r13 = pid cache    (same)
+  //   r14 = state cache  (same)
+  //   rax, rcx, rdi, rsi, rdx = short-scratch (call args / byte load)
+  //   r10, r11 = LEA scratch for the three rodata blobs
+  //   [rsp + 0 .. rsp + 103] = 104-byte composition scratch
+  //
+  // Prologue: 4 callee-save pushes + `sub rsp, 104` = 136 bytes. Entry
+  // rsp%16==8; 4 pushes -> rsp%16==(8-32) mod 16 == 8; `sub rsp, 104`
+  // -> rsp%16 == (8-32-104) mod 16 == 0. Nested calls to
+  // history_format_u64_dec + sys_write all see rsp%16==0.
+  //
+  // No counter bump inside this body. The two counter slots this issue
+  // reserves (SH_ST_JOBS = 14, SH_ST_JOBS_COMPLETED = 15 in shell.pdx)
+  // are bumped by the CALLER of this witness, so a state-only transition
+  // (state change on an already-existing row) and a fresh row-add can
+  // bump different counters while sharing this single emit helper.
+  //
+  // Labels prefixed `jb_jw_`.
+  // ==========================================================================
+  pub let shell_fp_job_ok : (u64, u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (n: u64) (pid: u64) (state: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R73.M1-006 (#26): job-control fingerprint witness. Emits the line `shell job ok -- n=<N> pid=<P> state=<S>\\n` to fd 2 in ONE sys_write so a concurrent stderr writer (post-#44 forked child in the same pipeline, or R66.M1-003's own history witness) cannot interleave bytes with this line. Composed in a 104-byte stack scratch: 18-byte prefix + up to 20-byte n decimal + 5-byte ` pid=` + up to 20-byte pid decimal + 7-byte ` state=` + up to 20-byte state decimal + 1-byte '\\n' = 91 bytes worst-case; the 104-byte allocation is rounded up to satisfy the SysV rsp%16==0 invariant across three nested calls (history_format_u64_dec x 3, sys_write x 1). Decimal render via History::history_format_u64_dec (cross-module call resolved by the linker at symbol name; the shell tree already calls it cross-module from Shell::history_ring_witness at src/shell.pdx line ~1147). All byte loads from the rodata prefix / sep blobs use `xor rax, rax; mov_b rax, [r11 + rcx * 1]` per the #1248 / U1606 mitigation; the store into the scratch uses `mov_b [rsp + rbx * 1], rax` at the same discipline. Byte-count literals 18, 5, 7 fit imm <= 0x7FFFFFFF trivially. No counter bump inside this body -- the caller (future #22/#23 job-add or job-complete site) is expected to bump SH_ST_JOBS (slot 14) or SH_ST_JOBS_COMPLETED (slot 15) as a separate call, so a state-transition-only fingerprint (no new row) and a row-add fingerprint can bump different counters while sharing this emit helper. Prologue: 4 callee-save pushes (rbx cursor, r12 n, r13 pid, r14 state) + sub rsp, 104 = 136 bytes; entry rsp%16==8, after 4 pushes rsp%16 stays at 8 (since 32 bytes cancels mod 16), after sub rsp, 104 rsp%16 = (8 - 104) mod 16 = 0, so every nested SysV call sees rsp%16==0. r11 as LEA scratch for the rodata blobs (paideia-as convention). Labels prefixed jb_jw_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 104;
+
+        mov r12, rdi;                        // n cache
+        mov r13, rsi;                        // pid cache
+        mov r14, rdx;                        // state cache
+        xor rbx, rbx;                        // cursor = 0
+
+        // ------------------------------------------------------------
+        // (1) Copy jb_fp_job_ok_prefix[0..18] into scratch[0..18).
+        // ------------------------------------------------------------
+      jb_jw_prefix_head:
+        cmp rbx, 18;
+        jae jb_jw_prefix_done;
+        lea r11, [rip + jb_fp_job_ok_prefix];
+        xor rax, rax;
+        mov_b rax, [r11 + rbx * 1];
+        mov_b [rsp + rbx * 1], rax;
+        add rbx, 1;
+        jmp jb_jw_prefix_head;
+      jb_jw_prefix_done:
+
+        // ------------------------------------------------------------
+        // (2) Render n decimal at scratch[cursor], advance cursor.
+        // ------------------------------------------------------------
+        mov rdi, r12;                        // value = n
+        mov rsi, rsp;
+        add rsi, rbx;                        // out_buf = &scratch[cursor]
+        call history_format_u64_dec;
+        add rbx, rax;                        // cursor += digit count
+
+        // ------------------------------------------------------------
+        // (3) Copy jb_fp_job_ok_sep_pid " pid=" (5 bytes) into scratch.
+        // ------------------------------------------------------------
+        xor rcx, rcx;                        // inner index 0..5
+      jb_jw_pid_head:
+        cmp rcx, 5;
+        jae jb_jw_pid_done;
+        lea r11, [rip + jb_fp_job_ok_sep_pid];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        mov_b [rsp + rbx * 1], rax;
+        add rbx, 1;
+        add rcx, 1;
+        jmp jb_jw_pid_head;
+      jb_jw_pid_done:
+
+        // ------------------------------------------------------------
+        // (4) Render pid decimal at scratch[cursor], advance cursor.
+        // ------------------------------------------------------------
+        mov rdi, r13;                        // value = pid
+        mov rsi, rsp;
+        add rsi, rbx;
+        call history_format_u64_dec;
+        add rbx, rax;
+
+        // ------------------------------------------------------------
+        // (5) Copy jb_fp_job_ok_sep_state " state=" (7 bytes).
+        // ------------------------------------------------------------
+        xor rcx, rcx;
+      jb_jw_state_head:
+        cmp rcx, 7;
+        jae jb_jw_state_done;
+        lea r11, [rip + jb_fp_job_ok_sep_state];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        mov_b [rsp + rbx * 1], rax;
+        add rbx, 1;
+        add rcx, 1;
+        jmp jb_jw_state_head;
+      jb_jw_state_done:
+
+        // ------------------------------------------------------------
+        // (6) Render state decimal at scratch[cursor], advance cursor.
+        // ------------------------------------------------------------
+        mov rdi, r14;                        // value = state
+        mov rsi, rsp;
+        add rsi, rbx;
+        call history_format_u64_dec;
+        add rbx, rax;
+
+        // ------------------------------------------------------------
+        // (7) Append '\n' (0x0A) at scratch[cursor].
+        // ------------------------------------------------------------
+        mov rax, 0x0A;
+        mov_b [rsp + rbx * 1], rax;
+        add rbx, 1;
+
+        // ------------------------------------------------------------
+        // (8) sys_write(fd=2, scratch, cursor).
+        // ------------------------------------------------------------
+        mov rdi, 2;
+        mov rsi, rsp;
+        mov rdx, rbx;
+        call sys_write;
+
+        add rsp, 104;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

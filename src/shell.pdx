@@ -216,8 +216,11 @@ module Shell = structure {
   //   9  SH_ST_COMPLETIONS   completion_encode_record entries      (M3-002)
   //   10 SH_ST_AUDITS        command_record_begin + _close entries (M3-003)
   //   11 SH_ST_STAGES        shell_repl_step per-stage attempts     (#45)
-  //   12..15                 reserved for M4/M5 (audit fingerprints,
+  //   12 SH_ST_RECALL        up/down arrow recall walks             (#19)
+  //   13                     reserved for M4/M5 (audit fingerprints,
   //                          smoke matrix, dual-signed release counters)
+  //   14 SH_ST_JOBS          jobs-table row-add events              (R73.M1-006, #26)
+  //   15 SH_ST_JOBS_COMPLETED jobs-table wait4-return events         (R73.M1-006, #26)
   //
   // The table grew from 8 to 16 at M3 to accommodate the three new
   // event classes M3 introduces without another re-layout. 16 fits
@@ -246,6 +249,10 @@ module Shell = structure {
   pub let SH_ST_AUDITS      : u64 = 10  // M3-003
   pub let SH_ST_STAGES      : u64 = 11  // #45: per-stage attempts in shell_repl_step
   pub let SH_ST_RECALL      : u64 = 12  // R66.M1-003 (#19): up/down arrow recall walks
+  // Slot 13 reserved for a future M4/M5 counter (audit fingerprints,
+  // smoke matrix, dual-signed release counters).
+  pub let SH_ST_JOBS           : u64 = 14  // R73.M1-006 (#26): jobs-table row-add events; bumped by future #22/#23 job-add site around shell_fp_job_ok
+  pub let SH_ST_JOBS_COMPLETED : u64 = 15  // R73.M1-006 (#26): jobs-table wait4-return events; bumped by future #22/#23 job-complete site around shell_fp_job_ok
   pub let SH_ST_MAX         : u64 = 16
 
   // ==========================================================================

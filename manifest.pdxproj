@@ -48,6 +48,7 @@ sources:
   - src/pipe_passthrough.pdx      # M3-001: semantic-pipe passthrough
   - src/completion.pdx            # M3-002: CommandCompletion encoder
   - src/command_record.pdx        # M3-003: ShellCommandRecord audit encoder
+  - src/jobs.pdx                  # R73.M1-006 (#26): job-control fingerprint witness + jobs-table skeleton
   - src/release_manifest.pdx      # M5-001: manifest.pdxsig encoder
   - src/broker_bind.pdx           # M5-001: svc.login-shell registration
 
