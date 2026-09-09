@@ -338,6 +338,34 @@ module LineReader = structure {
   pub let lr_erase_str : [u8; 4] = "\x08 \x08\0"
 
   // ==========================================================================
+  // R66.M1-004 (#20): cursor-motion byte strings.
+  //
+  //   lr_bs_one_str      -- one 0x08 byte, the VT100 cursor-left. Written
+  //                         to fd 1 on LEFT arrow (SK_LEFT / LR_KEY_LEFT).
+  //                         `\b` is preferred over `ESC [ D` at #20 for the
+  //                         same reason #18 chose it for backspace erase:
+  //                         smaller, older, more portable, and does not
+  //                         re-enter the S_CSI FSM branch if the byte ever
+  //                         loops back to us.
+  //
+  //   lr_move_right_str  -- three bytes ESC '[' 'C' (CSI cursor-forward,
+  //                         ECMA-48 CUF 1). Written to fd 1 on RIGHT arrow
+  //                         (SK_RIGHT / LR_KEY_RIGHT). Chosen over re-
+  //                         emitting the buffer byte at the old cursor
+  //                         position per design/user/shell-line-editing.md
+  //                         §7.3: re-emitting a byte would render a literal
+  //                         `\t` or `\a` at the cursor position very
+  //                         differently on right-arrow than left-arrow
+  //                         does; ESC [ C is a pure motion and always safe.
+  //
+  // Sizing per the paideia-as fingerprint-string convention: N =
+  // strlen + 1 (trailing NUL); the sys_write count arg (rdx) at the call
+  // site consumes strlen, not N.
+  // ==========================================================================
+  pub let lr_bs_one_str     : [u8; 2] = "\x08\0"
+  pub let lr_move_right_str : [u8; 4] = "\x1b[C\0"
+
+  // ==========================================================================
   // lr_read_one_byte(byte_ptr) -> u64
   //
   // SINGLE SEAM: the sole call site of `sys_read` in the LineReader
@@ -1113,6 +1141,334 @@ module LineReader = structure {
     }
 
   // ==========================================================================
+  // R66.M1-004 (#20): lr_insert_mid(buf, byte, count, cursor) -> new_count
+  //
+  // Signature: lr_insert_mid : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI (input): buf     -- caller's line buffer (base, immutable)
+  // RSI (input): byte    -- byte to insert (low 8 bits; upper bits ignored)
+  // RDX (input): count   -- current byte count (0 < count <= buf_cap - 1)
+  // RCX (input): cursor  -- insertion point (0 <= cursor < count)
+  // RAX (output): new byte count (= count + 1)
+  //
+  // Preconditions (enforced by the caller line_reader_read_line):
+  //   cursor < count   -- callers dispatch end-append (cursor == count) to
+  //                       a separate fast path that skips this helper.
+  //   count < buf_cap  -- the loop header returns when r14 >= buf_cap, so
+  //                       we always have room for one more byte.
+  //
+  // Effects (per design/user/shell-line-editing.md §7.4):
+  //   1. Shift buf[cursor..count] right by one -> buf[cursor+1..count+1].
+  //   2. Store byte at buf[cursor].
+  //   3. Compose in Shell::_sm_line_edit_scratch:
+  //        scratch[0]                    = byte
+  //        scratch[1..1+tail_len]        = buf[cursor+1..count+1]
+  //        scratch[1+tail_len..1+2*tl]   = 0x08 * tail_len
+  //      where tail_len = count - cursor.
+  //   4. sys_write(1, _sm_line_edit_scratch, 1 + 2*tail_len).
+  //   5. _sm_line_cursor := cursor + 1.
+  //
+  // The one-`sys_write` compound matters per §7.4 -- a per-byte write
+  // would give the user a visible tearing artifact on slow terminals.
+  //
+  // Scratch sizing: worst case is count=4095, cursor=0, tail_len=4095,
+  // total = 1 + 2*4095 = 8191 bytes, fits in the 8192-byte scratch.
+  //
+  // Register plan (5 callee-save pushes = 40 bytes; rsp % 16 == 0 at
+  // every nested SysV call):
+  //   rbx = buf (base)
+  //   r12 = byte value (low 8 bits)
+  //   r13 = count (for return staging: new_count = count + 1)
+  //   r14 = cursor
+  //   r15 = tail_len (= count - cursor, computed once, reused)
+  // Loop scratches: rcx, r8, r9, r10 (scratch base for scratch buf), r11
+  // (via lea for cross-module .bss reach; r10/r11 clobbered by sys_write
+  // and re-staged after).
+  //
+  // Entry rsp%16==8 (return addr); 5 pushes = 40 bytes -> rsp%16==0 at
+  // every nested `call` (sys_write). No `sub rsp, 8` needed.
+  // Labels prefixed lr_im_.
+  // ==========================================================================
+  pub let lr_insert_mid : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (byte: u64) (count: u64) (cursor: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-004 (#20): mid-line insert helper for the SK_LITERAL (byte) event at cursor < count. Shifts buf[cursor..count] right by one via a backwards walk (dst=rcx, src=rcx-1, rcx decreasing from count down to cursor+1), stores the byte at buf[cursor], then composes the design/user/shell-line-editing.md §7.4 sys_write bundle in Shell::_sm_line_edit_scratch: `byte + tail + \\b * tail_len`. Total emitted bytes = 1 + 2*(count-cursor), fits in the 8192-byte scratch (worst case count=4095, cursor=0, tail_len=4095, total=8191). Single sys_write per §7.4 to avoid tearing on slow terminals. Byte load via xor+mov_b per #1248; byte store via mov_b [reg + reg * 1] per U1606 (explicit *1 scale). Modifies _sm_line_cursor .bss singleton to cursor+1 after the write completes so a hypothetical concurrent reader sees a coherent (buffer, cursor) pair. New count = count + 1 returned in rax. 5 callee-save pushes (rbx buf, r12 byte, r13 count, r14 cursor, r15 tail_len) + no sub rsp = 40 bytes; entry rsp%16==8 + 40 = rsp%16==0 at every nested SysV call (sys_write). Encoder conformance: no `test`; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears); byte constants 0x08 fit imm8. r11 used only for `lea [rip + <symbol>]` staging (paideia-as scratch discipline). Labels prefixed lr_im_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = buf
+        mov r12, rsi;                        // r12 = byte
+        mov r13, rdx;                        // r13 = count
+        mov r14, rcx;                        // r14 = cursor
+        mov r15, r13;
+        sub r15, r14;                        // r15 = tail_len = count - cursor
+
+        // ------------------------------------------------------------
+        // Shift buf[cursor..count] right by one, walking dst backwards
+        // from count down to cursor+1: buf[rcx] = buf[rcx - 1] for
+        // rcx in (cursor, count].
+        // ------------------------------------------------------------
+        mov rcx, r13;                        // rcx = count (loop dst)
+      lr_im_shift:
+        cmp rcx, r14;
+        jbe lr_im_shift_done;                // rcx <= cursor -> done
+        // src = buf[rcx - 1]
+        mov r10, rcx;
+        sub r10, 1;
+        xor rax, rax;
+        mov_b rax, [rbx + r10 * 1];
+        // dst = buf[rcx]
+        mov_b [rbx + rcx * 1], rax;
+        sub rcx, 1;
+        jmp lr_im_shift;
+      lr_im_shift_done:
+
+        // Store the new byte at buf[cursor].
+        mov rax, r12;
+        mov_b [rbx + r14 * 1], rax;
+
+        // ------------------------------------------------------------
+        // Compose scratch[0..1+2*tail_len] = byte + tail + \b*tail_len.
+        // r10 = scratch base (freshly LEA'd for each phase so it survives
+        // subsequent nested calls without being clobbered).
+        // ------------------------------------------------------------
+        // (a) scratch[0] = byte.
+        lea r10, [rip + _sm_line_edit_scratch];
+        mov rax, r12;
+        mov_b [r10], rax;
+
+        // (b) scratch[1 + i] = buf[cursor + 1 + i] for i in 0..tail_len.
+        xor rcx, rcx;                        // i = 0
+      lr_im_copy_tail:
+        cmp rcx, r15;
+        jae lr_im_copy_tail_done;
+        // src index = cursor + 1 + i
+        mov r9, r14;
+        add r9, 1;
+        add r9, rcx;
+        xor rax, rax;
+        mov_b rax, [rbx + r9 * 1];
+        // dst index = 1 + i
+        mov r8, rcx;
+        add r8, 1;
+        lea r10, [rip + _sm_line_edit_scratch];
+        mov_b [r10 + r8 * 1], rax;
+        add rcx, 1;
+        jmp lr_im_copy_tail;
+      lr_im_copy_tail_done:
+
+        // (c) scratch[1 + tail_len + i] = 0x08 for i in 0..tail_len.
+        xor rcx, rcx;                        // i = 0
+      lr_im_fill_bs:
+        cmp rcx, r15;
+        jae lr_im_fill_bs_done;
+        // dst index = 1 + tail_len + i
+        mov r8, r15;
+        add r8, 1;
+        add r8, rcx;
+        mov rax, 0x08;                       // backspace
+        lea r10, [rip + _sm_line_edit_scratch];
+        mov_b [r10 + r8 * 1], rax;
+        add rcx, 1;
+        jmp lr_im_fill_bs;
+      lr_im_fill_bs_done:
+
+        // ------------------------------------------------------------
+        // sys_write(fd=1, buf=scratch, count = 1 + 2*tail_len).
+        // ------------------------------------------------------------
+        mov rdx, r15;
+        add rdx, r15;                        // rdx = 2*tail_len
+        add rdx, 1;                          // rdx = 1 + 2*tail_len
+        mov rdi, 1;
+        lea rsi, [rip + _sm_line_edit_scratch];
+        call sys_write;
+
+        // Update _sm_line_cursor := cursor + 1.
+        add r14, 1;
+        lea r11, [rip + _sm_line_cursor];
+        mov [r11], r14;
+
+        // Return new count = count + 1.
+        mov rax, r13;
+        add rax, 1;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // R66.M1-004 (#20): lr_bs_mid(buf, count, cursor) -> new_count
+  //
+  // Signature: lr_bs_mid : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI (input): buf     -- caller's line buffer (base, immutable)
+  // RSI (input): count   -- current byte count (0 < count)
+  // RDX (input): cursor  -- insertion point (0 < cursor < count)
+  // RAX (output): new byte count (= count - 1)
+  //
+  // Preconditions (enforced by the caller line_reader_read_line):
+  //   cursor > 0        -- callers dispatch column-zero BS to a full no-op
+  //                        branch that skips this helper (§5.1).
+  //   cursor < count    -- callers dispatch end-BS (cursor == count) to
+  //                        the existing \b \b fast path that skips this
+  //                        helper.
+  //
+  // Effects (per design/user/shell-line-editing.md §7.5):
+  //   1. Shift buf[cursor..count] left by one -> buf[cursor-1..count-1].
+  //   2. Compose in Shell::_sm_line_edit_scratch:
+  //        scratch[0]                        = 0x08 (\b)
+  //        scratch[1..1+tail_len]            = buf[cursor-1..cursor-1+tail_len]
+  //        scratch[1+tail_len]               = 0x20 (space)
+  //        scratch[2+tail_len..3+2*tail_len] = 0x08 * (tail_len + 1)
+  //      where tail_len = count - cursor.
+  //   3. sys_write(1, _sm_line_edit_scratch, 3 + 2*tail_len).
+  //   4. _sm_line_cursor := cursor - 1.
+  //
+  // Scratch sizing: worst case cursor=1, count=4095, tail_len=4094,
+  // total = 3 + 2*4094 = 8191 bytes, fits in the 8192-byte scratch.
+  //
+  // Register plan (5 callee-save pushes = 40 bytes; rsp % 16 == 0 at
+  // every nested SysV call):
+  //   rbx = buf (base)
+  //   r12 = (padding push for alignment parity with lr_insert_mid)
+  //   r13 = count (for return staging: new_count = count - 1)
+  //   r14 = cursor
+  //   r15 = tail_len (= count - cursor)
+  //
+  // Entry rsp%16==8 (return addr); 5 pushes = 40 bytes -> rsp%16==0 at
+  // every nested `call` (sys_write). No `sub rsp, 8` needed.
+  // Labels prefixed lr_bm_.
+  // ==========================================================================
+  pub let lr_bs_mid : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (count: u64) (cursor: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-004 (#20): mid-line backspace helper for SK_BACKSPACE with 0 < cursor < count. Shifts buf[cursor..count] left by one via a forward walk (src=cursor+k, dst=cursor-1+k, k in [0, tail_len)), then composes the design/user/shell-line-editing.md §7.5 sys_write bundle in Shell::_sm_line_edit_scratch: `\\b + tail + space + \\b * (tail_len + 1)`. Trailing space overwrites the character that used to be the rightmost, which the leftward shift would otherwise leave visible; the (tail_len + 1) backspaces walk the cursor back to just past buf[cursor-1] (the new insertion point). Total emitted bytes = 3 + 2*(count-cursor), fits in the 8192-byte scratch (worst case cursor=1, count=4095, tail_len=4094, total=8191). Single sys_write per §7.5's atomicity concern (same rationale as §7.4). Byte load via xor+mov_b per #1248; byte store via mov_b [reg + reg * 1] per U1606. Modifies _sm_line_cursor .bss singleton to cursor-1 after the write completes. New count = count - 1 returned in rax. 5 callee-save pushes (rbx buf, r12 padding, r13 count, r14 cursor, r15 tail_len) + no sub rsp = 40 bytes; entry rsp%16==8 + 40 = rsp%16==0 at every nested SysV call (sys_write). The 5th push (r12) is a padding slot -- we don't actually use r12 in this body -- but it lets the prologue/epilogue mirror lr_insert_mid's shape and, more importantly, satisfies the paideia-as alignment rule without a sub rsp, 8 (which for a 5-push function would misalign; per user's #20 warning). r12 is callee-save so pushing/popping it is harmless. Encoder conformance: no `test`; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 appears); byte constants 0x08 / 0x20 fit imm8. Labels prefixed lr_bm_.",
+      block: {
+        push rbx;
+        push r12;                            // padding for alignment parity
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // rbx = buf
+        mov r13, rsi;                        // r13 = count
+        mov r14, rdx;                        // r14 = cursor
+        mov r15, r13;
+        sub r15, r14;                        // r15 = tail_len = count - cursor
+
+        // ------------------------------------------------------------
+        // Shift buf[cursor..count] left by one: buf[cursor-1+k] =
+        // buf[cursor+k] for k in [0, tail_len).
+        // ------------------------------------------------------------
+        xor rcx, rcx;                        // k = 0
+      lr_bm_shift:
+        cmp rcx, r15;
+        jae lr_bm_shift_done;
+        // src index = cursor + k
+        mov r9, r14;
+        add r9, rcx;
+        xor rax, rax;
+        mov_b rax, [rbx + r9 * 1];
+        // dst index = cursor - 1 + k = r9 - 1
+        mov r8, r9;
+        sub r8, 1;
+        mov_b [rbx + r8 * 1], rax;
+        add rcx, 1;
+        jmp lr_bm_shift;
+      lr_bm_shift_done:
+
+        // ------------------------------------------------------------
+        // Compose scratch: \b + tail + space + \b * (tail_len + 1).
+        // ------------------------------------------------------------
+        // (a) scratch[0] = 0x08.
+        lea r10, [rip + _sm_line_edit_scratch];
+        mov rax, 0x08;
+        mov_b [r10], rax;
+
+        // (b) scratch[1 + i] = buf[cursor - 1 + i] for i in 0..tail_len.
+        // (After the shift, buf[cursor - 1 .. cursor - 1 + tail_len]
+        //  holds the new visible tail.)
+        xor rcx, rcx;                        // i = 0
+      lr_bm_copy_tail:
+        cmp rcx, r15;
+        jae lr_bm_copy_tail_done;
+        // src index = cursor - 1 + i
+        mov r9, r14;
+        sub r9, 1;
+        add r9, rcx;
+        xor rax, rax;
+        mov_b rax, [rbx + r9 * 1];
+        // dst index = 1 + i
+        mov r8, rcx;
+        add r8, 1;
+        lea r10, [rip + _sm_line_edit_scratch];
+        mov_b [r10 + r8 * 1], rax;
+        add rcx, 1;
+        jmp lr_bm_copy_tail;
+      lr_bm_copy_tail_done:
+
+        // (c) scratch[1 + tail_len] = 0x20 (space).
+        mov r8, r15;
+        add r8, 1;                           // 1 + tail_len
+        mov rax, 0x20;
+        lea r10, [rip + _sm_line_edit_scratch];
+        mov_b [r10 + r8 * 1], rax;
+
+        // (d) scratch[2 + tail_len + i] = 0x08 for i in 0..tail_len+1.
+        // Loop iteration count = tail_len + 1, stored in r9 for the cmp.
+        mov r9, r15;
+        add r9, 1;                           // r9 = tail_len + 1 (loop bound)
+        xor rcx, rcx;                        // i = 0
+      lr_bm_fill_bs:
+        cmp rcx, r9;
+        jae lr_bm_fill_bs_done;
+        // dst index = 2 + tail_len + i
+        mov r8, r15;
+        add r8, 2;
+        add r8, rcx;
+        mov rax, 0x08;
+        lea r10, [rip + _sm_line_edit_scratch];
+        mov_b [r10 + r8 * 1], rax;
+        add rcx, 1;
+        jmp lr_bm_fill_bs;
+      lr_bm_fill_bs_done:
+
+        // ------------------------------------------------------------
+        // sys_write(fd=1, buf=scratch, count = 3 + 2*tail_len).
+        // ------------------------------------------------------------
+        mov rdx, r15;
+        add rdx, r15;                        // rdx = 2*tail_len
+        add rdx, 3;                          // rdx = 3 + 2*tail_len
+        mov rdi, 1;
+        lea rsi, [rip + _sm_line_edit_scratch];
+        call sys_write;
+
+        // Update _sm_line_cursor := cursor - 1.
+        sub r14, 1;
+        lea r11, [rip + _sm_line_cursor];
+        mov [r11], r14;
+
+        // Return new count = count - 1.
+        mov rax, r13;
+        sub rax, 1;
+
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // line_reader_read_line(buf, buf_len) -> u64
   //
   // Signature: line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs}
@@ -1161,7 +1517,7 @@ module LineReader = structure {
   pub let line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (buf: u64) (buf_len: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17) + R66.M1-002 (#18) + R66.M1-003 (#19): byte-at-a-time line assembly over the key-event FSM. #17 folded 0x1B [...final and 0x7F into LR_KEY_* sentinels; #18 added on-screen `\\b \\b` erase; #19 refactored r12 to hold the buffer BASE (immutable) so byte writes are `mov_b [r12 + r14 * 1], rax`, letting up/down recall helpers overwrite via r14 assignment. Backspace (LR_KEY_BACKSPACE): shrinks r14 if count > 0 AND per #18 emits sys_write(1, lr_erase_str, 3); column-zero is a full no-op (no shrink, no erase). Does NOT reset the recall cursor (§6.3). Arrow-UP/DOWN call lr_recall_up/down and set r14 := returned count (or iterate on LR_KEY_RECALL_NOP). Arrow LEFT/RIGHT still discarded at #19 (#20's scope). Every RAW-byte append resets _sm_hist_recall_cursor := _sm_hist_head (§6.3 draft promotion). Three callee-save pushes (r12=buf_base, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_key, sys_write, lr_recall_up, lr_recall_down). No `sub rsp, 8` needed. Counter discipline unchanged from ENH-007: PROMPTS - LINES - ERRORS == 0 holds. Encoder conformance: no `test`; imm compares <= 0x7FFFFFFF; large-imm sentinels stage via `mov r11, imm64; cmp rax, r11`; byte STORE via `mov_b [r12 + r14 * 1], rax` per U1606 mitigation. Labels prefixed lr_rl_.",
+      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17) + R66.M1-002 (#18) + R66.M1-003 (#19) + R66.M1-004 (#20): byte-at-a-time line assembly over the key-event FSM. #17 folded 0x1B [...final and 0x7F into LR_KEY_* sentinels; #18 added on-screen `\\b \\b` erase; #19 refactored r12 to hold the buffer BASE (immutable) so byte writes are `mov_b [r12 + r14 * 1], rax`, letting up/down recall helpers overwrite via r14 assignment; #20 layers an in-line cursor state (_sm_line_cursor .bss singleton) on top, honouring LEFT/RIGHT + mid-line insert/BS with tail redraw per design/user/shell-line-editing.md §7. #20 does NOT introduce a new callee-save register: cursor is loaded from .bss on each branch that reads it (human-typing rate makes the extra load negligible) and updated in the helpers or inline. Backspace (LR_KEY_BACKSPACE): (a) cursor==0 -> full no-op (no shrink, no erase); (b) cursor==count -> existing shape (r14--, sys_write \\b \\b), plus cursor--; (c) 0<cursor<count -> call lr_bs_mid which shifts + redraws + updates cursor. Does NOT reset the recall cursor (§6.3). Arrow-UP/DOWN call lr_recall_up/down, set r14 := returned count AND set _sm_line_cursor := r14 (end-of-recalled-line per §6.3 step 3). Arrow LEFT: cursor>0 -> cursor--, sys_write(lr_bs_one_str, 1); else drop. Arrow RIGHT: cursor<r14 -> sys_write(lr_move_right_str, 3), cursor++; else drop. Raw-byte: newline (0x0A) FIRST -> commit at end regardless of cursor position (§4 SK_ENTER semantics). Non-newline: cursor==count -> existing end-append fast path (store [r12+r14], r14++, cursor++); cursor<count -> lr_insert_mid (shift + store + redraw + cursor++). Every RAW-byte APPEND/INSERT resets _sm_hist_recall_cursor := _sm_hist_head (§6.3 draft promotion). Line-scoped cursor reset (§7.1): _sm_line_cursor := 0 at every entry, right after prologue. Three callee-save pushes (r12=buf_base, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_key, sys_write, lr_recall_up, lr_recall_down, lr_insert_mid, lr_bs_mid). No `sub rsp, 8` needed. Counter discipline unchanged from ENH-007: PROMPTS - LINES - ERRORS == 0 holds. Encoder conformance: no `test`; imm compares <= 0x7FFFFFFF; large-imm sentinels stage via `mov r11, imm64; cmp rax, r11`; byte STORE via `mov_b [r12 + r14 * 1], rax` per U1606 mitigation. Labels prefixed lr_rl_.",
       block: {
         push r12;
         push r13;
@@ -1170,6 +1526,14 @@ module LineReader = structure {
         mov r12, rdi;                        // r12 = buf BASE (immutable)
         mov r13, rsi;                        // r13 = buf_len
         xor r14, r14;                        // r14 = bytes-read count = 0
+
+        // R66.M1-004 (#20): line-scoped cursor reset per design §7.1.
+        // _sm_line_cursor tracks the insertion point within [0, count]
+        // for the CURRENT read_line invocation; reset to 0 so LEFT at
+        // column zero drops correctly regardless of prior line state.
+        xor rax, rax;
+        lea r11, [rip + _sm_line_cursor];
+        mov [r11], rax;
 
         // SH_ST_PROMPTS bumps on every entry (prompt was displayed;
         // caller-gate rejects still count as prompt attempts).
@@ -1214,37 +1578,104 @@ module LineReader = structure {
         cmp rax, r11;
         je  lr_rl_down;
 
-        // Arrow LEFT/RIGHT / UNKNOWN: recognised but ignored at #19
-        // (#20 replaces LEFT/RIGHT with in-buffer cursor motion).
+        // R66.M1-004 (#20): Arrow LEFT / RIGHT dispatch.
         mov r11, 0xFFFFEC52;                 // LR_KEY_LEFT
         cmp rax, r11;
-        je  lr_rl_loop;
+        je  lr_rl_left;
         mov r11, 0xFFFFEC53;                 // LR_KEY_RIGHT
         cmp rax, r11;
-        je  lr_rl_loop;
+        je  lr_rl_right;
+
+        // UNKNOWN: recognised but ignored.
         mov r11, 0xFFFFEC55;                 // LR_KEY_UNKNOWN
         cmp rax, r11;
         je  lr_rl_loop;
 
-        // Raw byte (0..0xFF): append to buffer at [r12 + r14].
+        // R66.M1-004 (#20): Raw byte (0..0xFF).
+        //
+        // Newline (0x0A) FIRST: commit at end regardless of cursor
+        // position, matching SK_ENTER semantics (§4 dispatch table).
+        // Storing 0x0A at [r12 + r14] preserves the ENH-007 return
+        // contract (buffer holds the terminator, caller sees count
+        // including newline).
+        cmp rax, 0x0A;
+        je  lr_rl_newline_commit;
+
+        // Non-newline. Load cursor; check if at end (fast path) or
+        // mid-line (helper path).
+        lea r11, [rip + _sm_line_cursor];
+        mov r10, [r11];                      // r10 = cursor
+        cmp r10, r14;
+        jne lr_rl_insert_mid_call;
+
+        // End-append fast path: store byte, r14++, cursor++.
         mov_b [r12 + r14 * 1], rax;          // byte store (low byte of rax)
         add r14, 1;                          // count++
+        mov r10, r14;                        // cursor = count (end)
+        lea r11, [rip + _sm_line_cursor];
+        mov [r11], r10;
+        jmp lr_rl_reset_recall;
 
-        // Newline check: return count (includes the newline byte).
-        cmp rax, 0x0A;
-        je  lr_rl_return_count;
+      lr_rl_insert_mid_call:
+        // Mid-line insert: lr_insert_mid(buf=r12, byte=rax, count=r14, cursor=r10).
+        // Helper shifts buf, stores byte, redraws tail, updates
+        // _sm_line_cursor, returns new_count in rax.
+        mov rdi, r12;                        // buf base
+        mov rsi, rax;                        // byte value (low 8 bits)
+        mov rdx, r14;                        // count
+        mov rcx, r10;                        // cursor
+        call lr_insert_mid;
+        mov r14, rax;                        // r14 := new count
+        jmp lr_rl_reset_recall;
 
-        // R66.M1-003 (#19): after every raw-byte append, reset the
-        // recall cursor to head. The store is idempotent when the
-        // shell was not recalling (recall_cursor == head already), so
-        // an unconditional store is cheaper than a compare+branch.
-        // Uses rax as scratch (byte value no longer needed after the
-        // store).
+      lr_rl_newline_commit:
+        // ENTER: append 0x0A at [r12 + r14], r14++, then return count.
+        // Cursor state is NOT updated -- the next read_line entry
+        // resets _sm_line_cursor to 0 anyway (§7.1).
+        mov_b [r12 + r14 * 1], rax;
+        add r14, 1;
+        jmp lr_rl_return_count;
+
+      lr_rl_reset_recall:
+        // R66.M1-003 (#19): after every raw-byte append or mid-insert,
+        // reset the recall cursor to head (draft-promotion per §6.3).
+        // The store is idempotent when the shell was not recalling.
         lea r11, [rip + _sm_hist_head];
         mov rax, [r11];
         lea r11, [rip + _sm_hist_recall_cursor];
         mov [r11], rax;
+        jmp lr_rl_loop;
 
+      lr_rl_left:
+        // R66.M1-004 (#20) SK_LEFT (§7.2): if cursor > 0, cursor--,
+        // sys_write(1, "\b", 1). Terminal cursor moves left one column.
+        lea r11, [rip + _sm_line_cursor];
+        mov r10, [r11];
+        cmp r10, 0;
+        je  lr_rl_loop;                      // at column zero -> drop
+        sub r10, 1;
+        mov [r11], r10;
+        mov rdi, 1;
+        lea rsi, [rip + lr_bs_one_str];
+        mov rdx, 1;
+        call sys_write;
+        jmp lr_rl_loop;
+
+      lr_rl_right:
+        // R66.M1-004 (#20) SK_RIGHT (§7.3): if cursor < count,
+        // sys_write(1, "ESC [ C", 3), cursor++. ESC [ C is a pure
+        // motion (does not depend on the byte at the old cursor
+        // being printable, unlike re-emitting buf[cursor]).
+        lea r11, [rip + _sm_line_cursor];
+        mov r10, [r11];
+        cmp r10, r14;
+        jae lr_rl_loop;                      // at end -> drop
+        add r10, 1;
+        mov [r11], r10;
+        mov rdi, 1;
+        lea rsi, [rip + lr_move_right_str];
+        mov rdx, 3;
+        call sys_write;
         jmp lr_rl_loop;
 
       lr_rl_up:
@@ -1258,6 +1689,11 @@ module LineReader = structure {
         cmp rax, r11;
         je  lr_rl_loop;
         mov r14, rax;                        // r14 := new count
+        // R66.M1-004 (#20): recalled line is drawn end-to-end; put
+        // the in-line cursor at end so the next typed byte appends
+        // (design/user/shell-line-editing.md §6.3 step 3).
+        lea r11, [rip + _sm_line_cursor];
+        mov [r11], r14;
         jmp lr_rl_loop;
 
       lr_rl_down:
@@ -1271,18 +1707,39 @@ module LineReader = structure {
         cmp rax, r11;
         je  lr_rl_loop;
         mov r14, rax;
+        // R66.M1-004 (#20): cursor := end of recalled entry (or 0 for
+        // the empty-draft transition since r14==0 there).
+        lea r11, [rip + _sm_line_cursor];
+        mov [r11], r14;
         jmp lr_rl_loop;
 
       lr_rl_backspace:
-        // #17 base + #18 on-screen erase + #19 recall-safe (r12 immutable):
-        // shrink r14 if count > 0; NO `sub r12` (r12 is buffer BASE per #19
-        // r-cursor refactor; byte writes are `[r12 + r14 * 1]`). Column-zero
-        // is a full no-op — cursor never crosses back over the prompt.
-        // Does NOT reset recall cursor (§6.3: 'Backspace and cursor motion
+        // R66.M1-004 (#20) SK_BACKSPACE dispatch:
+        //   cursor == 0        -> full no-op (column-zero, §5.1)
+        //   cursor == count    -> end-BS fast path: r14--, cursor--,
+        //                          sys_write(lr_erase_str, 3)
+        //   0 < cursor < count -> lr_bs_mid helper (shift + redraw
+        //                          + cursor--)
+        //
+        // #17 base + #18 on-screen erase + #19 recall-safe (r12
+        // immutable) preserved. Column-zero remains a full no-op so
+        // the cursor cannot cross back over the prompt. Does NOT
+        // reset recall cursor (§6.3: 'Backspace and cursor motion
         // during recall behave identically to on the current draft').
-        cmp r14, 0;
-        je  lr_rl_loop;
+        lea r11, [rip + _sm_line_cursor];
+        mov r10, [r11];                      // r10 = cursor
+        cmp r10, 0;
+        je  lr_rl_loop;                      // column-zero drop
+
+        // Cursor > 0. End vs mid.
+        cmp r10, r14;
+        jne lr_rl_bs_mid_call;
+
+        // End-BS fast path: cursor == count > 0. r14--, cursor--,
+        // sys_write(1, lr_erase_str, 3).
         sub r14, 1;
+        sub r10, 1;                          // cursor--
+        mov [r11], r10;                      // store cursor
         // R66.M1-002 (#18): on-screen erase. sys_write(1, lr_erase_str, 3)
         // writes `\b \b` (0x08 0x20 0x08). sys_write clobbers rax/rcx/r11
         // (caller-save; r11 re-staged next iter); r12/r13/r14 callee-save
@@ -1291,6 +1748,15 @@ module LineReader = structure {
         lea rsi, [rip + lr_erase_str];
         mov rdx, 3;
         call sys_write;
+        jmp lr_rl_loop;
+
+      lr_rl_bs_mid_call:
+        // 0 < cursor < count: helper does shift + redraw + cursor--.
+        mov rdi, r12;                        // buf base
+        mov rsi, r14;                        // count
+        mov rdx, r10;                        // cursor
+        call lr_bs_mid;
+        mov r14, rax;                        // r14 := new count
         jmp lr_rl_loop;
 
       lr_rl_eof:

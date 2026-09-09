@@ -265,7 +265,7 @@ module Shell = structure {
   pub let shell_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "shell.M1-001 (#1) / shell.M3 (#9-#11) / R66.M1-003 (#19): clear the sixteen-word session stats table AND the four R66.M1-003 history-ring cursors (_sm_hist_head / _sm_hist_tail / _sm_hist_recall_cursor + the legacy _sm_hist_used). Startup + teardown only; a live counter reset would race any concurrent shell_note (same discipline as elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70, and elevate_client_stats_reset libpdx-elevate/src/elevate_client.pdx). Loop: r10 base, rcx index 0..16, rax = 0. `cmp rcx, 16` uses imm <= 0x7FFFFFFF (paideia-as conformance). Loop bound widened from 8 to 16 at M3 to cover SH_ST_PASSTHRU / _COMPLETIONS / _AUDITS + 5 reserved slots without another re-layout. R66.M1-003 adds four direct .bss zero stores after the counter loop; the .bss slots are uninit-declared (loader zero-init happens for `uninit` @align slots at process load per paideia-as manifest.pdxproj kind=tool convention, but shell_reset is called both at boot AND before each test fixture, so explicit stores keep the test fixture reset semantics honest). Leaf function -- no push/pop parity. Labels prefixed sh_rs_.",
+      justification: "shell.M1-001 (#1) / shell.M3 (#9-#11) / R66.M1-003 (#19) / R66.M1-004 (#20): clear the sixteen-word session stats table AND the four R66.M1-003 history-ring cursors (_sm_hist_head / _sm_hist_tail / _sm_hist_recall_cursor + the legacy _sm_hist_used) AND the R66.M1-004 in-line cursor (_sm_line_cursor). Startup + teardown only; a live counter reset would race any concurrent shell_note (same discipline as elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70, and elevate_client_stats_reset libpdx-elevate/src/elevate_client.pdx). Loop: r10 base, rcx index 0..16, rax = 0. `cmp rcx, 16` uses imm <= 0x7FFFFFFF (paideia-as conformance). Loop bound widened from 8 to 16 at M3 to cover SH_ST_PASSTHRU / _COMPLETIONS / _AUDITS + 5 reserved slots without another re-layout. R66.M1-003 adds four direct .bss zero stores after the counter loop; R66.M1-004 adds one more (_sm_line_cursor). The .bss slots are uninit-declared (loader zero-init happens for `uninit` @align slots at process load per paideia-as manifest.pdxproj kind=tool convention, but shell_reset is called both at boot AND before each test fixture, so explicit stores keep the test fixture reset semantics honest). Leaf function -- no push/pop parity. Labels prefixed sh_rs_.",
       block: {
         lea r10, [rip + _shell_stats];
         xor rax, rax;
@@ -285,6 +285,11 @@ module Shell = structure {
         lea r11, [rip + _sm_hist_tail];
         mov [r11], rax;
         lea r11, [rip + _sm_hist_recall_cursor];
+        mov [r11], rax;
+        // R66.M1-004 (#20): zero the in-line cursor. Line-scoped state
+        // (also reset at every line_reader_read_line entry), but shell_
+        // reset restores a coherent post-boot / post-fixture baseline.
+        lea r11, [rip + _sm_line_cursor];
         mov [r11], rax;
         ret
       }
@@ -474,6 +479,32 @@ module Shell = structure {
   pub let mut _sm_hist_tail           : u64        = uninit @align(8)
   pub let mut _sm_hist_recall_cursor  : u64        = uninit @align(8)
   pub let mut _sm_hist_enc_scratch    : [u8; 4128] = uninit @align(16)
+
+  // ==========================================================================
+  // R66.M1-004 (#20): in-line cursor position + edit-redraw scratch.
+  //
+  //   _sm_line_cursor         insertion-point offset within _sm_line_buf,
+  //                           in the range [0, r14-count]. cursor==count
+  //                           means "at end", the default position after
+  //                           any typed byte, history recall, or reset.
+  //                           Reset to 0 at every `line_reader_read_line`
+  //                           entry (line-scoped state, per §7.1 of the
+  //                           design doc).  LEFT decrements it, RIGHT
+  //                           increments it, mid-line insert / mid-BS
+  //                           adjust it in concert with r14/count.
+  //
+  //   _sm_line_edit_scratch   compose buffer for the mid-line redraw
+  //                           sys_write bundle (byte + tail + \b*N for
+  //                           insert; \b + tail + space + \b*(N+1) for
+  //                           BS). Sized 8192 = worst-case 3 + 2*4095
+  //                           (BS with 4095-byte tail) rounded up.
+  //                           Shared singleton because the shell is
+  //                           single-threaded; a future thread-per-
+  //                           session variant would push it into per-
+  //                           thread state.
+  // ==========================================================================
+  pub let mut _sm_line_cursor         : u64        = uninit @align(8)
+  pub let mut _sm_line_edit_scratch   : [u8; 8192] = uninit @align(16)
 
   // ENH-008 (#35): fd for the per-session ~/.history/<session>-<ts>
   // .pdxhist journal file. Populated at shell_main startup via

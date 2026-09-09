@@ -4,6 +4,93 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — R66.M1-004 (#20): cursor-left/right in-place edit
+
+Fills in the LEFT/RIGHT arrow branches R66.M1-001 (#17) landed as
+recognised-but-ignored no-ops in `line_reader_read_line`. The shell
+now tracks an in-line cursor within the not-yet-submitted line and
+honours mid-line insert and mid-line backspace with a single-write
+tail redraw per `design/user/shell-line-editing.md` §7.
+
+Two new `.bss` singletons live in `module Shell`:
+
+- `_sm_line_cursor : u64` — insertion-point offset within
+  `_sm_line_buf`, in `[0, count]`. Reset to 0 at every
+  `line_reader_read_line` entry (line-scoped state per §7.1).
+- `_sm_line_edit_scratch : [u8; 8192]` — compose buffer for the
+  mid-line redraw `sys_write` bundle. Sized to cover the worst-case
+  `3 + 2*4094 = 8191` (BS worst case with 4094-byte tail; buf_len=4096 caps
+  cursor at 4095, so max tail = 4094) — buffer sized at 8192.
+
+Behaviour by key:
+
+- LEFT (`SK_LEFT`): if `cursor > 0`, `cursor--`, `sys_write(1, "\b", 1)`.
+- RIGHT (`SK_RIGHT`): if `cursor < count`, `sys_write(1, "ESC [ C", 3)`,
+  `cursor++`. `ESC [ C` is a pure motion — no dependence on the
+  glyph at the old cursor position.
+- LITERAL byte at `cursor < count`: `lr_insert_mid` shifts the tail
+  right, stores the byte, then emits `byte + tail + \b × tail_len`
+  in one `sys_write` (§7.4). Recall cursor is reset to head per
+  §6.3 draft-promotion.
+- LITERAL byte at `cursor == count`: existing end-append fast path,
+  `cursor` advances alongside `count`.
+- BACKSPACE at `cursor == 0`: full no-op (column-zero, §5.1).
+- BACKSPACE at `cursor == count`: existing `\b \b` end-erase, plus
+  `cursor--`.
+- BACKSPACE at `0 < cursor < count`: `lr_bs_mid` shifts the tail
+  left, then emits `\b + tail + space + \b × (tail_len + 1)` in
+  one `sys_write` (§7.5). Does NOT reset the recall cursor.
+- ENTER (`0x0A`): commit the whole buffer regardless of cursor
+  position — `mov_b [r12 + r14 * 1], 0x0A; r14++; return`.
+- UP / DOWN arrow (recall): after `lr_recall_up` / `lr_recall_down`
+  returns a new count, `_sm_line_cursor := new_count` so the next
+  typed byte appends normally (§6.3 step 3).
+
+`r12` remains the buffer BASE (immutable) per the R66.M1-003 (#19)
+refactor; nothing in the cursor path walks `r12`.
+
+### Added
+
+- `src/shell.pdx`:
+  - `_sm_line_cursor : u64 = uninit @align(8)` — in-line cursor slot.
+  - `_sm_line_edit_scratch : [u8; 8192] = uninit @align(16)` —
+    redraw compose buffer.
+  - `shell_reset` zeros `_sm_line_cursor` alongside the R66.M1-003
+    history-ring cursors, so test-fixture reset stays honest.
+- `src/line_reader.pdx`:
+  - `lr_bs_one_str : [u8; 2] = "\x08\0"` — one 0x08 byte for LEFT.
+  - `lr_move_right_str : [u8; 4] = "\x1b[C\0"` — `ESC [ C` for RIGHT.
+  - `lr_insert_mid : (u64, u64, u64, u64) -> u64` — shift-right +
+    store + tail-redraw + cursor update. Returns `count + 1`.
+    5 callee-save pushes (`rbx r12 r13 r14 r15`), no `sub rsp`, so
+    `rsp%16==0` at the nested `sys_write` (per the user's #20
+    alignment warning against `sub rsp, 8` under 5 pushes).
+  - `lr_bs_mid : (u64, u64, u64) -> u64` — shift-left + tail-redraw
+    + cursor update. Returns `count - 1`. Same 5-push alignment
+    shape (r12 push is a padding slot).
+  - `line_reader_read_line` dispatch: LEFT / RIGHT / mid-insert /
+    mid-BS branches; ENTER-first check on the raw-byte path; cursor
+    reset at prologue; cursor update after UP / DOWN recall.
+
+### Changed
+
+- `line_reader_read_line`'s justification block widens to cover the
+  #20 cursor branches and the ENTER-first ordering on the raw-byte
+  path.
+
+### Design cross-references
+
+- `design/user/shell-line-editing.md` §7 (cursor spec) and §11
+  (state allocation) — the authoritative behaviour reference.
+- Encoder pitfalls: stack alignment under 5 pushes (never
+  `sub rsp, 8`), `mov_b` with `* 1` scale (U1606), and byte load
+  via `xor + mov_b` (#1248) — all observed.
+
+Fingerprint: none dedicated for #20 per the issue's fingerprint
+row; covered by the R66.M1-005 (#21) design doc's worked examples.
+
+Closes paideia-os/shell#20.
+
 ## Unreleased — R66.M1-003 (#19): history ring buffer + up/down recall
 
 Fills in the arrow-key recall branches R66.M1-001 (#17) landed as
