@@ -499,7 +499,7 @@ module Exec = structure {
 
       en_nc_done_ok:
         xor rax, rax;                        // EX_OK (0)
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15;
         pop r14;
         pop r13;
@@ -512,7 +512,7 @@ module Exec = structure {
         mov rdi, 4;                          // SH_ST_ERRORS
         call shell_note;
         mov rax, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15;
         pop r14;
         pop r13;
@@ -525,7 +525,7 @@ module Exec = structure {
         mov rdi, 4;
         call shell_note;
         mov rax, 0xFFFFEC24;                 // EX_ERR_MISSING_CAP
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15;
         pop r14;
         pop r13;
@@ -538,7 +538,7 @@ module Exec = structure {
         mov rdi, 4;
         call shell_note;
         mov rax, 0xFFFFEC25;                 // EX_ERR_WIDENING
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15;
         pop r14;
         pop r13;
@@ -551,7 +551,7 @@ module Exec = structure {
         mov rdi, 4;
         call shell_note;
         mov rax, 0xFFFFEC26;                 // EX_ERR_SIDECAR_FULL
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15;
         pop r14;
         pop r13;
@@ -988,7 +988,7 @@ module Exec = structure {
 
         // (c) Return 0.
         xor rax, rax;
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r12;
         pop rbx;
         ret
@@ -1132,14 +1132,18 @@ module Exec = structure {
   pub let exec_spawn_and_wait : (u64, u64, u64) -> u64 !{mem, sysreg} @{sched, mem, fs} =
     fn (argv_pool_ptr: u64) (argv_bytes: u64) (argc: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {sched, mem, fs},
-      justification: "shell.ENH-005 (#32) + shell#44 (fork-before-exec): the exec-path REAL body. shell#44 retires the ENH-005 §FORK GAP by inserting sys_fork between command_record_begin and sys_execve. Sequence: (0) gate + SH_ST_SPAWNS bump; (1) exec_build_argv_ptrs into _ex_argv_ptrs from the parser's NUL-separated pool slice; (2) exec_narrow_child_caps into _ex_sidecar_buf with a placeholder parent cap (SH_KIND_SHELL_SESSION with RIGHTS_ALL, target_ptr=0) and child_decl_count=0; (3) cap_manifest_verify DEFERRED (libpdx-cap not linked); (4) command_record_begin into _ex_audit_rec BEFORE fork (D3 audit-first as a running-system property: the audit record exists in the parent's aspace before the child even exists as a task). A non-zero begin routes to EX_ERR_AUDIT_BEGIN_FAIL WITHOUT proceeding to fork -- the child never runs if the audit record cannot be opened. (4a) sys_fork with three arms: rax<0 (signed jl) -> parent-only fork_fail close+return EX_ERR_FORK_FAIL; rax==0 -> child branch falls through to (5) sys_execve; rax>0 -> parent branch stashes pid in rbx, emits SHELL FORK OK fingerprint via three sys_write(1) calls (ex_fp_fork_ok_str+18 bytes, history_format_u64_dec pid rendering into _ex_fp_pid_scratch then sys_write(1, scratch, digit_count), ex_fp_nl_str+1 byte), then jumps to (6) sys_wait4(child_pid). (5) sys_execve with argv[0] as path, _ex_argv_ptrs as argv, envp=0 (D5). CHILD-BRANCH ONLY. Success never returns (kernel replaces image); failure returns errno and the child sys_exit(127) so the parent's wait4 sees exit code 127 (POSIX 'command not found' convention). Child does NOT touch the audit record or restore the callee-save prologue -- the aspace is a cow-copy that dies with sys_exit / execve. (6) sys_wait4(pid=child_pid, &_ex_wstatus, 0, 0) is now genuinely reachable on the parent timeline; on negative errno (signed jl) close audit with exit=127 and return EX_ERR_WAIT_FAIL. (7) command_record_close with (wstatus & 0xFF) as exit_code; the parent bumps SH_ST_EXITS and returns exit_code. Reject-path close discipline: every parent path that reached command_record_begin AND then failed (fork_fail, wait_fail) calls command_record_close(exit=127) before returning the EX_ERR_* code -- otherwise the audit trail would show OPEN records with no matching CLOSE, defeating replay. The paideia-as no-`test`-mnemonic + `cmp reg, 0` discipline is followed at every branch; large immediates (placeholder parent-cap fused qword 0xFFFFFFFF01940001; error sentinels 0xFFFFEC2x) via mov r64, imm64 or mov r32, imm32 (paideia-as supports MOV imm64 in general; the pitfall is `and r11, imm64` which we do not use here). Byte loads via `xor rax, rax; mov_b rax, [ptr]` with explicit `* 1` scale per #1248 + U1606. The `wstatus & 0xFF` extraction uses `and rax, 0xFF` (imm32 <= 0x7FFFFFFF). rbx is repurposed at shell#44 as the child-pid carrier on the parent branch (previously reserved as a scratch that was never actually used in the ENH-005 body). 5 callee-save pushes (rbx, r12, r13, r14, r15) + `sub rsp, 8` = 48 bytes prologue; rsp % 16 == 0 at every nested SysV call. Every nested syscall / library call in the parent path (shell_note, exec_build_argv_ptrs, exec_narrow_child_caps, command_record_begin, sys_fork, sys_write, history_format_u64_dec, sys_wait4, command_record_close) preserves r12/r13/r14/rbx per SysV callee-save rules. The child branch's sys_execve / sys_exit run against the same alignment (rsp % 16 == 0). Labels prefixed ex_sw_.",
+      justification: "shell.ENH-005 (#32) + shell#44 (fork-before-exec): the exec-path REAL body. shell#44 retires the ENH-005 §FORK GAP by inserting sys_fork between command_record_begin and sys_execve. Sequence: (0) gate + SH_ST_SPAWNS bump; (1) exec_build_argv_ptrs into _ex_argv_ptrs from the parser's NUL-separated pool slice; (2) exec_narrow_child_caps into _ex_sidecar_buf with a placeholder parent cap (SH_KIND_SHELL_SESSION with RIGHTS_ALL, target_ptr=0) and child_decl_count=0; (3) cap_manifest_verify DEFERRED (libpdx-cap not linked); (4) command_record_begin into _ex_audit_rec BEFORE fork (D3 audit-first as a running-system property: the audit record exists in the parent's aspace before the child even exists as a task). A non-zero begin routes to EX_ERR_AUDIT_BEGIN_FAIL WITHOUT proceeding to fork -- the child never runs if the audit record cannot be opened. (4a) sys_fork with three arms: rax<0 (signed jl) -> parent-only fork_fail close+return EX_ERR_FORK_FAIL; rax==0 -> child branch falls through to (5) sys_execve; rax>0 -> parent branch stashes pid in rbx, emits SHELL FORK OK fingerprint via three sys_write(1) calls (ex_fp_fork_ok_str+18 bytes, history_format_u64_dec pid rendering into _ex_fp_pid_scratch then sys_write(1, scratch, digit_count), ex_fp_nl_str+1 byte), then jumps to (6) sys_wait4(child_pid). (5) sys_execve with argv[0] as path, _ex_argv_ptrs as argv, envp=0 (D5). CHILD-BRANCH ONLY. Success never returns (kernel replaces image); failure returns errno and the child sys_exit(127) so the parent's wait4 sees exit code 127 (POSIX 'command not found' convention). Child does NOT touch the audit record or restore the callee-save prologue -- the aspace is a cow-copy that dies with sys_exit / execve. (6) sys_wait4(pid=child_pid, &_ex_wstatus, 0, 0) is now genuinely reachable on the parent timeline; on negative errno (signed jl) close audit with exit=127 and return EX_ERR_WAIT_FAIL. (7) command_record_close with (wstatus & 0xFF) as exit_code; the parent bumps SH_ST_EXITS and returns exit_code. Reject-path close discipline: every parent path that reached command_record_begin AND then failed (fork_fail, wait_fail) calls command_record_close(exit=127) before returning the EX_ERR_* code -- otherwise the audit trail would show OPEN records with no matching CLOSE, defeating replay. The paideia-as no-`test`-mnemonic + `cmp reg, 0` discipline is followed at every branch; large immediates (placeholder parent-cap fused qword 0xFFFFFFFF01940001; error sentinels 0xFFFFEC2x) via mov r64, imm64 or mov r32, imm32 (paideia-as supports MOV imm64 in general; the pitfall is `and r11, imm64` which we do not use here). Byte loads via `xor rax, rax; mov_b rax, [ptr]` with explicit `* 1` scale per #1248 + U1606. The `wstatus & 0xFF` extraction uses `and rax, 0xFF` (imm32 <= 0x7FFFFFFF). rbx is repurposed at shell#44 as the child-pid carrier on the parent branch (previously reserved as a scratch that was never actually used in the ENH-005 body). 5 callee-save pushes (rbx, r12, r13, r14, r15) = 40 bytes prologue; no extra `sub rsp` because 5 pushes alone give rsp % 16 == 0 (entry rsp%16==8 after the CALL). Prior version had `sub rsp, 8` which was arithmetically WRONG — it moved rsp%16 to 8, misaligning every nested SysV call. Debugger caught it 2026-09-08; fix retroactive. Every nested syscall / library call in the parent path (shell_note, exec_build_argv_ptrs, exec_narrow_child_caps, command_record_begin, sys_fork, sys_write, history_format_u64_dec, sys_wait4, command_record_close) preserves r12/r13/r14/rbx per SysV callee-save rules. The child branch's sys_execve / sys_exit run against the same alignment (rsp % 16 == 0). Labels prefixed ex_sw_.",
       block: {
         push rbx;
         push r12;
         push r13;
         push r14;
         push r15;
-        sub rsp, 8;                          // 48-byte prologue; rsp%16==0
+        // Prologue: 5 pushes = 40B; entry rsp%16==8 -> after 5 pushes rsp%16==0.
+        // No extra sub rsp needed (no local stack slots used). Prior code
+        // had `sub rsp, 8` which mis-aligned every nested call to rsp%16==8
+        // — a live SSE-alignment landmine on the fork/exec path.
+        // Debugger caught 2026-09-08; retroactively fixed post shell#44.
 
         mov r12, rdi;                        // argv_pool_ptr
         mov r13, rsi;                        // argv_bytes
@@ -1357,7 +1361,7 @@ module Exec = structure {
 
         // Return exit code.
         mov rax, r15;
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
@@ -1374,7 +1378,7 @@ module Exec = structure {
         mov rdi, 4;                          // SH_ST_ERRORS
         call shell_note;
         mov rax, 0xFFFFEC29;                 // EX_ERR_FORK_FAIL
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
@@ -1388,7 +1392,7 @@ module Exec = structure {
         mov rdi, 4;
         call shell_note;
         mov rax, 0xFFFFEC23;                 // EX_ERR_WAIT_FAIL
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
@@ -1408,7 +1412,7 @@ module Exec = structure {
         mov rdi, 4;                          // SH_ST_ERRORS
         call shell_note;
         mov rax, 0xFFFFEC2A;                 // EX_ERR_RECONCILE_FAIL
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
@@ -1418,7 +1422,7 @@ module Exec = structure {
         mov rdi, 4;
         call shell_note;
         mov rax, 0xFFFFEC28;                 // EX_ERR_AUDIT_BEGIN_FAIL
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
@@ -1426,7 +1430,7 @@ module Exec = structure {
         // exec_narrow_child_caps already bumped SH_ST_ERRORS.
         // Return its sentinel verbatim (EX_ERR_MISSING_CAP /
         // EX_ERR_WIDENING / EX_ERR_SIDECAR_FULL / EX_ERR_BAD_ARGV).
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
@@ -1441,7 +1445,7 @@ module Exec = structure {
         mov rdi, 4;                          // SH_ST_ERRORS
         call shell_note;
         mov rax, r15;
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret;
 
@@ -1449,7 +1453,7 @@ module Exec = structure {
         mov rdi, 4;                          // SH_ST_ERRORS
         call shell_note;
         mov rax, 0xFFFFEC21;                 // EX_ERR_BAD_ARGV
-        add rsp, 8;
+        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
         pop r15; pop r14; pop r13; pop r12; pop rbx;
         ret
       }

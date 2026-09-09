@@ -4,6 +4,98 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased — R66.M1-003 (#19): history ring buffer + up/down recall
+
+Fills in the arrow-key recall branches R66.M1-001 (#17) landed as
+recognised-but-ignored no-ops in `line_reader_read_line`. The shell
+now walks a flat-text history ring on up/down arrow, replaces the
+current visible line with the recalled entry, and reprints via a
+`\r ESC[K` clear-line + prompt + recalled-bytes sequence to fd 1.
+
+The 8 KiB `Shell::_sm_hist_buf` retains its previous storage
+allocation but its semantics move from wire-encoded records to flat
+text (per `design/user/shell-line-editing.md` §6.1): each committed
+entry contributes `<cmd-bytes><0x0A>` and the ring holds two views
+in one place. The old ENH-006 (#33) write path
+(`history_encode_record` into the ring + `history_persist_flush`
+draining the ring) is retired at the call site in `shell_main`; the
+new `sm_hist_ring_commit` helper owns both the flat-text append AND
+the wire-encoded `sys_write` to `_sm_hist_fd` in one action, so the
+in-memory recall view and the on-disk journal cannot drift.
+
+Three new `.bss` cursors track ring state -- `_sm_hist_head`
+(write cursor), `_sm_hist_tail` (oldest entry), and
+`_sm_hist_recall_cursor` (currently-recalled entry). The ring reserves
+one slot so `(head + 1) mod cap == tail` signals full; on overrun
+`tail` walks forward past the next `0x0A` so every surviving entry is
+whole. Typing any raw byte during recall resets the recall cursor to
+head per the design's "commit on literal" semantic; backspace does
+not (matching the design's "edit continues on the recalled draft"
+rule). The `line_reader_read_line` register plan flips so `r12` is
+the buffer BASE (immutable) and byte writes use
+`mov_b [r12 + r14 * 1], rax`, letting the recall helpers set `r14 :=
+new_count` without also rewinding a walking cursor.
+
+The `shell history ok -- entries=<N>` fingerprint is emitted to fd 2
+after every commit by a new `history_ring_witness` helper -- `<N>`
+is walked live (not cached) from `_sm_hist_tail` to `_sm_hist_head`
+counting `0x0A`.
+
+### Added
+
+- `src/shell.pdx`:
+  - `pub let SH_ST_RECALL : u64 = 12` -- per-arrow-key-press counter
+    slot; bumped by `lr_recall_up` / `lr_recall_down` on every walk.
+  - `_sm_hist_head`, `_sm_hist_tail`, `_sm_hist_recall_cursor` (three
+    `u64 @align(8)` .bss slots) and `_sm_hist_enc_scratch : [u8; 4128]
+    @align(16)` (wire-encode staging for the persistence write-through).
+  - `sm_fp_hist_ok_prefix` rodata (28 visible bytes + NUL) +
+    `sm_fp_hist_ok_prefix_len` u64.
+  - `sm_hist_ring_commit(cmd_ptr, cmd_len) -> u64` -- flat-text ring
+    append + wire-encoded `sys_write` to `_sm_hist_fd` in one atomic
+    action. Empty-line short-circuit; pre-write tail-advance guard;
+    recall cursor reset; fingerprint emission.
+  - `history_ring_witness() -> ()` -- walks the ring counting
+    `0x0A` separators and emits the fingerprint to fd 2.
+- `src/line_reader.pdx`:
+  - `pub let LR_KEY_RECALL_NOP : u64 = 0xFFFFEC57` -- returned by
+    the recall helpers when the walk hit a boundary and no state
+    changed; the read-loop compares against it and iterates.
+  - `lr_redraw_clear` rodata (`\r ESC[K` + NUL) +
+    `lr_redraw_clear_len` u64.
+  - `lr_recall_redraw(buf, len) -> ()` -- three-`sys_write`
+    line redraw (clear + prompt + buf) shared by both recall helpers.
+  - `lr_recall_up(buf, buf_cap) -> u64` -- back-scan for the previous
+    `0x0A` boundary; copies the recalled entry into the caller's buf;
+    redraws; updates recall cursor.
+  - `lr_recall_down(buf, buf_cap) -> u64` -- symmetric forward scan;
+    empty-draft transition returns `len == 0`.
+
+### Changed
+
+- `src/shell.pdx`:
+  - `_sm_hist_buf` semantics documented as flat text (was wire-encoded
+    records); the allocation itself is unchanged.
+  - `_sm_hist_used` documented as deprecated -- retained as a linkage
+    stub so `history_persist_flush` (which reads it) keeps compiling;
+    `shell_reset` now zeroes it explicitly and no other write path
+    populates it.
+  - `shell_reset` widens to also zero the three R66.M1-003 cursors.
+  - `shell_main` REPL-loop history-append block is replaced by a
+    single `sm_hist_ring_commit(_sm_line_buf, cmd_len)` call
+    (trailing newline stripped inline before the call); the
+    `history_encode_record` / `history_persist_flush` pair is retired
+    from this call site.
+- `src/line_reader.pdx`:
+  - `line_reader_read_line` register plan: `r12` is now the buffer
+    BASE (immutable); byte writes use `mov_b [r12 + r14 * 1], rax`;
+    backspace only decrements `r14`.
+  - Raw-byte append path now unconditionally resets
+    `_sm_hist_recall_cursor := _sm_hist_head` (idempotent when not
+    recalling) per §6.3 "commit on SK_LITERAL".
+  - `LR_KEY_UP` / `LR_KEY_DOWN` branches call `lr_recall_up` /
+    `lr_recall_down` and update `r14` from the returned count.
+
 ## Unreleased — R106.SHELL-003 (#42): tokenizer test infrastructure
 
 Lands `tests/test_tokenizer.pdx` -- `TestTokenizer` module with a

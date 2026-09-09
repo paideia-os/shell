@@ -255,6 +255,31 @@ module LineReader = structure {
   pub let LR_KEY_UNKNOWN   : u64 = 0xFFFFEC55
   pub let LR_KEY_EOF       : u64 = 0xFFFFEC56
 
+  // R66.M1-003 (#19): sentinel returned by lr_recall_up / lr_recall_down
+  // when the walk hit a boundary and did not update the line buffer.
+  // The line_reader loop's UP/DOWN dispatch compares against this
+  // sentinel and, when it matches, leaves the count/buffer state
+  // untouched (equivalent to swallowing the keypress). Value chosen in
+  // the same 0xFFFFEC5x LR_KEY_* band to keep the FSM's one-compare-per-
+  // sentinel dispatch shape.
+  pub let LR_KEY_RECALL_NOP : u64 = 0xFFFFEC57
+
+  // R66.M1-003 (#19): redraw prefix `\r ESC [ K` written to fd 1 at the
+  // start of every recall-hit emission. `\r` returns the cursor to
+  // column 0; `ESC [ K` (CSI K, ECMA-48 EL 0) erases to end of line
+  // from the current position -- combined they clear the entire visible
+  // input row. The prompt + recalled bytes follow in separate
+  // sys_write calls. Placing the escape sequence in rodata (rather than
+  // splitting it across three sys_write calls) keeps the terminal-side
+  // atomicity of the erase-and-return as close to a single frame as the
+  // kernel VFS's write scheduler allows.
+  //
+  // Sizing per the paideia-as fingerprint-string convention: strlen 3
+  // + NUL. sys_write consumes lr_redraw_clear_len bytes (3), not the
+  // NUL.
+  pub let lr_redraw_clear     : [u8; 4] = "\r\x1b[K\0"
+  pub let lr_redraw_clear_len : u64     = 3
+
   // ==========================================================================
   // R66.M1-001 (#17): KIND_TTY termios op ordinal mirrors
   //
@@ -619,6 +644,475 @@ module LineReader = structure {
     }
 
   // ==========================================================================
+  // R66.M1-003 (#19): lr_recall_redraw(buf, len) -> ()
+  //
+  // Signature: lr_recall_redraw : (u64, u64) -> () !{mem, sysreg} @{fs}
+  // RDI (input): buf  -- caller-owned buffer holding the visible line
+  // RSI (input): len  -- byte count of the visible line (may be 0 for
+  //                       an empty draft, e.g. down-arrow past newest)
+  //
+  // Emits `\r ESC[K` (clear line + return to column 0) + prompt + line
+  // to fd 1 via three sys_write calls. Empty-draft (`len == 0`) still
+  // emits the first two writes so the user sees a fresh empty prompt --
+  // matches the design/user/shell-line-editing.md §6.3 down-arrow-to-
+  // empty semantics.
+  //
+  // Register plan (2 callee-save pushes + `sub rsp, 8` = 24 bytes;
+  // rsp % 16 == 0 at every nested SysV call):
+  //   r12 = buf save
+  //   r13 = len save
+  // Labels prefixed lr_rd_.
+  // ==========================================================================
+  pub let lr_recall_redraw : (u64, u64) -> () !{mem, sysreg} @{fs} =
+    fn (buf: u64) (len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-003 (#19): terminal redraw for a recall hit. Three sys_write calls: (1) `\\r ESC[K` (return-to-column-0 + erase-to-end-of-line per ECMA-48 EL 0) from lr_redraw_clear (3 bytes), (2) shell prompt from Shell::sm_prompt_str (2 bytes), (3) the current visible line from buf (len bytes; may be 0 for the down-arrow-past-newest case). Splitting into three calls rather than composing into a stack scratch trades a small increase in syscall count for a simpler body -- kernel-side sys_write already coalesces small writes on the pipe/tty side. Empty-draft (len == 0) still emits (1) and (2) so the user's visible cursor lands on a fresh empty prompt; a `sys_write(fd, buf, 0)` in step (3) is a documented no-op per POSIX write(2). Effect + capability set matches sys_write's own {mem, sysreg} @{fs}. Prologue: 2 callee-save pushes (r12 buf, r13 len) + sub rsp, 8 = 24 bytes; rsp%16==0 at every nested SysV call. Labels prefixed lr_rd_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 8;
+
+        mov r12, rdi;                        // buf
+        mov r13, rsi;                        // len
+
+        // (1) `\r ESC[K` clear-line prefix.
+        mov rdi, 1;
+        lea rsi, [rip + lr_redraw_clear];
+        mov rdx, 3;
+        call sys_write;
+
+        // (2) prompt string.
+        mov rdi, 1;
+        lea rsi, [rip + sm_prompt_str];
+        mov rdx, 2;
+        call sys_write;
+
+        // (3) current visible line (may be 0-length -> POSIX no-op).
+        mov rdi, 1;
+        mov rsi, r12;
+        mov rdx, r13;
+        call sys_write;
+
+        add rsp, 8;
+        pop r13;
+        pop r12;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // R66.M1-003 (#19): lr_recall_up(buf, buf_cap) -> u64
+  //
+  // Signature: lr_recall_up : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI (input): buf      -- caller's line buffer to overwrite
+  // RSI (input): buf_cap  -- capacity of buf (typically 4096)
+  // RAX (output): new byte count on a recall HIT (0..buf_cap; the
+  //               caller's buf now holds the recalled entry), or
+  //               LR_KEY_RECALL_NOP (0xFFFFEC57) if the walk was at
+  //               the oldest entry already and no state changed.
+  //
+  // Walks _sm_hist_recall_cursor backwards to the previous entry per
+  // design/user/shell-line-editing.md §6.3, copies the recalled bytes
+  // into buf, redraws the visible line, and updates the recall cursor.
+  // Bumps SH_ST_RECALL on every walk attempt (including NOP).
+  //
+  // Ring conventions (§6.1 / §6.2):
+  //   * `_sm_hist_buf` is flat text `<cmd-bytes><0x0A><cmd-bytes>...`.
+  //   * `_sm_hist_recall_cursor` points to the FIRST byte of the entry
+  //     currently on-screen (equal to _sm_hist_head when empty draft).
+  //   * `_sm_hist_tail` points to the FIRST byte of the OLDEST entry.
+  //   * Modulo SM_HIST_RING_CAP (8192, fits imm <= 0x7FFFFFFF).
+  //
+  // UP-scan algorithm:
+  //   1. NOP if recall_cursor == tail (at oldest).
+  //   2. end_of_prev_entry = (recall_cursor - 1) mod cap   -- the '\n'
+  //      terminator of the previous entry.
+  //   3. scan_start = (end_of_prev_entry - 1) mod cap.
+  //   4. Walk p from scan_start backwards. At each step:
+  //        - if p == tail: new_cursor = tail; stop
+  //        - if buf[p] == 0x0A: new_cursor = (p + 1) mod cap; stop
+  //        - else p = (p - 1 + cap) mod cap; iterate
+  //   5. recalled_len = (end_of_prev_entry - new_cursor) mod cap.
+  //   6. Copy _sm_hist_buf[(new_cursor + i) mod cap] for i in 0..len
+  //      to buf[i]. Truncate to buf_cap on overflow (defensive; a
+  //      well-formed entry fits, since HIST_CMD_MAX == 4096 and
+  //      SM_LINE_BUF_CAP == 4096).
+  //   7. Redraw via lr_recall_redraw.
+  //   8. _sm_hist_recall_cursor := new_cursor.
+  //   9. Return recalled_len.
+  //
+  // Register plan (5 callee-save pushes + `sub rsp, 8` = 48 bytes;
+  // rsp % 16 == 0 at every nested SysV call):
+  //   rbx = buf                      (caller's dst)
+  //   r12 = buf_cap
+  //   r13 = new_cursor (scan target / final result)
+  //   r14 = end_of_prev_entry cache  (upper bound for length compute)
+  //   r15 = i (copy loop) / recalled_len
+  // Labels prefixed lr_ru_.
+  // ==========================================================================
+  pub let lr_recall_up : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (buf_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-003 (#19): up-arrow recall walk. Reads Shell::_sm_hist_head, Shell::_sm_hist_tail, Shell::_sm_hist_recall_cursor, Shell::_sm_hist_buf via `lea r11 + mov` (same cross-module .bss reach the tree uses everywhere -- history.pdx reads _sm_hist_buf and _sm_hist_used identically). NOP short-circuit when recall_cursor == tail (already at oldest); the caller (line_reader_read_line) sees LR_KEY_RECALL_NOP and leaves r14/count untouched. Scan: from (recall_cursor - 1 - 1) mod cap walk backwards, testing each byte for 0x0A. On hit, new_cursor = (hit + 1) mod cap. On reaching tail without a hit (buf[tail] is a data byte by invariant -- tail always points to an entry's first byte), new_cursor = tail. Modular arithmetic uses cmp+jb+xor / cmp+je+xor sequences; the ring cap 8192 fits imm <= 0x7FFFFFFF so no r11-staged compare is needed. Recalled length = (end_of_prev_entry - new_cursor) mod cap; the modular subtract branches on end_of_prev_entry vs new_cursor. Byte-copy inner loop uses xor+mov_b load/store per #1248, with src index = (new_cursor + i) mod cap computed inline. Redraw via lr_recall_redraw (3 sys_write calls: clear + prompt + line). recall_cursor updated last so a hypothetical concurrent read sees a consistent state (single-threaded shell today; a future thread-per-session variant would need a barrier here). Bumps SH_ST_RECALL (slot 12) on the WALK path (a NOP walk also bumps so the fingerprint counts arrow-key presses, not just successful transitions). Prologue: 5 callee-save pushes (rbx buf, r12 buf_cap, r13 new_cursor, r14 end_of_prev_entry, r15 loop-i / final-len) + sub rsp, 8 = 48 bytes; entry rsp%16==8 + 48 = rsp%16==0 for every nested SysV call. Labels prefixed lr_ru_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // buf
+        mov r12, rsi;                        // buf_cap
+
+        // Bump SH_ST_RECALL slot 12 (per-arrow-key-press count).
+        mov rdi, 12;                         // SH_ST_RECALL
+        call shell_note;
+
+        // Load recall_cursor + tail + head.
+        lea r11, [rip + _sm_hist_recall_cursor];
+        mov r13, [r11];                      // r13 = recall_cursor
+        lea r11, [rip + _sm_hist_tail];
+        mov r10, [r11];                      // r10 = tail
+        lea r11, [rip + _sm_hist_head];
+        mov r9, [r11];                       // r9 = head (also empty-draft marker)
+
+        // NOP if recall_cursor == tail.
+        cmp r13, r10;
+        je  lr_ru_nop;
+
+        // end_of_prev_entry = (recall_cursor - 1) mod cap  -- the '\n'
+        // terminator of the previous entry.
+        // Cache in r14 for the length compute at the end.
+        mov r14, r13;
+        cmp r14, 0;
+        jne lr_ru_epe_no_wrap;
+        mov r14, 8192;
+      lr_ru_epe_no_wrap:
+        sub r14, 1;                          // r14 = end_of_prev_entry
+
+        // scan_start p = (end_of_prev_entry - 1) mod cap
+        // Reuse r13 as the scan cursor now (recall_cursor value no
+        // longer needed; new_cursor lands back in r13 at loop exit).
+        mov r13, r14;
+        cmp r13, 0;
+        jne lr_ru_scan_no_wrap;
+        mov r13, 8192;
+      lr_ru_scan_no_wrap:
+        sub r13, 1;                          // p
+
+      lr_ru_scan:
+        // Terminate at tail: buf[tail] is a data byte (invariant), so
+        // reaching tail without a '\n' hit means the previous entry
+        // starts at tail.
+        cmp r13, r10;
+        je  lr_ru_at_tail;
+
+        // Load buf[p]; test for 0x0A.
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + r13 * 1];
+        cmp rax, 0x0A;
+        je  lr_ru_hit;
+
+        // p = (p - 1) mod cap
+        cmp r13, 0;
+        jne lr_ru_step_no_wrap;
+        mov r13, 8192;
+      lr_ru_step_no_wrap:
+        sub r13, 1;
+        jmp lr_ru_scan;
+
+      lr_ru_hit:
+        // new_cursor = (p + 1) mod cap
+        add r13, 1;
+        cmp r13, 8192;
+        jb  lr_ru_hit_no_wrap;
+        xor r13, r13;
+      lr_ru_hit_no_wrap:
+        jmp lr_ru_have_cursor;
+
+      lr_ru_at_tail:
+        // new_cursor = tail
+        mov r13, r10;
+
+      lr_ru_have_cursor:
+        // recalled_len = (end_of_prev_entry - new_cursor) mod cap
+        // r15 = len
+        mov r15, r14;
+        cmp r15, r13;
+        jae lr_ru_len_no_wrap;
+        add r15, 8192;
+      lr_ru_len_no_wrap:
+        sub r15, r13;                        // r15 = recalled_len
+
+        // Truncate to buf_cap if the recalled entry somehow exceeds
+        // it (should not happen for HIST_CMD_MAX==4096 into a 4096
+        // buf, but defensive).
+        cmp r15, r12;
+        jbe lr_ru_len_ok;
+        mov r15, r12;
+      lr_ru_len_ok:
+
+        // ------------------------------------------------------------
+        // Copy _sm_hist_buf[(new_cursor + i) mod cap] to buf[i] for
+        // i in 0..recalled_len.
+        // Registers during copy:
+        //   r13 = new_cursor (unchanged; we compute src per iteration)
+        //   r15 = recalled_len (invariant across the loop)
+        //   rbx = buf (unchanged)
+        //   rcx = i (loop index)
+        //   r10 = src_idx (per iteration = (r13 + rcx) mod 8192)
+        // ------------------------------------------------------------
+        xor rcx, rcx;                        // i = 0
+
+      lr_ru_copy_head:
+        cmp rcx, r15;
+        jae lr_ru_copy_done;
+
+        // src_idx = (r13 + rcx) mod 8192
+        mov r10, r13;
+        add r10, rcx;
+        cmp r10, 8192;
+        jb  lr_ru_copy_src_ok;
+        sub r10, 8192;
+      lr_ru_copy_src_ok:
+
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + r10 * 1];
+        mov_b [rbx + rcx * 1], rax;
+
+        add rcx, 1;
+        jmp lr_ru_copy_head;
+      lr_ru_copy_done:
+
+        // Redraw the visible line: `\r ESC[K` + prompt + buf[0..len).
+        mov rdi, rbx;
+        mov rsi, r15;
+        call lr_recall_redraw;
+
+        // Persist recall cursor.
+        lea r11, [rip + _sm_hist_recall_cursor];
+        mov [r11], r13;
+
+        // Return recalled_len.
+        mov rax, r15;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lr_ru_nop:
+        mov rax, 0xFFFFEC57;                 // LR_KEY_RECALL_NOP
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // R66.M1-003 (#19): lr_recall_down(buf, buf_cap) -> u64
+  //
+  // Signature: lr_recall_down : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI (input): buf      -- caller's line buffer to overwrite
+  // RSI (input): buf_cap  -- capacity of buf (typically 4096)
+  // RAX (output): new byte count (0 for the empty-draft transition,
+  //               1..buf_cap for a recall hit), or LR_KEY_RECALL_NOP
+  //               (0xFFFFEC57) if already at the empty-draft position.
+  //
+  // Walks _sm_hist_recall_cursor forward per §6.3 down-arrow rules.
+  // If the walk transitions to the empty-draft position, buf is
+  // cleared (len == 0) and the redraw shows an empty visible line
+  // after the prompt.
+  //
+  // DOWN-scan algorithm:
+  //   1. NOP if recall_cursor == head (empty draft already).
+  //   2. Scan forward from p = recall_cursor:
+  //        - if buf[p] == 0x0A: end_curr = p; stop
+  //        - else p = (p + 1) mod cap; iterate
+  //   3. new_cursor = (end_curr + 1) mod cap.
+  //   4. If new_cursor == head: len = 0 (empty draft), skip step 5.
+  //   5. Else scan forward from p = new_cursor for the terminator:
+  //        - if buf[p] == 0x0A: end_new = p; stop
+  //        - else p = (p + 1) mod cap; iterate
+  //      len = (end_new - new_cursor) mod cap.
+  //   6. Copy _sm_hist_buf[(new_cursor + i) mod cap] to buf[i] for
+  //      i in 0..len (skip if len == 0).
+  //   7. Redraw via lr_recall_redraw.
+  //   8. _sm_hist_recall_cursor := new_cursor.
+  //   9. Return len.
+  //
+  // Register plan (5 callee-save pushes + `sub rsp, 8` = 48 bytes;
+  // rsp % 16 == 0 at every nested SysV call):
+  //   rbx = buf                      (caller's dst)
+  //   r12 = buf_cap
+  //   r13 = new_cursor
+  //   r14 = scan cursor / end_new cache
+  //   r15 = len (final result) / copy loop index
+  // Labels prefixed lr_rd_.  (distinct from lr_recall_redraw's lr_rd_
+  // to avoid label collision -- see prefixes in labels below.)
+  // Effective labels: lr_rdn_.
+  // ==========================================================================
+  pub let lr_recall_down : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (buf_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-003 (#19): down-arrow recall walk. Mirror of lr_recall_up with forward scan semantics. NOP short-circuit when recall_cursor == head (empty draft already); the caller sees LR_KEY_RECALL_NOP and leaves r14/count untouched. Two forward scans per hit: (1) from recall_cursor find 0x0A terminator of current entry, (2) from (terminator + 1) find 0x0A terminator of new entry -- unless (terminator + 1) == head, in which case the new state is empty-draft (len == 0). Modular arithmetic uses cmp+jb+xor on the ring cap 8192 (fits imm <= 0x7FFFFFFF). Byte load via xor+mov_b per #1248. Redraw always emits (even for len == 0: the user sees an empty visible line after the prompt, which is the correct 'you've walked past the newest entry' feedback). recall_cursor updated after redraw so the visible state and the cursor are always coherent. Bumps SH_ST_RECALL on every walk (NOP included) so the fingerprint counts arrow-key presses. Prologue: 5 callee-save pushes (rbx buf, r12 buf_cap, r13 new_cursor, r14 scan cursor / end cache, r15 len / copy-i) + sub rsp, 8 = 48 bytes; entry rsp%16==8 + 48 = rsp%16==0 at every nested SysV call. Labels prefixed lr_rdn_ (distinct from lr_recall_redraw's lr_rd_ to avoid collision).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // buf
+        mov r12, rsi;                        // buf_cap
+
+        // Bump SH_ST_RECALL (slot 12).
+        mov rdi, 12;
+        call shell_note;
+
+        // Load recall_cursor + head.
+        lea r11, [rip + _sm_hist_recall_cursor];
+        mov r13, [r11];                      // temporarily = recall_cursor
+        lea r11, [rip + _sm_hist_head];
+        mov r10, [r11];                      // r10 = head
+
+        // NOP if recall_cursor == head (empty-draft already).
+        cmp r13, r10;
+        je  lr_rdn_nop;
+
+        // ------------------------------------------------------------
+        // Scan (1): from p = recall_cursor forward, find 0x0A terminator
+        // of the currently-recalled entry.  r14 = p.
+        // ------------------------------------------------------------
+        mov r14, r13;                        // p = recall_cursor
+
+      lr_rdn_scan1:
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + r14 * 1];
+        cmp rax, 0x0A;
+        je  lr_rdn_scan1_hit;
+        // p = (p + 1) mod 8192
+        add r14, 1;
+        cmp r14, 8192;
+        jb  lr_rdn_scan1;
+        xor r14, r14;
+        jmp lr_rdn_scan1;
+
+      lr_rdn_scan1_hit:
+        // new_cursor = (p + 1) mod 8192 -- reuse r13.
+        mov r13, r14;
+        add r13, 1;
+        cmp r13, 8192;
+        jb  lr_rdn_nc_ok;
+        xor r13, r13;
+      lr_rdn_nc_ok:
+
+        // If new_cursor == head, empty-draft transition (len == 0).
+        cmp r13, r10;
+        je  lr_rdn_empty;
+
+        // ------------------------------------------------------------
+        // Scan (2): forward from p = new_cursor for the new entry's
+        // 0x0A terminator; length = (p - new_cursor) mod 8192.
+        // ------------------------------------------------------------
+        mov r14, r13;                        // p = new_cursor
+
+      lr_rdn_scan2:
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + r14 * 1];
+        cmp rax, 0x0A;
+        je  lr_rdn_scan2_hit;
+        add r14, 1;
+        cmp r14, 8192;
+        jb  lr_rdn_scan2;
+        xor r14, r14;
+        jmp lr_rdn_scan2;
+
+      lr_rdn_scan2_hit:
+        // len = (r14 - r13) mod 8192; if r14 >= r13, simple sub;
+        // else add 8192 first.
+        mov r15, r14;
+        cmp r15, r13;
+        jae lr_rdn_len_no_wrap;
+        add r15, 8192;
+      lr_rdn_len_no_wrap:
+        sub r15, r13;                        // r15 = len
+
+        // Truncate to buf_cap on defensive overflow.
+        cmp r15, r12;
+        jbe lr_rdn_len_ok;
+        mov r15, r12;
+      lr_rdn_len_ok:
+        jmp lr_rdn_copy;
+
+      lr_rdn_empty:
+        xor r15, r15;                        // len = 0
+
+      lr_rdn_copy:
+        // Copy _sm_hist_buf[(r13 + i) mod 8192] to buf[i] for i in
+        // 0..r15. Skipped naturally when r15 == 0.
+        xor rcx, rcx;
+
+      lr_rdn_copy_head:
+        cmp rcx, r15;
+        jae lr_rdn_copy_done;
+        mov r10, r13;
+        add r10, rcx;
+        cmp r10, 8192;
+        jb  lr_rdn_copy_src_ok;
+        sub r10, 8192;
+      lr_rdn_copy_src_ok:
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + r10 * 1];
+        mov_b [rbx + rcx * 1], rax;
+        add rcx, 1;
+        jmp lr_rdn_copy_head;
+      lr_rdn_copy_done:
+
+        // Redraw visible line.
+        mov rdi, rbx;
+        mov rsi, r15;
+        call lr_recall_redraw;
+
+        // Persist new recall cursor.
+        lea r11, [rip + _sm_hist_recall_cursor];
+        mov [r11], r13;
+
+        mov rax, r15;
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      lr_rdn_nop:
+        mov rax, 0xFFFFEC57;                 // LR_KEY_RECALL_NOP
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // line_reader_read_line(buf, buf_len) -> u64
   //
   // Signature: line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs}
@@ -667,13 +1161,13 @@ module LineReader = structure {
   pub let line_reader_read_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (buf: u64) (buf_len: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17) + R66.M1-002 (#18): byte-at-a-time line assembly over the key-event FSM. The pre-#17 body called lr_read_one_byte directly and treated every byte as verbatim buffer input; the #17 body calls lr_read_key which folds 0x1B [...final and 0x7F into LR_KEY_* sentinels. Raw bytes (0..0xFF, excluding 0x1B and 0x7F which the FSM consumes) still take the append path; the newline byte (0x0A) terminates as before. Backspace (LR_KEY_BACKSPACE): shrinks the buffer cursor + count by 1 if count > 0 AND, per #18 R66.M1-002, emits the canonical on-screen erase `\\x08 \\x08` (BS SP BS) via sys_write(1, lr_erase_str, 3) so the terminal display tracks the buffer shrink. At column zero (count == 0) the branch is a full no-op: neither shrink nor erase, so the cursor never crosses back over the prompt. sys_write does NOT re-enter shell_note (only line_reader_read_line's own entry/return/error paths bump SH_ST_*), so the PROMPTS-LINES-ERRORS invariant is unaffected by per-keystroke erase writes. sys_write's clobber of rax/rcx/r11 is benign: r11 is re-staged at the top of every loop iteration (sentinel compares each stage `mov r11, imm64` fresh), rax/rcx are caller-save with no live value across the write. r12/r13/r14 (callee-save) survive as required. rsp%16==0 holds at the sys_write call site: entry rsp%16==8 plus 3 callee-save pushes (24 bytes) leaves rsp%16==0, and no local stack activity moves rsp between the prologue and the call. Arrow keys (LR_KEY_UP/DOWN/LEFT/RIGHT): recognised then discarded; #19/#20 replace the no-op branches. LR_KEY_UNKNOWN (unmapped ESC or CSI): also discarded. LR_KEY_EOF: routes to lr_rl_eof (mid-stream EOF returns count so far; start EOF returns LR_ERR_EOF). LR_ERR_READ_FAIL: routes to lr_rl_read_fail. Three callee-save pushes (r12=buf-walker, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_key, sys_write from #18). No `sub rsp, 8` needed. Gate rejects (buf==0 || buf_len==0) fail fast with LR_ERR_BAD_BUF before any read; SH_ST_PROMPTS bumps unconditionally at entry so a caller-side gate reject still records the prompt attempt. Counter discipline unchanged from ENH-007: SH_ST_PROMPTS on entry, SH_ST_LINES on any bytes-written return, SH_ST_ERRORS on every error sentinel — the invariant PROMPTS - LINES - ERRORS == 0 holds. Encoder conformance: no `test` mnemonic; every `cmp reg, imm` uses imm <= 0x7FFFFFFF (only 0 and 0x0A appear as low-byte compares; large-imm LR_KEY_* / LR_ERR_* sentinels stage via `mov r11, imm64; cmp rax, r11`); byte STORE uses `mov_b [r12], rax` (rax's low byte) per the history.pdx / command_record.pdx pattern; byte LOAD not needed in this body (the FSM already delivered the byte in rax). Effect/cap set !{mem, sysreg} @{fs} already covers sys_write (identical to sys_read's annotation) so #18's added call site widens nothing. raw-mode entry / cooked-mode restore are NOT called from this body: R66.M1-001 places them as scaffolded no-ops that a future shell_main will call once at session start / teardown when the KIND_TTY cap seat is provisioned (per-session, not per-line, so a Ctrl-C exit does not leave the tty stuck in raw mode). In cooked mode (what the substrate runs today) the kernel tty driver consumes 0x7F before it reaches sys_read, so the erase-write branch is dead code by construction; when the substrate lands and shell_main calls lr_tty_set_raw at startup, this branch activates without a further edit. Labels prefixed lr_rl_.",
+      justification: "shell.ENH-007 (#34) + R66.M1-001 (#17) + R66.M1-002 (#18) + R66.M1-003 (#19): byte-at-a-time line assembly over the key-event FSM. #17 folded 0x1B [...final and 0x7F into LR_KEY_* sentinels; #18 added on-screen `\\b \\b` erase; #19 refactored r12 to hold the buffer BASE (immutable) so byte writes are `mov_b [r12 + r14 * 1], rax`, letting up/down recall helpers overwrite via r14 assignment. Backspace (LR_KEY_BACKSPACE): shrinks r14 if count > 0 AND per #18 emits sys_write(1, lr_erase_str, 3); column-zero is a full no-op (no shrink, no erase). Does NOT reset the recall cursor (§6.3). Arrow-UP/DOWN call lr_recall_up/down and set r14 := returned count (or iterate on LR_KEY_RECALL_NOP). Arrow LEFT/RIGHT still discarded at #19 (#20's scope). Every RAW-byte append resets _sm_hist_recall_cursor := _sm_hist_head (§6.3 draft promotion). Three callee-save pushes (r12=buf_base, r13=buf_len, r14=count) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call (shell_note, lr_read_key, sys_write, lr_recall_up, lr_recall_down). No `sub rsp, 8` needed. Counter discipline unchanged from ENH-007: PROMPTS - LINES - ERRORS == 0 holds. Encoder conformance: no `test`; imm compares <= 0x7FFFFFFF; large-imm sentinels stage via `mov r11, imm64; cmp rax, r11`; byte STORE via `mov_b [r12 + r14 * 1], rax` per U1606 mitigation. Labels prefixed lr_rl_.",
       block: {
         push r12;
         push r13;
         push r14;
 
-        mov r12, rdi;                        // r12 = current buffer pointer
+        mov r12, rdi;                        // r12 = buf BASE (immutable)
         mov r13, rsi;                        // r13 = buf_len
         xor r14, r14;                        // r14 = bytes-read count = 0
 
@@ -712,14 +1206,16 @@ module LineReader = structure {
         cmp rax, r11;
         je  lr_rl_backspace;
 
-        // Arrow keys / unknown: recognised but ignored at #17.
-        // (#19 replaces UP/DOWN branches; #20 replaces LEFT/RIGHT.)
+        // R66.M1-003 (#19): Arrow-UP / Arrow-DOWN dispatch.
         mov r11, 0xFFFFEC50;                 // LR_KEY_UP
         cmp rax, r11;
-        je  lr_rl_loop;
+        je  lr_rl_up;
         mov r11, 0xFFFFEC51;                 // LR_KEY_DOWN
         cmp rax, r11;
-        je  lr_rl_loop;
+        je  lr_rl_down;
+
+        // Arrow LEFT/RIGHT / UNKNOWN: recognised but ignored at #19
+        // (#20 replaces LEFT/RIGHT with in-buffer cursor motion).
         mov r11, 0xFFFFEC52;                 // LR_KEY_LEFT
         cmp rax, r11;
         je  lr_rl_loop;
@@ -730,41 +1226,67 @@ module LineReader = structure {
         cmp rax, r11;
         je  lr_rl_loop;
 
-        // Raw byte (0..0xFF): append to buffer.
-        mov_b [r12], rax;                    // byte store (low byte of rax)
+        // Raw byte (0..0xFF): append to buffer at [r12 + r14].
+        mov_b [r12 + r14 * 1], rax;          // byte store (low byte of rax)
         add r14, 1;                          // count++
-        add r12, 1;                          // buf-walker++
 
         // Newline check: return count (includes the newline byte).
         cmp rax, 0x0A;
         je  lr_rl_return_count;
 
+        // R66.M1-003 (#19): after every raw-byte append, reset the
+        // recall cursor to head. The store is idempotent when the
+        // shell was not recalling (recall_cursor == head already), so
+        // an unconditional store is cheaper than a compare+branch.
+        // Uses rax as scratch (byte value no longer needed after the
+        // store).
+        lea r11, [rip + _sm_hist_head];
+        mov rax, [r11];
+        lea r11, [rip + _sm_hist_recall_cursor];
+        mov [r11], rax;
+
+        jmp lr_rl_loop;
+
+      lr_rl_up:
+        // Up-arrow: walk history recall cursor backwards. The helper
+        // rewrites buf[0..new_count) and redraws the visible line.
+        // On NOP (already at oldest), r14 is untouched.
+        mov rdi, r12;                        // buf base
+        mov rsi, r13;                        // buf_cap
+        call lr_recall_up;
+        mov r11, 0xFFFFEC57;                 // LR_KEY_RECALL_NOP
+        cmp rax, r11;
+        je  lr_rl_loop;
+        mov r14, rax;                        // r14 := new count
+        jmp lr_rl_loop;
+
+      lr_rl_down:
+        // Down-arrow: symmetric walk forward. Empty-draft transition
+        // returns 0 in rax (buf remains but visible line becomes empty
+        // after redraw).
+        mov rdi, r12;
+        mov rsi, r13;
+        call lr_recall_down;
+        mov r11, 0xFFFFEC57;                 // LR_KEY_RECALL_NOP
+        cmp rax, r11;
+        je  lr_rl_loop;
+        mov r14, rax;
         jmp lr_rl_loop;
 
       lr_rl_backspace:
-        // Shrink the buffer if count > 0; iterate either way. At
-        // column zero the branch is a full no-op (no shrink, no
-        // erase) so the on-screen cursor cannot cross back over the
-        // prompt.
+        // #17 base + #18 on-screen erase + #19 recall-safe (r12 immutable):
+        // shrink r14 if count > 0; NO `sub r12` (r12 is buffer BASE per #19
+        // r-cursor refactor; byte writes are `[r12 + r14 * 1]`). Column-zero
+        // is a full no-op — cursor never crosses back over the prompt.
+        // Does NOT reset recall cursor (§6.3: 'Backspace and cursor motion
+        // during recall behave identically to on the current draft').
         cmp r14, 0;
         je  lr_rl_loop;
         sub r14, 1;
-        sub r12, 1;
-        // R66.M1-002 (#18): on-screen erase. sys_write(1, lr_erase_
-        // str, 3) writes the canonical `\b \b` (0x08 0x20 0x08)
-        // sequence to stdout so the terminal display tracks the
-        // buffer shrink. sys_write clobbers rax/rcx/r11 (all caller-
-        // save; r11 is re-staged at the top of every loop iteration,
-        // so its clobber is benign). r12/r13/r14 are callee-save and
-        // survive. rsp%16==0 holds at the call site: entry rsp%16==8
-        // plus 3 callee-save pushes (24 bytes) leaves rsp%16==0, and
-        // no local stack activity has moved rsp since the prologue.
-        // Return value is discarded: a failed erase (short write to
-        // a full pipe, negative errno) leaves the terminal state
-        // out-of-sync with the buffer for exactly one keystroke,
-        // which the next append or a redraw corrects; no
-        // SH_ST_ERRORS bump because this is not a line-assembly
-        // failure -- the buffer edit already succeeded.
+        // R66.M1-002 (#18): on-screen erase. sys_write(1, lr_erase_str, 3)
+        // writes `\b \b` (0x08 0x20 0x08). sys_write clobbers rax/rcx/r11
+        // (caller-save; r11 re-staged next iter); r12/r13/r14 callee-save
+        // survive. rsp%16==0 at call site (3 pushes + entry rsp%16==8).
         mov rdi, 1;
         lea rsi, [rip + lr_erase_str];
         mov rdx, 3;

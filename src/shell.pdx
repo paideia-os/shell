@@ -245,6 +245,7 @@ module Shell = structure {
   pub let SH_ST_COMPLETIONS : u64 = 9   // M3-002
   pub let SH_ST_AUDITS      : u64 = 10  // M3-003
   pub let SH_ST_STAGES      : u64 = 11  // #45: per-stage attempts in shell_repl_step
+  pub let SH_ST_RECALL      : u64 = 12  // R66.M1-003 (#19): up/down arrow recall walks
   pub let SH_ST_MAX         : u64 = 16
 
   // ==========================================================================
@@ -264,7 +265,7 @@ module Shell = structure {
   pub let shell_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "shell.M1-001 (#1) / shell.M3 (#9-#11): clear the sixteen-word session stats table. Startup + teardown only; a live counter reset would race any concurrent shell_note (same discipline as elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70, and elevate_client_stats_reset libpdx-elevate/src/elevate_client.pdx). Loop: r10 base, rcx index 0..16, rax = 0. `cmp rcx, 16` uses imm <= 0x7FFFFFFF (paideia-as conformance). Loop bound widened from 8 to 16 at M3 to cover SH_ST_PASSTHRU / _COMPLETIONS / _AUDITS + 5 reserved slots without another re-layout. Leaf function -- no push/pop parity. Labels prefixed sh_rs_.",
+      justification: "shell.M1-001 (#1) / shell.M3 (#9-#11) / R66.M1-003 (#19): clear the sixteen-word session stats table AND the four R66.M1-003 history-ring cursors (_sm_hist_head / _sm_hist_tail / _sm_hist_recall_cursor + the legacy _sm_hist_used). Startup + teardown only; a live counter reset would race any concurrent shell_note (same discipline as elevate_broker_stats_reset paideia-os src/kernel/core/ipc/elevate_broker.pdx:70, and elevate_client_stats_reset libpdx-elevate/src/elevate_client.pdx). Loop: r10 base, rcx index 0..16, rax = 0. `cmp rcx, 16` uses imm <= 0x7FFFFFFF (paideia-as conformance). Loop bound widened from 8 to 16 at M3 to cover SH_ST_PASSTHRU / _COMPLETIONS / _AUDITS + 5 reserved slots without another re-layout. R66.M1-003 adds four direct .bss zero stores after the counter loop; the .bss slots are uninit-declared (loader zero-init happens for `uninit` @align slots at process load per paideia-as manifest.pdxproj kind=tool convention, but shell_reset is called both at boot AND before each test fixture, so explicit stores keep the test fixture reset semantics honest). Leaf function -- no push/pop parity. Labels prefixed sh_rs_.",
       block: {
         lea r10, [rip + _shell_stats];
         xor rax, rax;
@@ -274,6 +275,17 @@ module Shell = structure {
         add rcx, 1;
         cmp rcx, 16;
         jb  sh_rs_loop;
+
+        // R66.M1-003 (#19): zero the history-ring cursors + legacy used.
+        xor rax, rax;
+        lea r11, [rip + _sm_hist_used];
+        mov [r11], rax;
+        lea r11, [rip + _sm_hist_head];
+        mov [r11], rax;
+        lea r11, [rip + _sm_hist_tail];
+        mov [r11], rax;
+        lea r11, [rip + _sm_hist_recall_cursor];
+        mov [r11], rax;
         ret
       }
     }
@@ -417,7 +429,36 @@ module Shell = structure {
   //                        before each exec_spawn_and_wait)
   //   _sm_line_buf         the 4096-byte interactive-read scratch
   //   _sm_hist_buf         the 8192-byte in-memory history ring
-  //   _sm_hist_used        bytes consumed in _sm_hist_buf
+  //   _sm_hist_used        bytes consumed in _sm_hist_buf (deprecated at
+  //                        R66.M1-003 (#19): the ring's semantics moved
+  //                        from wire-encoded records to flat text per
+  //                        design/user/shell-line-editing.md §6.1; the
+  //                        write cursor is now _sm_hist_head. The slot
+  //                        is retained as a linkage-compat stub so the
+  //                        deprecated `history_persist_flush` no-ops
+  //                        cleanly instead of link-failing during the
+  //                        deprecation window)
+  //
+  // R66.M1-003 (#19) additions:
+  //   _sm_hist_head           write cursor into _sm_hist_buf (modulo cap);
+  //                           where the NEXT committed entry lands.
+  //   _sm_hist_tail           byte offset of the OLDEST surviving entry's
+  //                           first byte (advances as head wraps around
+  //                           and overwrites older data).
+  //   _sm_hist_recall_cursor  during an active up/down arrow walk, the
+  //                           offset of the currently-recalled entry's
+  //                           first byte. Equal to _sm_hist_head when no
+  //                           entry is currently recalled (empty draft).
+  //   _sm_hist_enc_scratch    scratch buffer sized for one wire-encoded
+  //                           HistoryEntry (24-byte header + up to 4096
+  //                           bytes command + up to 7 pad bytes = 4127
+  //                           bytes rounded to 4128 @align(16)). Used by
+  //                           sm_hist_commit to marshal the just-appended
+  //                           entry through history_encode_record before
+  //                           sys_write to _sm_hist_fd. Shared singleton
+  //                           because the shell is single-threaded; a
+  //                           future thread-per-session variant would
+  //                           push the scratch into per-thread state.
   // ==========================================================================
   pub let mut _sm_opt_c_cmd_ptr   : u64        = uninit @align(8)
   pub let mut _sm_opt_c_cmd_len   : u64        = uninit @align(8)
@@ -429,6 +470,10 @@ module Shell = structure {
   pub let mut _sm_line_buf        : [u8; 4096] = uninit @align(16)
   pub let mut _sm_hist_buf        : [u8; 8192] = uninit @align(16)
   pub let mut _sm_hist_used       : u64        = uninit @align(8)
+  pub let mut _sm_hist_head           : u64        = uninit @align(8)
+  pub let mut _sm_hist_tail           : u64        = uninit @align(8)
+  pub let mut _sm_hist_recall_cursor  : u64        = uninit @align(8)
+  pub let mut _sm_hist_enc_scratch    : [u8; 4128] = uninit @align(16)
 
   // ENH-008 (#35): fd for the per-session ~/.history/<session>-<ts>
   // .pdxhist journal file. Populated at shell_main startup via
@@ -470,6 +515,23 @@ module Shell = structure {
   // ("SHELL MAIN OK\n"); `[u8; 15]` = strlen + NUL per the paideia-as
   // fingerprint-string sizing rule.
   pub let sm_fp_entry_str         : [u8; 15] = "SHELL MAIN OK\n\0"
+
+  // R66.M1-003 (#19): history-ring fingerprint prefix.
+  //
+  // The full emission is `shell history ok -- entries=<N>\n`, composed
+  // at run time by history_ring_witness: this rodata blob is the fixed
+  // prefix; <N> is rendered decimal via History::history_format_u64_dec;
+  // '\n' is appended by the caller. `[u8; N]` sizing rule = strlen + 1
+  // (paideia-as fingerprint-string discipline) so N = 28 + 1 = 29 --
+  // the strlen of the visible prefix is 28 ("shell history ok -- entries=").
+  //
+  // The house shape is `component name ok -- kv=val` per design/policy/
+  // output-provenance-strip.md; the fingerprint is `-provenance-strip.md`
+  // clean (no milestone tag). sm_fp_hist_ok_prefix_len is the WIRE length
+  // (28, excludes the terminating NUL sys_write should not emit) so a
+  // sys_write can spell the count symbolically.
+  pub let sm_fp_hist_ok_prefix     : [u8; 29] = "shell history ok -- entries=\0"
+  pub let sm_fp_hist_ok_prefix_len : u64      = 28
 
   // ==========================================================================
   // sm_strlen(ptr) -> u64
@@ -728,6 +790,351 @@ module Shell = structure {
         pop r13;
         pop r12;
         pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // R66.M1-003 (#19): sm_hist_ring_commit(cmd_ptr, cmd_len) -> u64
+  //
+  // Signature: sm_hist_ring_commit : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI (input): cmd_ptr  -- caller-owned command bytes (typically
+  //                          &_sm_line_buf; the trailing newline byte
+  //                          MUST already have been stripped by the
+  //                          caller -- shell_main passes line_len-1
+  //                          when the line_reader return ends in 0x0A)
+  // RSI (input): cmd_len  -- command length in bytes (0..SM_LINE_BUF_CAP)
+  // RAX (output): SM_OK on success, or a HI_ERR_* pass-through from the
+  //               wire-encoded persist attempt.
+  //
+  // Commits ONE entry to the in-memory history ring (_sm_hist_buf, flat
+  // text layout per design/user/shell-line-editing.md §6.1) AND writes
+  // the wire-encoded record to _sm_hist_fd (persistence per §6.4). Both
+  // side effects share this one entry point so the recall-view and the
+  // on-disk journal cannot diverge -- the code path that appends flat
+  // text to the ring is the same one that encodes-and-writes the
+  // canonical record.
+  //
+  // Ring layout (flat text, per §6.1):
+  //   Each committed entry contributes `<cmd-bytes>` followed by ONE
+  //   0x0A separator byte. `_sm_hist_head` advances by cmd_len + 1 modulo
+  //   SM_HIST_RING_CAP (8192). If the write would overrun the region
+  //   protected by `_sm_hist_tail`, tail advances past the next 0x0A
+  //   following the overwritten region so every surviving entry is whole
+  //   (never truncated).
+  //
+  // Empty-line rule (§6.4 step 1): cmd_len == 0 short-circuits SM_OK
+  // without touching the ring. shell_main filters trailing-newline-only
+  // lines to cmd_len == 0 via the (line_len - 1) subtract; a bare-newline
+  // line therefore never lands.
+  //
+  // Wire persist (§6.4 flush integration): after the ring append lands,
+  // the just-committed entry is encoded via History::history_encode_record
+  // into _sm_hist_enc_scratch, then written to _sm_hist_fd via sys_write.
+  // A closed / bad fd (signed-negative) silently skips the sys_write;
+  // this preserves the ENH-008 "invalid fd is silent" discipline so the
+  // shell keeps running even before the persistent-home substrate lands.
+  //
+  // Recall cursor reset (§6.4 step 4): _sm_hist_recall_cursor is set to
+  // the new _sm_hist_head after every commit, so the NEXT input line's
+  // up-arrow walks backward from the fresh head, not from a stale
+  // in-progress recall position.
+  //
+  // Fingerprint (§6.5): history_ring_witness is called after every
+  // successful commit to emit `shell history ok -- entries=<N>` to fd 2.
+  //
+  // Register plan (5 callee-save pushes + `sub rsp, 8` = 48 bytes;
+  // rsp % 16 == 0 at every nested SysV call):
+  //   rbx = cmd_ptr
+  //   r12 = cmd_len
+  //   r13 = head (write cursor, updated in place)
+  //   r14 = tail (may advance)
+  //   r15 = byte-copy loop index
+  // Labels prefixed sm_hc_.
+  // ==========================================================================
+  pub let sm_hist_ring_commit : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (cmd_ptr: u64) (cmd_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-003 (#19): commit one entry to the flat-text history ring AND the wire-encoded persistence journal in one atomic action so the recall view and the on-disk journal cannot diverge. Empty-line short-circuit per design/user/shell-line-editing.md §6.4 step 1 (cmd_len==0 returns SM_OK without touching ring or fd). Ring layout is flat text `<cmd-bytes><0x0A>` (per §6.1) so the recall walk in line_reader can back-scan for the previous 0x0A boundary in constant per-byte cost -- no header parsing needed on the recall path, keeping arrow-key latency proportional to entry size only. Tail-advance rule (§6.4 step 3): when the head-advance would step past tail, walk tail forward past the next 0x0A in the ring so every surviving entry is whole; this preserves the invariant that a scan back from any interior byte hits a valid entry start or reaches tail. Wire persistence (§6.4 integration point): after the ring append the just-committed entry is encoded via History::history_encode_record into _sm_hist_enc_scratch (4128 bytes = 24 header + 4096 max cmd + 7 pad + 1 align), then sys_write to _sm_hist_fd. A closed/bad fd (signed-negative check) silently skips the sys_write per the ENH-008 invalid-fd-is-silent discipline (design/user/shell-line-editing.md §8 cross-ref; src/history.pdx :: history_persist_flush). Recall cursor reset (§6.4 step 4): _sm_hist_recall_cursor := _sm_hist_head after commit, so the next up-arrow walks back from the fresh head. Byte-copy inner loop uses xor rax, rax; mov_b rax, [rbx + r15 * 1] (load) then mov_b [r11 + r13 * 1], rax (store) per the #1248 / U1606 mitigation. Modulo SM_HIST_RING_CAP (8192, fits imm <= 0x7FFFFFFF) via cmp+jae+sub — cheaper than the shl/shr rounding pattern for a running cursor and honours the paideia-as no-large-imm-in-cmp rule since 8192 fits imm32. Fingerprint (§6.5) via history_ring_witness at the end of every successful commit path. 5 callee-save pushes (rbx cmd_ptr, r12 cmd_len, r13 head, r14 tail, r15 loop-idx) + sub rsp, 8 = 48 bytes; entry rsp%16==8 + 48 = rsp%16==0 for every nested SysV call (history_encode_record, sys_write, history_ring_witness). Labels prefixed sm_hc_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // cmd_ptr
+        mov r12, rsi;                        // cmd_len
+
+        // Empty-line short-circuit (§6.4 step 1).
+        cmp r12, 0;
+        je  sm_hc_ok;
+
+        // Load current head + tail into r13 + r14.
+        lea r11, [rip + _sm_hist_head];
+        mov r13, [r11];
+        lea r11, [rip + _sm_hist_tail];
+        mov r14, [r11];
+
+        // ------------------------------------------------------------
+        // Byte-copy cmd_ptr[0..cmd_len) into _sm_hist_buf at head,
+        // then one 0x0A separator at head + cmd_len. Per-byte
+        // discipline (single-slot-reserved ring convention): before
+        // each store, compute next_head = (head + 1) mod cap; if
+        // next_head == tail the ring would fill after the write, so
+        // advance tail past the NEXT 0x0A first to preserve the "every
+        // surviving entry is whole" invariant. Cold empty state
+        // (head == tail == 0) satisfies (next_head == 1) != (tail == 0)
+        // so the guard is inert on the first commit. This differs from
+        // the more obvious post-write check (`head == tail after step`)
+        // which would fail to detect the wrap-around exactly when
+        // head_pre == tail (the byte we're about to write sits on
+        // tail's first byte).
+        // ------------------------------------------------------------
+        xor r15, r15;                        // r15 = i (0..cmd_len)
+
+      sm_hc_copy_head:
+        cmp r15, r12;
+        jae sm_hc_copy_done;
+
+        // Pre-write tail-advance guard: (head + 1) mod cap == tail ?
+        // Computed BEFORE loading the source byte so the tail-scan
+        // inner loop can freely clobber rax.
+        mov r9, r13;
+        add r9, 1;
+        cmp r9, 8192;
+        jb  sm_hc_nh_ok;
+        xor r9, r9;
+      sm_hc_nh_ok:
+        cmp r9, r14;
+        jne sm_hc_no_tail_adv;
+        // Advance tail past the next 0x0A. Guarantee: at least one
+        // 0x0A exists between tail and head because tail was set by
+        // this same routine and it only moves past 0x0A boundaries.
+      sm_hc_tail_scan:
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + r14 * 1];
+        add r14, 1;
+        cmp r14, 8192;
+        jb  sm_hc_after_tail_wrap_a;
+        xor r14, r14;
+      sm_hc_after_tail_wrap_a:
+        cmp rax, 0x0A;
+        jne sm_hc_tail_scan;
+      sm_hc_no_tail_adv:
+
+        // Load one byte from cmd_ptr[i] into rax, then store at
+        // buf[head]. rax is the byte-source register the tree uses
+        // everywhere (history.pdx / completion.pdx / parser.pdx all
+        // spell `mov_b [dst], rax`).
+        xor rax, rax;
+        mov_b rax, [rbx + r15 * 1];
+        lea r11, [rip + _sm_hist_buf];
+        mov_b [r11 + r13 * 1], rax;
+
+        // head := next_head, i++.
+        mov r13, r9;
+        add r15, 1;
+        jmp sm_hc_copy_head;
+      sm_hc_copy_done:
+
+        // Append the 0x0A separator. Same pre-write guard as the
+        // command bytes above.
+        mov r9, r13;
+        add r9, 1;
+        cmp r9, 8192;
+        jb  sm_hc_nh_ok_b;
+        xor r9, r9;
+      sm_hc_nh_ok_b:
+        cmp r9, r14;
+        jne sm_hc_no_tail_adv_b;
+      sm_hc_tail_scan_b:
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + r14 * 1];
+        add r14, 1;
+        cmp r14, 8192;
+        jb  sm_hc_after_tail_wrap_b;
+        xor r14, r14;
+      sm_hc_after_tail_wrap_b:
+        cmp rax, 0x0A;
+        jne sm_hc_tail_scan_b;
+      sm_hc_no_tail_adv_b:
+
+        // Store 0x0A.
+        mov rax, 0x0A;
+        lea r11, [rip + _sm_hist_buf];
+        mov_b [r11 + r13 * 1], rax;
+        mov r13, r9;                         // head := next_head
+
+        // Persist updated head + tail + recall cursor.
+        lea r11, [rip + _sm_hist_head];
+        mov [r11], r13;
+        lea r11, [rip + _sm_hist_tail];
+        mov [r11], r14;
+        lea r11, [rip + _sm_hist_recall_cursor];
+        mov [r11], r13;                      // recall_cursor := new head
+
+        // Bump SH_ST_HISTORY (persistence-attempt counter, per the
+        // #19 issue text "history_encode_record entries" slot).
+        mov rdi, 7;                          // SH_ST_HISTORY
+        call shell_note;
+
+        // ------------------------------------------------------------
+        // Wire-encoded persist: history_encode_record(scratch, cap,
+        //   cmd_ptr, cmd_len, ts_ns=0, flags=0) -> HIST_OK / HIST_ERR_*
+        // then sys_write(_sm_hist_fd, scratch, history_bytes_written)
+        // if fd is valid.
+        // ------------------------------------------------------------
+        lea rdi, [rip + _sm_hist_enc_scratch];
+        mov rsi, 4128;                       // dst_len
+        mov rdx, rbx;                        // cmd_ptr
+        mov rcx, r12;                        // cmd_len
+        xor r8,  r8;                         // ts_ns = 0 (no clock yet)
+        xor r9,  r9;                         // flags = 0
+        call history_encode_record;
+        cmp rax, 0;                          // HIST_OK == 0
+        jne sm_hc_witness;                   // encoder refused -> skip write, still fingerprint
+
+        // sys_write only if fd is non-negative.
+        lea r11, [rip + _sm_hist_fd];
+        mov rdi, [r11];
+        cmp rdi, 0;
+        jl  sm_hc_witness;                   // bad fd -> silent skip
+
+        lea rsi, [rip + _sm_hist_enc_scratch];
+        lea r11, [rip + history_bytes_written];
+        mov rdx, [r11];
+        call sys_write;
+        // rax return is ignored; a failed write does not roll back the
+        // ring append (matches the ENH-008 "invalid fd is silent"
+        // posture for stable-under-degraded-substrate operation).
+
+      sm_hc_witness:
+        // §6.5 fingerprint emission (unconditional after successful
+        // ring commit, regardless of persist path outcome).
+        call history_ring_witness;
+
+      sm_hc_ok:
+        xor rax, rax;                        // SM_OK
+        add rsp, 8;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // R66.M1-003 (#19): history_ring_witness() -> ()
+  //
+  // Signature: history_ring_witness : () -> () !{mem, sysreg} @{fs}
+  //
+  // Emit the fingerprint `shell history ok -- entries=<N>\n` to fd 2
+  // (stderr) via sys_write, where <N> is the live count of complete
+  // entries in the ring (i.e., the count of 0x0A separator bytes
+  // between _sm_hist_tail and _sm_hist_head, walking modulo the ring
+  // capacity).
+  //
+  // The count is NOT cached (design/user/shell-line-editing.md §6.5):
+  // a walk of at most SM_HIST_RING_CAP (8192) bytes on every commit
+  // is a hundred microseconds and the honest answer is worth that.
+  //
+  // The message is composed into a stack-allocated 64-byte scratch:
+  //   28-byte prefix + 20-byte max decimal digits + 1 newline = 49 bytes.
+  // Rounded to 64 for 16-byte alignment insurance across the sys_write
+  // call's cross-syscall red-zone semantics.
+  //
+  // Register plan (2 callee-save pushes + `sub rsp, 64` = 80 bytes;
+  // rsp % 16 == 0 at nested SysV calls):
+  //   r12 = cursor into scratch
+  //   r13 = count accumulator (walked over the ring)
+  //   [rsp + 0 .. rsp + 64] = scratch
+  // Labels prefixed sm_hw_.
+  // ==========================================================================
+  pub let history_ring_witness : () -> () !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell.R66.M1-003 (#19): history-ring fingerprint emission. Full message `shell history ok -- entries=<N>\\n` per design/user/shell-line-editing.md §6.5. The `<N>` count is walked at emission time (not cached) because the ring is small (8192 bytes) and the walk cost is dominated by cross-syscall latency of the sys_write anyway. The walk counts 0x0A bytes between tail (inclusive) and head (exclusive) modulo SM_HIST_RING_CAP; each 0x0A is one complete entry's terminator. Prefix copied inline from sm_fp_hist_ok_prefix (28 bytes visible, plus a NUL that sys_write must not emit -- we spell the write count symbolically via sm_fp_hist_ok_prefix_len). Decimal render via History::history_format_u64_dec (which returns byte count, max 20 chars for u64::MAX). Trailing '\\n' appended manually. sys_write to fd 2 (stderr, matches sm_fp_entry_str emission convention). Byte load from ring uses xor+mov_b per #1248; byte stores into stack scratch use mov_b [rsp + r12 * 1] similarly. Prologue: 2 callee-save pushes (r12 scratch cursor, r13 count acc) + sub rsp, 64 = 80 bytes; entry rsp%16==8 + 80 = rsp%16==0 at every nested SysV call (history_format_u64_dec, sys_write). No ring-empty short-circuit -- an `entries=0` emission is honest information (`shell_reset was just called`, or `--no-history was set and nothing was appended`). Labels prefixed sm_hw_.",
+      block: {
+        push r12;
+        push r13;
+        sub rsp, 64;
+
+        // ------------------------------------------------------------
+        // (1) Walk the ring [tail, head) counting 0x0A bytes → r13.
+        // ------------------------------------------------------------
+        lea r11, [rip + _sm_hist_tail];
+        mov rcx, [r11];                      // rcx = walker
+        lea r11, [rip + _sm_hist_head];
+        mov r10, [r11];                      // r10 = head (stop position)
+        xor r13, r13;                        // r13 = count
+
+      sm_hw_scan:
+        cmp rcx, r10;
+        je  sm_hw_scan_done;
+
+        lea r11, [rip + _sm_hist_buf];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        cmp rax, 0x0A;
+        jne sm_hw_scan_step;
+        add r13, 1;
+      sm_hw_scan_step:
+        add rcx, 1;
+        cmp rcx, 8192;
+        jb  sm_hw_scan;
+        xor rcx, rcx;
+        jmp sm_hw_scan;
+      sm_hw_scan_done:
+
+        // ------------------------------------------------------------
+        // (2) Copy sm_fp_hist_ok_prefix[0..28] into scratch [0..28).
+        // ------------------------------------------------------------
+        xor r12, r12;                        // scratch cursor
+      sm_hw_prefix_head:
+        cmp r12, 28;
+        jae sm_hw_prefix_done;
+        lea r11, [rip + sm_fp_hist_ok_prefix];
+        xor rax, rax;
+        mov_b rax, [r11 + r12 * 1];
+        mov_b [rsp + r12 * 1], rax;
+        add r12, 1;
+        jmp sm_hw_prefix_head;
+      sm_hw_prefix_done:
+
+        // ------------------------------------------------------------
+        // (3) Render <N> decimal at scratch[cursor].
+        // ------------------------------------------------------------
+        mov rdi, r13;                        // value
+        mov rsi, rsp;
+        add rsi, r12;                        // out_buf = &scratch[cursor]
+        call history_format_u64_dec;
+        // rax = digit count (1..20)
+        add r12, rax;
+
+        // ------------------------------------------------------------
+        // (4) Append '\n' at scratch[cursor].
+        // ------------------------------------------------------------
+        mov rax, 0x0A;
+        mov_b [rsp + r12 * 1], rax;
+        add r12, 1;
+
+        // ------------------------------------------------------------
+        // (5) sys_write(fd=2, scratch, cursor).
+        // ------------------------------------------------------------
+        mov rdi, 2;
+        mov rsi, rsp;
+        mov rdx, r12;
+        call sys_write;
+
+        add rsp, 64;
+        pop r13;
+        pop r12;
         ret
       }
     }
@@ -1130,55 +1537,48 @@ module Shell = structure {
         call shell_repl_step;
 
         // History append (skip if --no-history).
+        //
+        // R66.M1-003 (#19): the ring's semantics moved from wire-encoded
+        // records to flat text per design/user/shell-line-editing.md
+        // §6.1; the write path is now sm_hist_ring_commit which owns
+        // BOTH the flat-text ring append (for arrow-key recall) AND the
+        // wire-encoded sys_write to _sm_hist_fd (for on-disk persist).
+        // The old history_encode_record + history_persist_flush pair is
+        // retired here so the ring cannot silently hold two views of
+        // "what the user ran" that could drift.
         lea r11, [rip + _sm_opt_no_history];
         mov rax, [r11];
         cmp rax, 0;
         jne sm_hist_skip;
 
-        // Skip if ring is at capacity (also guards the sub below from
-        // underflowing the remaining-capacity compute).
-        lea r11, [rip + _sm_hist_used];
-        mov rcx, [r11];
-        cmp rcx, 8192;
-        jae sm_hist_skip;
+        // Empty line skip.
+        cmp r13, 0;
+        je  sm_hist_skip;
 
-        // dst = &_sm_hist_buf + _sm_hist_used;
-        // dst_len = 8192 - _sm_hist_used
-        lea r11, [rip + _sm_hist_buf];
-        mov rdi, r11;
-        add rdi, rcx;
-        mov rsi, 8192;
-        sub rsi, rcx;
+        // Compute cmd_len: strip a trailing 0x0A if the read ended in
+        // newline (the line_reader-returns-includes-newline invariant).
+        // Buffer-full-no-newline path (r13 == 4096 without terminator)
+        // leaves the length intact.
+        mov rsi, r13;                        // cmd_len tentative
+        lea r11, [rip + _sm_line_buf];
+        mov rdi, r13;
+        sub rdi, 1;                          // last byte offset
+        xor rax, rax;
+        mov_b rax, [r11 + rdi * 1];
+        cmp rax, 0x0A;
+        jne sm_hist_no_strip;
+        sub rsi, 1;                          // drop trailing newline
 
-        // Need at least header(24) + 1 byte + 7 bytes pad = 32 bytes.
-        cmp rsi, 32;
-        jbe sm_hist_skip;
+      sm_hist_no_strip:
+        // Bare-newline line -> commit-length 0 -> skip per §6.4 step 1.
+        cmp rsi, 0;
+        je  sm_hist_skip;
 
-        lea rdx, [rip + _sm_line_buf];       // cmd_ptr
-        mov rcx, r13;                        // cmd_len
-        xor r8,  r8;                         // ts_ns = 0 (no clock yet)
-        xor r9,  r9;                         // flags = 0
-        call history_encode_record;
-        cmp rax, 0;
-        jne sm_hist_skip;                    // encoder refused -> drop
-
-        // Advance _sm_hist_used by history_bytes_written.
-        lea r11, [rip + history_bytes_written];
-        mov rax, [r11];
-        lea r11, [rip + _sm_hist_used];
-        mov rcx, [r11];
-        add rcx, rax;
-        mov [r11], rcx;
-
-        // ENH-008 (#35): drain the ring to disk. history_persist_flush
-        // internally checks --no-history and fd validity, so we call
-        // unconditionally and ignore the return: a failed flush is
-        // silent-with-counter-bump today (SH_ST_ERRORS incremented by
-        // the flush's own reject path); a future error-surfacing polish
-        // can promote it to a user-visible message.
-        lea r11, [rip + _sm_hist_fd];
-        mov rdi, [r11];
-        call history_persist_flush;
+        // sm_hist_ring_commit(_sm_line_buf, cmd_len) -- appends to flat
+        // ring, writes wire-encoded record to _sm_hist_fd, resets recall
+        // cursor, emits fingerprint.
+        lea rdi, [rip + _sm_line_buf];
+        call sm_hist_ring_commit;
 
       sm_hist_skip:
         jmp sm_repl_loop;
