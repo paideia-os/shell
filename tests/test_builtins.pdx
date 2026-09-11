@@ -7,7 +7,7 @@
 // SCOPE
 // =============================================================================
 //
-// Six cases cover the builtin dispatch surface:
+// Seven cases cover the builtin dispatch surface:
 //
 //   tbi_case_dispatch_miss_ls       argv "ls\0"           -> BI_MISS
 //   tbi_case_dispatch_hit_export    argv "export\0FOO=bar\0" argc=2
@@ -23,6 +23,9 @@
 //                                        (either proves dispatch reached
 //                                        bi_pwd; the specific outcome
 //                                        depends on live sys_getcwd)
+//   tbi_case_cd_dash_no_oldpwd      bi_cd(argv "cd\0-\0", argc=2) after
+//                                   fresh reset (_bi_oldpwd_valid == 0)
+//                                     -> BI_ERR_CD_NO_OLDPWD (shell#14)
 //
 // The `hit_pwd` case's disjunctive expectation is DELIBERATE runtime-
 // verification scoping: the pure-function surface is dispatch_line's
@@ -73,6 +76,7 @@
 //   0xFFFFED73   TBI_FAIL_EXPORT_SHELL_LOCAL     export state or return wrong
 //   0xFFFFED74   TBI_FAIL_EXPORT_MALFORMED       export malformed return wrong
 //   0xFFFFED75   TBI_FAIL_DISPATCH_HIT_PWD       pwd dispatch returned BI_MISS
+//   0xFFFFED76   TBI_FAIL_CD_DASH_NO_OLDPWD      `cd -` with valid==0 wrong code (shell#14)
 //
 // The band extends the family:
 //   0xFFFFED0x  TestCapsNarrow
@@ -112,6 +116,10 @@ module TestBuiltins = structure {
   pub let TBI_FAIL_EXPORT_SHELL_LOCAL  : u64 = 0xFFFFED73
   pub let TBI_FAIL_EXPORT_MALFORMED    : u64 = 0xFFFFED74
   pub let TBI_FAIL_DISPATCH_HIT_PWD    : u64 = 0xFFFFED75
+  // shell#14: `cd -` invoked before any successful cd must return
+  // BI_ERR_CD_NO_OLDPWD (0xFFFFECE8) -- pure-function safe because the
+  // dash branch checks _bi_oldpwd_valid BEFORE any sys_getcwd / sys_chdir.
+  pub let TBI_FAIL_CD_DASH_NO_OLDPWD   : u64 = 0xFFFFED76
 
   // ==========================================================================
   // Fixture buffers (.bss).
@@ -136,6 +144,8 @@ module TestBuiltins = structure {
   pub let mut _tbi_argv_export_m  : [u8; 16] = uninit @align(8)
   pub let mut _tbi_argv_cd_no_arg : [u8; 8]  = uninit @align(8)
   pub let mut _tbi_argv_pwd       : [u8; 8]  = uninit @align(8)
+  // shell#14: `cd -` with valid==0 -- fixture "cd\0-\0" (5 bytes, argc=2)
+  pub let mut _tbi_argv_cd_dash   : [u8; 8]  = uninit @align(8)
 
   // ==========================================================================
   // tbi_reset() -> ()
@@ -220,6 +230,14 @@ module TestBuiltins = structure {
         mov rax, 0x77; mov_b [r10 + 1], rax;    // 'w'
         mov rax, 0x64; mov_b [r10 + 2], rax;    // 'd'
         xor rax, rax;  mov_b [r10 + 3], rax;    // NUL
+
+        // Populate _tbi_argv_cd_dash: "cd\0-\0" (5 bytes; shell#14).
+        lea r10, [rip + _tbi_argv_cd_dash];
+        mov rax, 0x63; mov_b [r10 + 0], rax;    // 'c'
+        mov rax, 0x64; mov_b [r10 + 1], rax;    // 'd'
+        xor rax, rax;  mov_b [r10 + 2], rax;    // NUL
+        mov rax, 0x2D; mov_b [r10 + 3], rax;    // '-'
+        xor rax, rax;  mov_b [r10 + 4], rax;    // NUL
 
         call dispatch_init;
 
@@ -601,6 +619,64 @@ module TestBuiltins = structure {
     }
 
   // ==========================================================================
+  // tbi_case_cd_dash_no_oldpwd() -> u64  (shell#14)
+  //
+  // Input: bi_cd(argv "cd\0-\0", argc=2). Expected: BI_ERR_CD_NO_OLDPWD
+  // (0xFFFFECE8). Immediately after tbi_reset (which calls
+  // dispatch_init -> bi_env_reset), _bi_oldpwd_valid == 0, so the dash
+  // branch must short-circuit at the `cmp rax, 0; je bi_cd_no_oldpwd`
+  // gate BEFORE any sys_getcwd or sys_chdir call, emit the
+  // "SHELL CD ERR no oldpwd\n" fingerprint to fd 2, bump SH_ST_ERRORS,
+  // and return the distinct sentinel.
+  //
+  // Why the distinct sentinel matters: a REPL layered on bi_cd can
+  // print "cd: OLDPWD not set" (bash discipline) on this code and
+  // "cd: <path>: <errno>" on BI_ERR_CD_FAIL -- collapsing both would
+  // hide a genuine "user typed cd - before ever cd'ing" from a
+  // path-lookup failure like ENOENT.
+  //
+  // This case is pure-function-safe in the same shape as
+  // tbi_case_cd_no_arg: the reject happens before any chdir attempt.
+  // The one live-side effect is the sys_write of the fingerprint to
+  // stderr, which the pwd case's disjunctive expectation already
+  // establishes as acceptable in this fixture.
+  // ==========================================================================
+  pub let tbi_case_cd_dash_no_oldpwd : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell#14: the `cd -` no-OLDPWD reject case. After tbi_reset the dispatch_init tail invokes bi_env_reset which zeros _bi_oldpwd_valid. Calling bi_cd with argv[1] == '-' must therefore hit the dash branch, gate at `cmp rax, 0; je bi_cd_no_oldpwd`, emit 'SHELL CD ERR no oldpwd\\n' fingerprint via sys_write(fd=2, bi_cd_no_oldpwd_msg, 23), call shell_note(SH_ST_ERRORS), and return BI_ERR_CD_NO_OLDPWD (0xFFFFECE8) -- the distinct sentinel that keeps a REPL 'cd: OLDPWD not set' printout separable from an errno-shaped chdir failure. If bi_cd returned BI_OK, the valid-check gate is missing (dangerous -- would sys_chdir on an uninitialised _bi_oldpwd_buf). If it returned BI_ERR_CD_FAIL, the dash branch was skipped and the regular chdir path fired with argv[1] == '-' (also broken; the dash-detection is missing). If it returned BI_ERR_CD_NO_ARG, argc==2 was misread as argc<2 (broken). Only 0xFFFFECE8 proves the dash branch is wired end-to-end. Effect/cap set matches bi_cd's widest ({mem, sysreg} @{fs}) because bi_cd itself declares that set. 2 pushes + sub rsp 8 prologue mirrors sibling cases. Labels prefixed tbi_cd_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call tbi_reset;
+
+        lea rdi, [rip + _tbi_argv_cd_dash];
+        mov rsi, 2;
+        call bi_cd;
+
+        // Expect BI_ERR_CD_NO_OLDPWD = 0xFFFFECE8.
+        mov r11, 0xFFFFECE8;
+        cmp rax, r11;
+        jne tbi_cd_fail;
+
+        xor rax, rax;                        // TBI_PASS
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      tbi_cd_fail:
+        mov rax, 0xFFFFED76;                 // TBI_FAIL_CD_DASH_NO_OLDPWD
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
   // tbi_run_all() -> u64
   //
   // Umbrella: drive all 6 cases in issue order. Short-circuit on first
@@ -614,7 +690,7 @@ module TestBuiltins = structure {
   pub let tbi_run_all : () -> u64 !{mem, sysreg} @{fs} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-004 (#31): drive all 6 TestBuiltins cases in fingerprint order (dispatch_miss_ls, dispatch_hit_export, cd_no_arg, export_shell_local, export_malformed, dispatch_hit_pwd). Short-circuit on first non-zero return. Effect/cap set is the union of every case's effects; the widest is {mem, sysreg} @{fs} (dispatch_hit_export / _pwd, cd_no_arg all inherit through dispatch_line's declared set). 1 push + sub rsp 8 prologue -- rsp%16==0 for the nested case calls. Labels prefixed tbi_ra_.",
+      justification: "shell.ENH-004 (#31) + shell#14: drive all 7 TestBuiltins cases in fingerprint order (dispatch_miss_ls, dispatch_hit_export, cd_no_arg, export_shell_local, export_malformed, dispatch_hit_pwd, cd_dash_no_oldpwd). Short-circuit on first non-zero return. Effect/cap set is the union of every case's effects; the widest is {mem, sysreg} @{fs} (dispatch_hit_export / _pwd / cd_dash_no_oldpwd, cd_no_arg all inherit through dispatch_line's declared set). 1 push + sub rsp 8 prologue -- rsp%16==0 for the nested case calls. Labels prefixed tbi_ra_.",
       block: {
         push rbx;
         sub rsp, 8;
@@ -640,6 +716,10 @@ module TestBuiltins = structure {
         jne tbi_ra_out;
 
         call tbi_case_dispatch_hit_pwd;
+        cmp rax, 0;
+        jne tbi_ra_out;
+
+        call tbi_case_cd_dash_no_oldpwd;     // shell#14
 
       tbi_ra_out:
         add rsp, 8;

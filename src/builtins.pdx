@@ -1,4 +1,5 @@
 // src/builtins.pdx -- shell.ENH-004 (paideia-os/shell#31)
+//                     shell#14 (2026-09): `cd -` OLDPWD swap
 //
 // Builtins module: cd / exit / export / pwd handlers.
 //
@@ -96,6 +97,7 @@
 //   BI_ERR_EXPORT_TABLE_FULL    = 0xFFFFECE5   _bi_env_count == BI_ENV_TABLE_MAX
 //   BI_ERR_EXPORT_POOL_FULL     = 0xFFFFECE6   copy would exceed _bi_env_pool
 //   BI_ERR_PWD_TOO_LONG         = 0xFFFFECE7   sys_getcwd returned negative
+//   BI_ERR_CD_NO_OLDPWD         = 0xFFFFECE8   `cd -` before any successful cd (shell#14)
 //
 // (0xFFFFECE0 is BI_MISS, defined in Dispatch. Handlers never emit
 // BI_MISS -- it is dispatcher-scoped.)
@@ -142,6 +144,8 @@ module Builtins = structure {
   pub let BI_ERR_EXPORT_TABLE_FULL  : u64 = 0xFFFFECE5
   pub let BI_ERR_EXPORT_POOL_FULL   : u64 = 0xFFFFECE6
   pub let BI_ERR_PWD_TOO_LONG       : u64 = 0xFFFFECE7
+  // shell#14: `cd -` invoked before any successful cd (OLDPWD unset).
+  pub let BI_ERR_CD_NO_OLDPWD       : u64 = 0xFFFFECE8
 
   // ==========================================================================
   // Storage (.bss)
@@ -170,6 +174,31 @@ module Builtins = structure {
   pub let bi_nl                 : [u8; 2]     = "\n\0"
 
   // ==========================================================================
+  // OLDPWD storage (shell#14).
+  //
+  // `_bi_oldpwd_buf` holds the NUL-terminated path of the previous cwd
+  // (populated on every successful bi_cd by copying from _bi_pwd_buf,
+  // which stages the result of a pre-chdir sys_getcwd call). Sized 256
+  // to match _bi_pwd_buf and sys_getcwd's cap. `_bi_oldpwd_valid` is
+  // zero at startup / after bi_env_reset and one after the first
+  // successful bi_cd -- the `cd -` special-case reads it as a gate for
+  // BI_ERR_CD_NO_OLDPWD.
+  //
+  // OLDPWD is stored as a PATH STRING (not a vnode index) because
+  // paideia-os has no sys_fchdir today; sys_chdir only accepts a path.
+  // ==========================================================================
+  pub let mut _bi_oldpwd_buf    : [u8; 256]   = uninit @align(16)
+  pub let mut _bi_oldpwd_valid  : u64         = uninit @align(8)
+
+  // Fingerprint rodata for the `cd -` no-OLDPWD reject path (shell#14).
+  // Fixed-size [u8; N] where N = strlen + 1 for the trailing NUL, per
+  // paideia-as fingerprint-string convention; the visible byte count for
+  // sys_write is the accompanying _len constant (excludes NUL).
+  //   "SHELL CD ERR no oldpwd\n" = 23 visible bytes + NUL = 24 total.
+  pub let bi_cd_no_oldpwd_msg     : [u8; 24] = "SHELL CD ERR no oldpwd\n\0"
+  pub let bi_cd_no_oldpwd_msg_len : u64      = 23
+
+  // ==========================================================================
   // bi_env_reset()
   //
   // Signature: bi_env_reset : () -> () !{mem} @{}
@@ -187,12 +216,14 @@ module Builtins = structure {
   pub let bi_env_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "shell.ENH-004 (#31): zero the two env-table count singletons so a fresh startup or session reset starts from a known-empty state. Only the counts need zeroing -- readers only walk records [0.._bi_env_count) and only touch pool bytes referenced by an existing record's spans, so stale content past those bounds is unobservable (same discipline as parser_reset for _pr_stage_count). xor rax, rax produces the zero; one lea + one mov per singleton. r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed bi_er_.",
+      justification: "shell.ENH-004 (#31) + shell#14: zero the two env-table count singletons AND the OLDPWD-valid flag so a fresh startup or session reset starts from a known-empty state. Only the counts / flag need zeroing -- env-record readers only walk records [0.._bi_env_count) and only touch pool bytes referenced by an existing record's spans, and _bi_oldpwd_buf is only read when _bi_oldpwd_valid==1, so stale content past those bounds is unobservable (same discipline as parser_reset for _pr_stage_count). xor rax, rax produces the zero; one lea + one mov per singleton. r11 scratch (paideia-as conformance). Leaf function -- no push/pop parity. Labels prefixed bi_er_.",
       block: {
         xor rax, rax;
         lea r11, [rip + _bi_env_count];
         mov [r11], rax;
         lea r11, [rip + _bi_env_pool_used];
+        mov [r11], rax;
+        lea r11, [rip + _bi_oldpwd_valid];
         mov [r11], rax;
         ret
       }
@@ -205,35 +236,71 @@ module Builtins = structure {
   // RDI: argv_ptr -- pointer to NUL-separated argv byte slice for this stage.
   // RSI: argc     -- number of words in that slice.
   //
-  // Returns BI_OK on sys_chdir success, BI_ERR_CD_NO_ARG when argc < 2
-  // (distinct from BI_ERR_CD_FAIL per issue -- the fix is different: no
-  // arg means "user forgot to type a path", fail means "path is bad"),
-  // BI_ERR_CD_FAIL when sys_chdir returned a negative errno.
+  // Returns:
+  //   BI_OK               on sys_chdir success (regular path OR `cd -`).
+  //   BI_ERR_CD_NO_ARG    when argc < 2 (user forgot the path arg).
+  //   BI_ERR_CD_FAIL      when sys_chdir returned a negative errno.
+  //   BI_ERR_CD_NO_OLDPWD when `cd -` is invoked before any successful
+  //                       cd (shell#14; OLDPWD unset). Distinct sentinel
+  //                       from BI_ERR_CD_FAIL because the REPL will want
+  //                       to print "cd: OLDPWD not set" (bash-style).
   //
-  // Path argument is argv[1]: skip past the NUL following argv[0] to
-  // land on the first byte of argv[1]. Walker cap for sys_chdir is 255
-  // (matches the syscall.pdx sys_chdir wrapper's own hint semantics --
-  // the kernel copies min(hint, PATH_MAX-1)=255 bytes until NUL, so
-  // 255 is the standard cap for a walker-length hint over a NUL-
-  // terminated string; a `strlen` on argv[1] would also work but wastes
-  // a walker pass; matches the monorepo cd_builtin at
+  // shell#14 -- OLDPWD (`cd -`) semantics:
+  //
+  // Bash's `cd -` chdirs to the previous cwd ($OLDPWD) and echoes the
+  // new cwd. We reproduce the shape:
+  //
+  //   (a) On EVERY successful bi_cd (regular path OR `cd -`), the pre-
+  //       chdir cwd is captured into _bi_oldpwd_buf via a two-step:
+  //       sys_getcwd(_bi_pwd_buf, 256) as staging, then copy into
+  //       _bi_oldpwd_buf ONLY IF sys_chdir succeeded (so a failed cd
+  //       does not clobber OLDPWD). _bi_oldpwd_valid is set to 1 on
+  //       first successful capture.
+  //   (b) `cd -` detection: argv[1] is exactly the two-byte sequence
+  //       "-\0" (single '-' char followed by NUL).
+  //   (c) `cd -` before any successful cd: _bi_oldpwd_valid == 0 →
+  //       emit the "SHELL CD ERR no oldpwd\n" fingerprint to fd 2,
+  //       bump SH_ST_ERRORS, return BI_ERR_CD_NO_OLDPWD.
+  //   (d) `cd -` success: emit the new cwd + newline to fd 1 (bash
+  //       echoes the new pwd on `cd -`; a plain `cd <path>` does not).
+  //
+  // OLDPWD is stored as a PATH STRING, not a vnode index -- paideia-os
+  // has no sys_fchdir syscall today (only sys_chdir(path, hint) exists
+  // per src/syscall.pdx §sys_chdir). If sys_fchdir lands later, the
+  // buffer + valid pair can be swapped for a u64 vnode-index slot
+  // without disturbing the dispatch shape.
+  //
+  // Path argument for the regular branch is argv[1]: skip past the NUL
+  // following argv[0] to land on the first byte of argv[1]. Walker cap
+  // for sys_chdir is 255 (matches the syscall.pdx sys_chdir wrapper's
+  // own hint semantics -- the kernel copies min(hint, PATH_MAX-1)=255
+  // bytes until NUL; matches the monorepo cd_builtin at
   // src/user/dispatch.pdx:602 `mov rsi, 255`).
   //
-  // Prologue: `sub rsp, 8` alone -- no callee-save state to preserve
-  // across the single nested `call sys_chdir`. Entry rsp % 16 == 8;
-  // sub rsp, 8 -> rsp % 16 == 0 for the SysV call.
+  // Prologue: 3 callee-save pushes (rbx, r12, r13) = 24 bytes. Entry
+  // rsp % 16 == 8; after 3 pushes rsp % 16 == 0 for every nested SysV
+  // call (sys_getcwd, sys_chdir, sys_write, shell_note). No local
+  // stack scratch beyond the callee-saves.
   //
   // Register plan (function-scope):
-  //   r10 = argv walker (finds NUL past argv[0])
-  //   rax = byte scratch / return code
-  //   rdi, rsi = call args to sys_chdir (reloaded fresh)
+  //   rbx = argv[1] pointer (callee-save; survives sys_getcwd + sys_chdir)
+  //   r12 = staged sys_getcwd return (>=0 means _bi_pwd_buf holds valid
+  //         cwd bytes and can seed _bi_oldpwd_buf; <0 means skip the
+  //         OLDPWD update on this cd -- rare but keeps state honest)
+  //   r13 = copy loop dst walker (callee-save; multi-use)
+  //   r10 = copy loop src walker / general scratch (caller-save)
+  //   r11 = .bss LEA scratch (caller-save)
+  //   rax = byte load / return code
+  //   rdi, rsi, rdx = call args to nested syscalls (reloaded fresh)
   // ==========================================================================
   pub let bi_cd : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (argv_ptr: u64) (argc: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-004 (#31): cd builtin. argc==1 (no path arg) is a distinct error case per issue -- BI_ERR_CD_NO_ARG names it separately from BI_ERR_CD_FAIL so a user can distinguish 'forgot the path' from 'path is bad' via the return code. argc>=2 walks past argv[0]'s trailing NUL to get argv[1]'s pointer, then calls sys_chdir(argv[1], 255). Walker cap 255 matches syscall.pdx sys_chdir's own hint semantics (kernel copies min(hint, 255) bytes until NUL); mirrors monorepo cd_builtin at src/user/dispatch.pdx:602. On sys_chdir negative errno (signed test rax<0 per the shell repo's own errno-check convention in cd/pwd), return BI_ERR_CD_FAIL. Effect/cap set {mem, sysreg} @{fs} lifted from sys_chdir. Prologue: `sub rsp, 8` alone (no callee-save state; leaf modulo the nested sys_chdir call); matched `add rsp, 8` before every ret. Labels prefixed bi_cd_.",
+      justification: "shell.ENH-004 (#31) + shell#14: cd builtin with bash-style OLDPWD (`cd -`) support. Semantics: (1) argc<2 -> BI_ERR_CD_NO_ARG (distinct from FAIL so REPL can print 'cd: missing argument'). (2) argv[1] == '-' (two-byte '-\\0') triggers the dash branch: if _bi_oldpwd_valid==0 emit 'SHELL CD ERR no oldpwd\\n' fingerprint to fd 2, bump SH_ST_ERRORS, return BI_ERR_CD_NO_OLDPWD; else sys_getcwd into _bi_pwd_buf (stage), sys_chdir(_bi_oldpwd_buf, 255), on success copy _bi_pwd_buf into _bi_oldpwd_buf and echo the new cwd + newline to fd 1 (bash echoes on 'cd -'). (3) Any other argv[1] path takes the regular branch: sys_getcwd into _bi_pwd_buf (stage), sys_chdir(argv[1], 255), on success copy _bi_pwd_buf into _bi_oldpwd_buf and set _bi_oldpwd_valid=1. On sys_chdir negative errno either branch returns BI_ERR_CD_FAIL without disturbing _bi_oldpwd_buf/_valid (a failed cd must not clobber OLDPWD -- bash discipline). OLDPWD is stored as a path string (not vnode idx) because paideia-os has no sys_fchdir today; sys_chdir only takes (path, hint). Copy walks byte-by-byte until NUL or 255 bytes (matches sys_chdir hint cap; the 256th byte stays as-is which is fine because the walker never reads past the NUL). If the pre-chdir sys_getcwd fails (r12 negative), the OLDPWD update is skipped for that cd -- keeps state honest rather than seeding OLDPWD with kernel garbage. Encoder discipline: no `test` mnemonic (every zero-check `cmp reg, 0`); no scaled `[reg + N*8]` (plain `[r10]` / `[r13]`); large-imm sentinels 0xFFFFECE1/2/8 fit imm32; `cmp reg, imm` bounds (255, 256, 0x2D '-') all under 0x7FFFFFFF. Prologue: 3 callee-save pushes (rbx argv1, r12 saved getcwd rc, r13 copy dst) = 24 bytes; entry rsp%16==8, after 3 pushes rsp%16==0 for every nested SysV call. Labels prefixed bi_cd_.",
       block: {
-        sub rsp, 8;                          // align rsp % 16 for sys_chdir call
+        push rbx;
+        push r12;
+        push r13;
 
         cmp rsi, 2;                          // argc < 2 → no path arg
         jb bi_cd_no_arg;
@@ -249,27 +316,187 @@ module Builtins = structure {
         jmp bi_cd_scan_a0;
       bi_cd_after_a0:
         add r10, 1;                          // r10 = argv[1]
+        mov rbx, r10;                        // rbx = argv[1] (callee-save)
 
-        // sys_chdir(argv[1], 255)
-        mov rdi, r10;
-        mov rsi, 255;                        // walker CAP (see justification)
+        // Detect `cd -`: argv[1] == '-' (0x2D) followed by NUL.
+        // Walk r10 forward one byte at a time so every byte load uses
+        // the proven `[reg]` addressing form (avoids `[rbx + imm]`
+        // encoder-shape unknown for byte ops on the low-8 rbx reg).
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0x2D;                       // '-'
+        jne bi_cd_regular;
+        add r10, 1;
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0;
+        jne bi_cd_regular;
+        // Fall through to dash branch. rbx still holds argv[1].
+        jmp bi_cd_dash;
+
+      // ----------------------------------------------------------------
+      // Regular branch: sys_getcwd(_bi_pwd_buf, 256) staging,
+      // sys_chdir(argv[1], 255); on success seed OLDPWD from staging.
+      // ----------------------------------------------------------------
+      bi_cd_regular:
+        lea rdi, [rip + _bi_pwd_buf];
+        mov rsi, 256;
+        call sys_getcwd;
+        mov r12, rax;                        // save (negative = skip OLDPWD update)
+
+        mov rdi, rbx;                        // argv[1]
+        mov rsi, 255;                        // walker CAP
         call sys_chdir;
-        // rax = 0 on success, negative errno on failure.
         cmp rax, 0;
         jl bi_cd_fail;
 
+        // sys_chdir succeeded. Update OLDPWD only if the pre-chdir
+        // sys_getcwd returned >= 0 (a fresh task with no cwd is rare
+        // but we honor it by leaving OLDPWD unset).
+        cmp r12, 0;
+        jl bi_cd_reg_ok;
+
+        // Copy _bi_pwd_buf -> _bi_oldpwd_buf, then set valid = 1.
+        lea r10, [rip + _bi_pwd_buf];
+        lea r13, [rip + _bi_oldpwd_buf];
+        mov rcx, 255;                        // cap: sys_chdir walker hint
+      bi_cd_reg_copy:
+        cmp rcx, 0;
+        je bi_cd_reg_copy_nul;
+        xor rax, rax;
+        mov_b rax, [r10];
+        mov_b [r13], rax;
+        cmp rax, 0;
+        je bi_cd_reg_copy_done;
+        add r10, 1;
+        add r13, 1;
+        sub rcx, 1;
+        jmp bi_cd_reg_copy;
+      bi_cd_reg_copy_nul:
+        // Ran out of room without hitting NUL: force-terminate at [r13].
+        xor rax, rax;
+        mov_b [r13], rax;
+      bi_cd_reg_copy_done:
+        mov rax, 1;
+        lea r11, [rip + _bi_oldpwd_valid];
+        mov [r11], rax;
+
+      bi_cd_reg_ok:
         xor rax, rax;                        // BI_OK
-        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      // ----------------------------------------------------------------
+      // Dash branch: `cd -`. Requires _bi_oldpwd_valid == 1. Swap:
+      //   stage current cwd -> _bi_pwd_buf,
+      //   sys_chdir(_bi_oldpwd_buf, 255),
+      //   copy _bi_pwd_buf -> _bi_oldpwd_buf,
+      //   echo new cwd + newline to fd 1.
+      // ----------------------------------------------------------------
+      bi_cd_dash:
+        // Gate on _bi_oldpwd_valid.
+        lea r11, [rip + _bi_oldpwd_valid];
+        mov rax, [r11];
+        cmp rax, 0;
+        je bi_cd_no_oldpwd;
+
+        // Stage the current cwd (this becomes the NEW OLDPWD on success).
+        lea rdi, [rip + _bi_pwd_buf];
+        mov rsi, 256;
+        call sys_getcwd;
+        mov r12, rax;                        // negative → skip OLDPWD update
+
+        // chdir to the stored OLDPWD path.
+        lea rdi, [rip + _bi_oldpwd_buf];
+        mov rsi, 255;
+        call sys_chdir;
+        cmp rax, 0;
+        jl bi_cd_fail;
+
+        // Success: update OLDPWD to the just-departed cwd (staged in
+        // _bi_pwd_buf), then echo the new cwd.
+        cmp r12, 0;
+        jl bi_cd_dash_echo;
+
+        lea r10, [rip + _bi_pwd_buf];
+        lea r13, [rip + _bi_oldpwd_buf];
+        mov rcx, 255;
+      bi_cd_dash_copy:
+        cmp rcx, 0;
+        je bi_cd_dash_copy_nul;
+        xor rax, rax;
+        mov_b rax, [r10];
+        mov_b [r13], rax;
+        cmp rax, 0;
+        je bi_cd_dash_copy_done;
+        add r10, 1;
+        add r13, 1;
+        sub rcx, 1;
+        jmp bi_cd_dash_copy;
+      bi_cd_dash_copy_nul:
+        xor rax, rax;
+        mov_b [r13], rax;
+      bi_cd_dash_copy_done:
+
+      bi_cd_dash_echo:
+        // Emit the new cwd (bash echoes on `cd -`). Read fresh via
+        // sys_getcwd rather than trusting a stale buffer -- covers the
+        // r12<0 skip-copy path where _bi_pwd_buf was never valid.
+        lea rdi, [rip + _bi_pwd_buf];
+        mov rsi, 256;
+        call sys_getcwd;
+        cmp rax, 0;
+        jl bi_cd_dash_ok;                    // silent-on-echo-fail; BI_OK
+
+        // r10 = strlen (excl NUL) for sys_write count.
+        mov r10, rax;
+        sub r10, 1;
+
+        mov rdi, 1;                          // stdout
+        lea rsi, [rip + _bi_pwd_buf];
+        mov rdx, r10;
+        call sys_write;
+
+        mov rdi, 1;
+        lea rsi, [rip + bi_nl];
+        mov rdx, 1;
+        call sys_write;
+
+      bi_cd_dash_ok:
+        xor rax, rax;                        // BI_OK
+        pop r13;
+        pop r12;
+        pop rbx;
         ret;
 
       bi_cd_no_arg:
         mov rax, 0xFFFFECE1;                 // BI_ERR_CD_NO_ARG
-        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
         ret;
 
       bi_cd_fail:
         mov rax, 0xFFFFECE2;                 // BI_ERR_CD_FAIL
-        add rsp, 8;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_cd_no_oldpwd:
+        // Emit "SHELL CD ERR no oldpwd\n" to fd 2.
+        mov rdi, 2;                          // stderr
+        lea rsi, [rip + bi_cd_no_oldpwd_msg];
+        mov rdx, 23;                         // bi_cd_no_oldpwd_msg_len
+        call sys_write;
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECE8;                 // BI_ERR_CD_NO_OLDPWD
+        pop r13;
+        pop r12;
+        pop rbx;
         ret
       }
     }

@@ -4,6 +4,10 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## Unreleased
+
+- `bi_cd` gains bash-style `cd -` OLDPWD support (shell#14): pre-chdir cwd snapshot into `_bi_oldpwd_buf`, `cd -` swaps + echoes the new cwd, unset-OLDPWD path emits `SHELL CD ERR no oldpwd` fingerprint and returns new sentinel `BI_ERR_CD_NO_OLDPWD` (0xFFFFECE8); `tbi_case_cd_dash_no_oldpwd` locks the reject shape.
+
 ## Unreleased — R73.M1-006 (#26): job-control + tab-completion fingerprints
 
 Lands the observability handle for R73 job-control (bg/fg/jobs/tab-
