@@ -141,6 +141,7 @@ module Syscall = structure {
   //   59  execve   (exec: replace child image with argv[0]; ENH-005)
   //   60  exit     (Shell::shell_main normal termination; ENH-006)
   //   61  wait4    (exec: block on child exit code; ENH-005)
+  //   78  getdents (builtin: help /bin auto-enumeration; shell#29-help)
   //   85  chdir    (builtin: cd; ENH-004)
   //   86  getcwd   (builtin: pwd, prompt render; ENH-004/006)
   //
@@ -172,6 +173,7 @@ module Syscall = structure {
   pub let SYS_EXECVE  : u64 = 59
   pub let SYS_EXIT    : u64 = 60
   pub let SYS_WAIT4   : u64 = 61
+  pub let SYS_GETDENTS: u64 = 78
   pub let SYS_CHDIR   : u64 = 85
   pub let SYS_GETCWD  : u64 = 86
 
@@ -412,6 +414,53 @@ module Syscall = structure {
       block: {
         mov r10, rcx;
         mov rax, 61;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_getdents(fd, buf, nbytes) -> u64
+  //
+  // Bytes populated into `buf` on success (0 == directory drained; the
+  // kernel emits a terminator record with `name_len == 0` in a prior
+  // batch), or a negative errno. Record layout (paideia-os
+  // `design/user/dirent-record.md` and `src/kernel/core/syscall/
+  // sys_getdents.pdx §Record layout`): 12-byte header
+  // `{ino:u64, name_len:u16, reserved:u16}` followed by `name_len` bytes
+  // of name (no NUL terminator; entries are packed back-to-back). The
+  // kernel caps output at GETDENTS_IO_MAX = 4096 so any `rax > 4096`
+  // as unsigned is a bit-63-set negative errno (mirrors the ls.pdx
+  // guard at postui-os-semsend/src/user/ls.pdx:199).
+  //
+  // SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle; arity 3).
+  // Kernel body: paideia-os `src/kernel/core/syscall/sys_getdents.pdx`
+  // (landed R56.M3-003; caller-side proof exercised by /bin/ls since
+  // R57.M4-001).
+  //
+  // Sole shell consumer at shell#29-help: `bi_help`'s /bin auto-
+  // enumeration section (opens /bin, walks the record stream, emits
+  // one name per line). Neither the ls.pdx pattern (a `_start` function
+  // dedicated to draining one directory then sys_exit) nor the pipe
+  // passthrough / history writers before it needed getdents; the
+  // `help` builtin is the first non-ls consumer of the fd->entries
+  // walk in ring-3.
+  //
+  // Effect / capability set matches the underlying syscall_shim.pdx
+  // sys_getdents ({mem, sysreg} @{fs}): the kernel writes `nbytes` (at
+  // most) into the caller's buf, so `mem` covers the write-back; `sysreg`
+  // for SYSCALL itself; `fs` because sys_getdents walks a VFS vnode's
+  // directory table.
+  //
+  // Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save,
+  // harmless). No arg shuffle.
+  // ==========================================================================
+  pub let sys_getdents : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (fd: u64) (buf: u64) (nbytes: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell#29-help: SC+ ID 78 wrapper. SysV rdi/rsi/rdx pass through unchanged to SYSCALL rdi/rsi/rdx (arity 3 < 4; no r10 shuffle needed). Kernel body at paideia-os src/kernel/core/syscall/sys_getdents.pdx (landed R56.M3-003; the caller-side pattern in postui-os-semsend/src/user/ls.pdx has exercised it in ring-3 since R57.M4-001). Effect and capability set match syscall_shim.pdx sys_getdents byte-for-byte: {mem, sysreg} for SYSCALL + the kernel writing at most `nbytes` into the caller's buf, @{fs} because the syscall walks a VFS vnode's directory table. Sole shell consumer at this landing: bi_help's /bin auto-enumeration (Builtins module), which opens /bin O_RDONLY, calls sys_getdents in a loop until either name_len==0 terminator or rax==0 drain, then sys_close. Record layout (12-byte header, u16 name_len at +8, name at +12, terminator when name_len==0) matches the ls.pdx walk pattern. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none (linear body).",
+      block: {
+        mov rax, 78;
         syscall;
         ret
       }

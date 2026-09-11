@@ -24,21 +24,21 @@
 // from the byte walker in dispatch_line, so a fast length gate rejects
 // most candidates before the byte-compare loop.
 //
-// BI_TABLE_MAX is 16 to leave 12 slots of growth headroom above the
-// four ENH-004 builtins (cd/exit/export/pwd); ENH-005+ additions
-// (help/env/echo/clear/history/jobs/type/which/alias/unalias/read/
-// wait) fit under the cap without a re-layout. The 16 vs the 4 also
-// documents at a glance that this table is DELIBERATELY under-populated
-// at ENH-004 rather than "just big enough today".
+// BI_TABLE_MAX is 16 to leave 11 slots of growth headroom above the
+// five landed builtins (cd/exit/export/pwd/help at shell#29-help);
+// ENH-005+ additions (env/echo/clear/history/jobs/type/which/alias/
+// unalias/read/wait) fit under the cap without a re-layout. The 16 vs
+// the 5 also documents at a glance that this table is DELIBERATELY
+// under-populated at this landing rather than "just big enough today".
 //
 // The names themselves live as short byte-array constants in this
-// module (`bi_name_cd`, `bi_name_exit`, `bi_name_export`, `bi_name_pwd`).
-// Populated at startup by `dispatch_init` because paideia-as does not
-// support address-of-symbol in static array initializers -- the LEA
-// pattern in `dispatch_init` mirrors the monorepo's `dispatch_init`
-// at src/user/dispatch.pdx:104. `dispatch_init` also calls
-// `bi_env_reset` (from Builtins) so the shell-local env table starts
-// clean at startup / session reset.
+// module (`bi_name_cd`, `bi_name_exit`, `bi_name_export`, `bi_name_pwd`,
+// `bi_name_help`). Populated at startup by `dispatch_init` because
+// paideia-as does not support address-of-symbol in static array
+// initializers -- the LEA pattern in `dispatch_init` mirrors the
+// monorepo's `dispatch_init` at src/user/dispatch.pdx:104.
+// `dispatch_init` also calls `bi_env_reset` (from Builtins) so the
+// shell-local env table starts clean at startup / session reset.
 //
 // =============================================================================
 // dispatch_line(argv_ptr, argc) -> u64
@@ -101,7 +101,7 @@ module Dispatch = structure {
   // Table caps
   // ==========================================================================
   pub let BI_TABLE_MAX : u64 = 16
-  pub let BI_TABLE_N   : u64 = 4         // cd, exit, export, pwd at ENH-004
+  pub let BI_TABLE_N   : u64 = 5         // cd, exit, export, pwd, help (shell#29-help)
 
   // ==========================================================================
   // Dispatcher return-code sentinel (part of the 0xFFFFECEx band; the
@@ -179,11 +179,13 @@ module Dispatch = structure {
   pub let bi_name_exit   : [u8; 5] = "exit\0"
   pub let bi_name_export : [u8; 7] = "export\0"
   pub let bi_name_pwd    : [u8; 4] = "pwd\0"
+  pub let bi_name_help   : [u8; 5] = "help\0"
 
   pub let BI_NAME_LEN_CD     : u64 = 2
   pub let BI_NAME_LEN_EXIT   : u64 = 4
   pub let BI_NAME_LEN_EXPORT : u64 = 6
   pub let BI_NAME_LEN_PWD    : u64 = 3
+  pub let BI_NAME_LEN_HELP   : u64 = 4
 
   // ==========================================================================
   // Runtime-loaded triple table (.bss).
@@ -203,10 +205,15 @@ module Dispatch = structure {
   //
   // Signature: dispatch_init : () -> () !{mem} @{}
   //
-  // Populate the four runtime-loaded slots with (name_ptr, name_len,
-  // handler_ptr) triples in the fixed order cd / exit / export / pwd.
-  // Sets _bi_count = 4. Then calls bi_env_reset to clear the shell-local
-  // env table (fresh startup / session reset invariant).
+  // Populate the five runtime-loaded slots with (name_ptr, name_len,
+  // handler_ptr) triples in the fixed order cd / exit / export / pwd /
+  // help. Sets _bi_count = 5. Then calls bi_env_reset to clear the
+  // shell-local env table (fresh startup / session reset invariant).
+  //
+  // Order note: `help` lands at index 4 (last) so pre-existing callers
+  // that hard-coded index positions for cd/exit/export/pwd (indices
+  // 0..3) still resolve the same handler. New builtins should always
+  // append at the tail for this reason.
   //
   // Called once from _start / Shell::shell_main before the REPL begins
   // reading lines (ENH-006 wiring). Leaf-ish: one nested `call bi_env_
@@ -223,11 +230,11 @@ module Dispatch = structure {
   pub let dispatch_init : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "shell.ENH-004 (#31): populate the runtime-loaded builtin dispatch table at startup. Loads (name_ptr, name_len, handler_ptr) for cd/exit/export/pwd at indices 0..3, then sets _bi_count = 4. Calls bi_env_reset (from Builtins) to clear the shell-local env table so the first `export` lands at slot 0. Table populated at runtime rather than statically because paideia-as does not support address-of-symbol in static array initializers (same reason monorepo dispatch_init at src/user/dispatch.pdx:104 uses this idiom). r11 as .bss LEA scratch, rax for name/handler pointer staging. `sub rsp, 8` prologue aligns rsp%16==0 for the single nested `call bi_env_reset`; matched `add rsp, 8` before ret. Labels prefixed bi_di_ (none needed -- linear body).",
+      justification: "shell.ENH-004 (#31) + shell#29-help: populate the runtime-loaded builtin dispatch table at startup. Loads (name_ptr, name_len, handler_ptr) for cd/exit/export/pwd at indices 0..3 (ENH-004) and help at index 4 (shell#29-help), then sets _bi_count = 5. Calls bi_env_reset (from Builtins) to clear the shell-local env table so the first `export` lands at slot 0. Table populated at runtime rather than statically because paideia-as does not support address-of-symbol in static array initializers (same reason monorepo dispatch_init at src/user/dispatch.pdx:104 uses this idiom). r11 as .bss LEA scratch, rax for name/handler pointer staging. `sub rsp, 8` prologue aligns rsp%16==0 for the single nested `call bi_env_reset`; matched `add rsp, 8` before ret. Labels prefixed bi_di_ (none needed -- linear body).",
       block: {
         sub rsp, 8;                          // align rsp % 16 for bi_env_reset call
 
-        // _bi_names[0..3]
+        // _bi_names[0..4]
         lea r11, [rip + _bi_names];
         lea rax, [rip + bi_name_cd];
         mov [r11 + 0], rax;
@@ -237,8 +244,10 @@ module Dispatch = structure {
         mov [r11 + 16], rax;
         lea rax, [rip + bi_name_pwd];
         mov [r11 + 24], rax;
+        lea rax, [rip + bi_name_help];
+        mov [r11 + 32], rax;
 
-        // _bi_name_lens[0..3]
+        // _bi_name_lens[0..4]
         lea r11, [rip + _bi_name_lens];
         mov rax, 2;                          // strlen("cd")
         mov [r11 + 0], rax;
@@ -248,8 +257,10 @@ module Dispatch = structure {
         mov [r11 + 16], rax;
         mov rax, 3;                          // strlen("pwd")
         mov [r11 + 24], rax;
+        mov rax, 4;                          // strlen("help")
+        mov [r11 + 32], rax;
 
-        // _bi_handlers[0..3]
+        // _bi_handlers[0..4]
         lea r11, [rip + _bi_handlers];
         lea rax, [rip + bi_cd];
         mov [r11 + 0], rax;
@@ -259,10 +270,12 @@ module Dispatch = structure {
         mov [r11 + 16], rax;
         lea rax, [rip + bi_pwd];
         mov [r11 + 24], rax;
+        lea rax, [rip + bi_help];
+        mov [r11 + 32], rax;
 
-        // _bi_count = 4
+        // _bi_count = 5
         lea r11, [rip + _bi_count];
-        mov rax, 4;
+        mov rax, 5;
         mov [r11], rax;
 
         // Reset shell-local env table so startup is a clean baseline.
@@ -330,7 +343,7 @@ module Dispatch = structure {
   pub let dispatch_line : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
     fn (argv_ptr: u64) (argc: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-004 (#31): builtin lookup + dispatch. Walks the runtime-loaded _bi_names / _bi_name_lens / _bi_handlers triple; fast length gate via _bi_name_lens skips the byte-compare loop for any candidate of the wrong length (the four ENH-004 names have four distinct lengths 2/4/6/3, so length alone disambiguates all four -- byte compare is only reached for the matching candidate). On hit, calls the handler with (argv_ptr, argc) preserved through argc/r13 and argv_ptr/r12 across the byte-compare loop. On miss (no candidate matched or argc==0), returns BI_MISS (0xFFFFECE0) so the caller's REPL (ENH-006) can try the external exec path. Effect/cap set {mem, sysreg} @{fs} matches the widest handler (bi_cd/bi_pwd); bi_exit's sched effect propagates through the call graph at sys_exit's own annotation. Prologue: 5 callee-save pushes (40 bytes; no local scratch). Entry rsp%16==8; after 5 pushes rsp%16==0; every nested `call rax` sees rsp%16==0. Labels prefixed dp_.",
+      justification: "shell.ENH-004 (#31) + shell#29-help: builtin lookup + dispatch. Walks the runtime-loaded _bi_names / _bi_name_lens / _bi_handlers triple; fast length gate via _bi_name_lens skips the byte-compare loop for any candidate of the wrong length. Post shell#29-help the five landed names have lengths 2/4/6/3/4 -- length alone disambiguates 3 of 5 candidates for either exit or help (the two length-4 names), and reaches byte compare only on the length-matching subset. On hit, calls the handler with (argv_ptr, argc) preserved through argc/r13 and argv_ptr/r12 across the byte-compare loop. On miss (no candidate matched or argc==0), returns BI_MISS (0xFFFFECE0) so the caller's REPL (ENH-006) can try the external exec path. Effect/cap set {mem, sysreg} @{fs} matches the widest handler (bi_cd/bi_pwd/bi_help); bi_exit's sched effect propagates through the call graph at sys_exit's own annotation. Prologue: 5 callee-save pushes (40 bytes; no local scratch). Entry rsp%16==8; after 5 pushes rsp%16==0; every nested `call rax` sees rsp%16==0. Labels prefixed dp_.",
       block: {
         push rbx;
         push r12;

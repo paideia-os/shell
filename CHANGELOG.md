@@ -10,6 +10,94 @@ Changelog conventions; the project follows Semantic Versioning per
 ## Unreleased — test SCOPE header drift (incidental)
 
 - `tests/test_shell_main.pdx` SCOPE header: "Ten cases" → "Eleven cases" (11 `tshm_case_*` defs; `tshm_run_all` justification + 0xFFFFED8x table already at 11 since #45 landed `tshm_case_repl_pipe_stages`). SH_ST_STAGES (slot 11) constant + `shell_repl_step` loop over `[0, _pr_stage_count)` unchanged; the `bumps by N for an N-stage line` invariant matches the code. Doc-only, no issue reference (survey handle #26 was mismatched — actual issue #26 tracks R73 job-control fingerprints and is not resolved by this edit).
+## Unreleased — shell#29-help: `help` builtin auto-enumerates `/bin`
+
+Adds the first user-facing discovery surface for the shell. `help`
+emits two sections separated by fixed headers: `--- builtins ---`
+listing every currently-registered builtin one-per-line, and
+`--- /bin ---` listing every entry the /bin directory exposes to the
+current process at the time `help` is invoked.
+
+**New: `Syscall::sys_getdents` (SC+ ID 78).** Thin wrapper matching
+the arity-3 (fd, buf, nbytes) → u64 shape of every other sibling
+syscall in the module; effect/cap set `{mem, sysreg} @{fs}` mirrors
+`sys_read`/`sys_write` with the fs cap for the VFS directory walk.
+Kernel body has been landed since paideia-os R56.M3-003 and exercised
+in ring-3 by `/bin/ls` since R57.M4-001; the shell was previously not
+a consumer.
+
+**New: `Builtins::bi_help` handler.** Signature
+`(u64, u64) -> u64 !{mem, sysreg} @{fs}`; argv/argc parameters unused
+(help takes no args). Flow:
+
+1. `sys_write` the `--- builtins ---\n` header.
+2. Walk `Dispatch::_bi_names` / `_bi_name_lens` (indices
+   `0.._bi_count`) and emit each name + `\n`. Live-read of the
+   dispatcher's table so future landings that register a builtin in
+   `dispatch_init` surface here without a `bi_help` code change.
+3. `sys_write` the `--- /bin ---\n` header.
+4. `sys_open("/bin", O_RDONLY, 0)`; on fd >= 32 (bad fd OR bit-63-set
+   negative errno; same gate shape ls.pdx at
+   `postui-os-semsend/src/user/ls.pdx:177` uses) skip the /bin phase
+   and return BI_OK.
+5. `sys_getdents` loop into `_bh_dents_buf : [u8; 4096]`; walk the
+   12-byte-header records (u16 `name_len` at +8 loaded via two
+   `mov_b`+shift-add byte reads to avoid the `mov_w` opcode that has
+   no other site in this repo, name at +12, terminator when
+   `name_len == 0`) and emit each name + `\n`. `.` / `..` are excluded
+   by the kernel per project convention (paideia-os
+   `design/user/dirent-record.md`), so no filter is needed on the
+   ring-3 side.
+6. `sys_close(fd)`; return BI_OK.
+
+Section-split (vs a merged flat list) is the operator-facing design
+call: users need to know which invocations are shell-internal (no
+fork+exec cost, effect+cap set bounded by the handler annotation)
+and which are `/bin` binaries (fork+exec, caps narrowed at
+`sys_execve`). Merging the two loses that distinction; the cost /
+capability posture matters for both interactive use and audit trails.
+
+Error degradation: `sys_open` and `sys_getdents` failures both skip
+the /bin phase and return BI_OK. `help` is an operator-comfort
+surface, not a semantic gate -- a rootfs that has yet to expose /bin
+(early boot, initramfs, chroot rig) should still let the user
+discover the in-shell command surface. The dropped /bin section is
+diagnosable by its absence in the output rather than a return code
+that a REPL would surface as "help failed" (misleading, since the
+builtins list did come through).
+
+**New rodata / bss in `Builtins`:**
+
+- `bh_hdr_builtins : [u8; 18] = "--- builtins ---\n\0"` (17 visible +
+  1 NUL sentinel per the paideia-as fingerprint-string rule).
+- `bh_hdr_bin : [u8; 14] = "--- /bin ---\n\0"` (13 visible + 1 NUL).
+- `bh_bin_path : [u8; 5] = "/bin\0"` (4 visible + 1 NUL).
+- Length constants `BH_HDR_BUILTINS_LEN = 17`, `BH_HDR_BIN_LEN = 13`.
+- `_bh_dents_buf : [u8; 4096] uninit @align(16)` -- sys_getdents work
+  buffer sized to `GETDENTS_IO_MAX`.
+
+**Dispatch table extension:**
+
+- New name literal `bi_name_help : [u8; 5] = "help\0"` and length
+  constant `BI_NAME_LEN_HELP = 4`.
+- `BI_TABLE_N` bumped 4 → 5; `dispatch_init` grows three rows
+  (`_bi_names[4]`, `_bi_name_lens[4]`, `_bi_handlers[4]`) and sets
+  `_bi_count = 5`. `help` lands at index 4 so pre-existing hard-coded
+  index references for cd/exit/export/pwd (0..3) still resolve the
+  same handler. `BI_TABLE_MAX = 16` unchanged.
+
+**No new error sentinel:** the 0xFFFFECEx band is unchanged. `help`
+never emits a handler-scoped error; any /bin failure degrades to
+BI_OK with the builtins section still visible.
+
+Encoder pitfalls check: no `test` mnemonic; every `cmp reg, imm`
+uses imm ≤ 0x7FFFFFFF (largest are 32 fd cap, 4096 getdents ret
+cap, 12 record header bytes); u16 loads via two `mov_b`+shift-add
+byte reads rather than `mov_w` (unused elsewhere in this repo);
+byte reads use the `xor rax, rax; mov_b rax, [reg]` #1248 pattern
+throughout; no `and reg, imm64` on r8-r15; no 2-op `imul r, imm`;
+r11 used only as short-lived .bss LEA and not held across any
+call; every label prefixed `bh_` (reserved-label discipline).
 
 ## Unreleased — R73.M1-006 (#26): job-control + tab-completion fingerprints
 
