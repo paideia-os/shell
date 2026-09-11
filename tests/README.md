@@ -31,6 +31,22 @@ returns 0 on all-pass or a distinct `0xFFFFED*x` fail code otherwise.
   on this module's `tsm_run_all()` returning 0. Fail code band
   0xFFFFED2x.
 
+- `test_exec_alignment.pdx` (shell#44 retroactive) —
+  `TestExecAlignment` module: 3 test cases witnessing the
+  `rsp % 16 == 0` invariant that shell#19 commit 88580b5 restored
+  on `Exec::exec_spawn_and_wait`. Case 1 replicates the POST-fix
+  prologue (5 callee-save pushes, no `sub rsp, 8`) and asserts
+  post-prologue rsp%16==0; case 2 replicates the PRE-fix (buggy)
+  prologue and asserts the counter-example (rsp%16==8 post-stray-
+  sub); case 3 round-trips the real SUT via its BAD_ARGV gate
+  (argc=0). Fail code band 0xFFFFEDFx. Driver: `teal_run_all()` --
+  emits `EXEC ALIGN OK\n` via sys_write(1, ...) on all-pass so the
+  paideia-os QEMU boot smoke can grep-assert it. Future enhancement
+  note: replace the arithmetic `and rax, 15` witness with a
+  `movaps [rsp], xmm0` hard-fault probe once paideia-as gains
+  packed-SSE emission (#1333 deferred; only scalar-float lands
+  today).
+
 - `test_tokenizer.pdx` (R106.SHELL-003, issue #42) —
   `TestTokenizer` module: 14 test cases against R106.M1
   `Tokenizer.tokenize` (src/tokenizer.pdx). Covers empty, ws-only,
@@ -53,6 +69,7 @@ Each `*_run_all` returns:
 - `0xFFFFED1x` — first failing case in test_audit_first.
 - `0xFFFFED2x` — first failing case in test_smoke_matrix.
 - `0xFFFFEDBx` — first failing case in test_tokenizer.
+- `0xFFFFEDFx` — first failing case in test_exec_alignment.
 
 The bands are disjoint from the shell's own 0xFFFFECxx band
 so an operator reading a test-run log can distinguish "SUT rejected

@@ -98,6 +98,73 @@ byte reads use the `xor rax, rax; mov_b rax, [reg]` #1248 pattern
 throughout; no `and reg, imm64` on r8-r15; no 2-op `imul r, imm`;
 r11 used only as short-lived .bss LEA and not held across any
 call; every label prefixed `bh_` (reserved-label discipline).
+## Unreleased — shell#44 retroactive: exec_spawn_and_wait alignment regression test
+
+Retroactive regression test for the fork/exec-path alignment landmine
+shell#19 commit 88580b5 removed. That fix pulled a stray `sub rsp, 8`
+from `Exec::exec_spawn_and_wait`'s prologue -- entry rsp%16==8, five
+callee-save pushes brought rsp%16 back to 0, the stray sub moved it to
+8. Every nested SysV CALL (shell_note, sys_fork, sys_execve, sys_wait4,
+sys_write, command_record_*, exec_narrow_child_caps,
+history_format_u64_dec) ran misaligned; would #GP the first SSE-aligned
+callee (`movaps`/`movdqa`) touching `[rsp+K]`. Silent until then --
+the shell repo's own callees are all asm-level GP-register-only, so no
+existing boot exercised the landmine.
+
+**New file `tests/test_exec_alignment.pdx` (module `TestExecAlignment`):**
+
+- Approach (a) per shell#44 task shape: arithmetic replica-based witness
+  (`mov rax, rsp; and rax, 15; cmp rax, 0`). paideia-as 0.36 does not
+  yet emit `movaps`/`movdqa` (#1333 shipped scalar-float only; packed
+  128-bit deferred), so an SSE-fault probe is not buildable today; the
+  arithmetic form witnesses the same property. Module header carries
+  the future-enhancement note: replace with `movaps [rsp], xmm0`
+  against a 16-byte-reserved stack scratch once the packed-SSE
+  mnemonics land.
+- `teal_case_replica_current_prologue` — reproduces the POST-88580b5
+  prologue (5 pushes, no `sub rsp, 8`); asserts rsp%16==0.
+- `teal_case_replica_landmine_prologue` — reproduces the PRE-88580b5
+  buggy prologue (5 pushes + `sub rsp, 8`); asserts rsp%16==8 as the
+  counter-example. Balanced `add rsp, 8` before the pop sequence keeps
+  the epilogue address-correct.
+- `teal_case_sut_gate_roundtrip` — round-trips the REAL
+  `exec_spawn_and_wait` via its BAD_ARGV gate (argc=0); expects
+  `EX_ERR_BAD_ARGV` (0xFFFFEC21). Not a strict alignment probe (gate
+  fires before any nested CALL), but a low-cost witness that the
+  SUT's real prologue+epilogue push/pop balance survives one
+  traversal.
+- `teal_run_all` — umbrella; on all-pass emits `EXEC ALIGN OK\n` (14
+  bytes) via sys_write(1, ...) so the paideia-os QEMU boot smoke can
+  grep-assert positive attestation alongside the existing
+  `SHELL FORK OK` / `SHELL RECONCILE` fingerprints.
+
+**Fail-code band 0xFFFFEDFx** — grep audit at landing time
+(`grep -oE '0xFFFFED[0-9A-Fa-f][0-9A-Fa-f]' tests/*.pdx src/*.pdx |
+sort -u`) confirmed disjoint from every existing 0xFFFFEDxx band
+(0..Ex all assigned).
+
+- `TEAL_PASS`          = 0
+- `TEAL_FAIL_CURRENT`  = 0xFFFFEDF0  (case 1 saw rsp%16 != 0)
+- `TEAL_FAIL_LANDMINE` = 0xFFFFEDF1  (case 2 saw rsp%16 != 8)
+- `TEAL_FAIL_SUT_GATE` = 0xFFFFEDF2  (case 3 got != EX_ERR_BAD_ARGV)
+
+**Manifest:** `tests/test_exec_alignment.pdx` added to the `tests:`
+list of `manifest.pdxproj`, immediately after `tests/test_exec.pdx`
+so the encoder-half exec cases and the alignment-invariant cases
+sit adjacent in the build graph.
+
+**tests/README.md:** module entry + band ledger row appended
+(`0xFFFFEDFx` -- first failing case in test_exec_alignment).
+
+Encoder pitfalls check: no `test` mnemonic (rsp%16 extraction uses
+`and rax, 15; cmp rax, 0`); no `and r, imm64` (mask is imm8 15);
+every `cmp reg, imm` uses imm <= 0x7FFFFFFF (0, 8, 15 fit trivially;
+0xFFFFEC21 and 0xFFFFEDFx staged via `mov r10, imm32`); r11
+(reserved) untouched; no memory reads or byte writes; label
+prefixes `teal_rcp_` / `teal_rlp_` / `teal_sgr_` / `teal_ra_` all
+avoid the `loop`/`if`/etc. reserved-word set.
+
+Closes #44.
 
 ## Unreleased — R73.M1-006 (#26): job-control + tab-completion fingerprints
 

@@ -94,6 +94,7 @@ tests:
   - tests/test_parser.pdx          # ENH-003 (#30): parser fingerprint + parser->pipeline_plan golden feed
   - tests/test_builtins.pdx        # ENH-004 (#31): dispatch + builtin handlers fingerprint matrix
   - tests/test_exec.pdx            # ENH-005 (#32): exec-path argv marshalling + D3 audit-first ordering fingerprint
+  - tests/test_exec_alignment.pdx  # shell#44 retroactive: exec_spawn_and_wait rsp%16==0 alignment regression witness (band 0xFFFFEDFx)
   - tests/test_shell_main.pdx      # ENH-006 (#33): shell_main entry + shell_repl_step + shell_argv_dispatch fingerprint
   - tests/test_line_reader.pdx     # ENH-007 (#34): line_reader_read_line + lr_read_one_byte input-gate fingerprint
   - tests/test_history.pdx         # ENH-008 (#35): history persist path format + flush skip paths fingerprint
