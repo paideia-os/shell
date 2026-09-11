@@ -7,6 +7,9 @@ Changelog conventions; the project follows Semantic Versioning per
 ## Unreleased
 
 - `bi_cd` gains bash-style `cd -` OLDPWD support (shell#14): pre-chdir cwd snapshot into `_bi_oldpwd_buf`, `cd -` swaps + echoes the new cwd, unset-OLDPWD path emits `SHELL CD ERR no oldpwd` fingerprint and returns new sentinel `BI_ERR_CD_NO_OLDPWD` (0xFFFFECE8); `tbi_case_cd_dash_no_oldpwd` locks the reject shape.
+## Unreleased — test SCOPE header drift (incidental)
+
+- `tests/test_shell_main.pdx` SCOPE header: "Ten cases" → "Eleven cases" (11 `tshm_case_*` defs; `tshm_run_all` justification + 0xFFFFED8x table already at 11 since #45 landed `tshm_case_repl_pipe_stages`). SH_ST_STAGES (slot 11) constant + `shell_repl_step` loop over `[0, _pr_stage_count)` unchanged; the `bumps by N for an N-stage line` invariant matches the code. Doc-only, no issue reference (survey handle #26 was mismatched — actual issue #26 tracks R73 job-control fingerprints and is not resolved by this edit).
 
 ## Unreleased — R73.M1-006 (#26): job-control + tab-completion fingerprints
 

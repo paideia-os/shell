@@ -7,7 +7,7 @@
 // SCOPE
 // =============================================================================
 //
-// Ten cases cover the pure-function surface of ENH-006:
+// Eleven cases cover the pure-function surface of ENH-006:
 //
 //   tshm_case_strlen           sm_strlen("hello") == 5; sm_strlen("") == 0
 //   tshm_case_streq            sm_streq_lit("hello","hello")==0;
