@@ -146,6 +146,11 @@ module Builtins = structure {
   pub let BI_ERR_PWD_TOO_LONG       : u64 = 0xFFFFECE7
   // shell#14: `cd -` invoked before any successful cd (OLDPWD unset).
   pub let BI_ERR_CD_NO_OLDPWD       : u64 = 0xFFFFECE8
+  // shell#23 / #24 job-control builtin returns.
+  pub let BI_ERR_JOB_BAD_JID        : u64 = 0xFFFFECE9   // bi_bg/bi_fg: argv[1] not a positive decimal in [1, 16]
+  pub let BI_ERR_JOB_NO_SUCH        : u64 = 0xFFFFECEA   // bi_bg/bi_fg: jid inactive (jb_pid_of_jid returned 0)
+  pub let BI_ERR_JOB_KILL_FAIL      : u64 = 0xFFFFECEB   // bi_bg/bi_fg: sys_kill returned negative errno
+  pub let BI_ERR_JOB_WAIT_FAIL      : u64 = 0xFFFFECEC   // bi_fg: sys_wait4 returned negative errno
 
   // ==========================================================================
   // Storage (.bss)
@@ -930,6 +935,492 @@ module Builtins = structure {
       bi_pw_fail:
         mov rax, 0xFFFFECE7;                 // BI_ERR_PWD_TOO_LONG
         add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // Job-control rodata + bi_jobs / bi_bg / bi_fg (shell#22 / #23 / #24)
+  //
+  // The bg/fg/jobs triplet share one small rodata pool:
+  //   bi_jb_hdr_bg      "[job "         6 bytes (bracket+jid header)
+  //   bi_jb_hdr_state_r "] Running  "  11 bytes (BG row label)
+  //   bi_jb_hdr_state_s "] Stopped  "  11 bytes (STOPPED row label)
+  //   bi_jb_hdr_state_w "] Waited   "  11 bytes (WAITED row label)
+  //   bi_jb_pid_sep     " pid "         5 bytes (pid separator)
+  //   bi_jb_none_msg    "no jobs\n"     8 bytes (empty-jobs message)
+  //
+  // A `jobs` invocation emits per row `[job <jid>] <label> pid <pid>\n`
+  // in one composed sys_write to fd 1 so a concurrent stderr writer
+  // cannot tear the output. The scratch is _bi_jb_out_buf (256 bytes)
+  // per row; the whole walk emits one sys_write per active row.
+  // ==========================================================================
+  pub let bi_jb_hdr_bg      : [u8; 6]  = "[job \0"
+  pub let bi_jb_hdr_state_r : [u8; 12] = "] Running  \0"
+  pub let bi_jb_hdr_state_s : [u8; 12] = "] Stopped  \0"
+  pub let bi_jb_hdr_state_w : [u8; 12] = "] Waited   \0"
+  pub let bi_jb_pid_sep     : [u8; 6]  = " pid \0"
+  pub let bi_jb_none_msg    : [u8; 9]  = "no jobs\n\0"
+  pub let bi_jb_hdr_bg_len      : u64 = 5
+  pub let bi_jb_hdr_state_len   : u64 = 11
+  pub let bi_jb_pid_sep_len     : u64 = 5
+  pub let bi_jb_none_msg_len    : u64 = 8
+
+  // Per-row scratch buffer for the jobs walker. 128 bytes is ample:
+  // 5 + 20 (jid decimal cap) + 11 + 5 + 20 (pid decimal cap) + 1 = 62
+  // bytes worst case; the round-up leaves room for a future field.
+  pub let mut _bi_jb_out_buf : [u8; 128] = uninit @align(16)
+
+  // ==========================================================================
+  // bi_jobs(argv_ptr, argc) -> u64
+  //
+  // Signature: bi_jobs : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  //
+  // Walks _jb_jobs_table[0..JB_TABLE_MAX). For each row with jid != 0,
+  // composes `[job <jid>] <state> pid <pid>\n` in _bi_jb_out_buf and
+  // sys_writes to fd 1. Emits `no jobs\n` if the table is empty
+  // (no row with jid != 0). Returns BI_OK.
+  //
+  // argv_ptr / argc are unused (jobs takes no args; kept for uniform
+  // dispatch signature).
+  //
+  // Prologue: 4 callee-save pushes (rbx slot, r12 row_base, r13
+  // cursor, r14 any-active flag) + `sub rsp, 8` = 40 bytes;
+  // entry rsp%16==8 + 40 = 48; 48 mod 16 == 0 at every nested SysV
+  // call (history_format_u64_dec, sys_write). Labels prefixed bi_jb_.
+  // ==========================================================================
+  pub let bi_jobs : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell#24 (R73.M1-004): jobs builtin. Walks _jb_jobs_table[0..JB_TABLE_MAX) reading each row's u64 jid at [+0]; if jid != 0 the row is active. For each active row composes `[job <jid>] <label> pid <pid>\\n` in _bi_jb_out_buf where <label> is one of `Running  ` (JB_STATE_BG=1), `Stopped  ` (JB_STATE_STOPPED=2), `Waited   ` (JB_STATE_WAITED=3, padded to 11 bytes for column alignment). Decimal render via History::history_format_u64_dec (already cross-called from Jobs::shell_fp_job_ok and Shell::history_ring_witness). One sys_write per row so a concurrent stderr writer (post-fork child or job-control fingerprint) cannot tear the output. If the walk finds no active row, emits `no jobs\\n` from bi_jb_none_msg. Returns BI_OK regardless (empty table is not an error). argv_ptr / argc parameters unused (jobs takes no args). Byte writes via mov_b [dst + cursor*1], src per U1606; byte reads via xor+mov_b per #1248. Row byte offset i*24 via shl 3 + lea [rax+rax*2] (no 2-op imul r,imm). Prologue: 4 callee-save pushes (rbx slot idx, r12 row_base, r13 cursor, r14 any-active flag) + sub rsp,8 = 40 bytes; entry rsp%16==8 + 40 = 48 (mod 16 = 0) at every nested SysV call (history_format_u64_dec, sys_write). Labels prefixed bi_jb_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        sub rsp, 8;
+
+        xor rbx, rbx;                        // slot = 0
+        xor r14, r14;                        // r14 = any-active flag
+
+      bi_jb_walk:
+        cmp rbx, 16;                         // JB_TABLE_MAX
+        jae bi_jb_walk_done;
+
+        // r12 = row_base = _jb_jobs_table + rbx * 24
+        mov rax, rbx;
+        shl rax, 3;
+        lea rax, [rax + rax * 2];
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;
+        mov r12, rax;
+
+        // Read jid; skip if 0 (free row).
+        mov rax, [r12];
+        cmp rax, 0;
+        je  bi_jb_next;
+
+        // Row is active. Compose per row into _bi_jb_out_buf.
+        mov r14, 1;                          // remember: at least one active
+        xor r13, r13;                        // cursor = 0
+
+        // (1) Copy bi_jb_hdr_bg (5 bytes: "[job ").
+        xor rcx, rcx;
+      bi_jb_hdr_head:
+        cmp rcx, 5;
+        jae bi_jb_hdr_done;
+        lea r11, [rip + bi_jb_hdr_bg];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        lea r11, [rip + _bi_jb_out_buf];
+        mov_b [r11 + r13 * 1], rax;
+        add r13, 1;
+        add rcx, 1;
+        jmp bi_jb_hdr_head;
+      bi_jb_hdr_done:
+
+        // (2) Render jid decimal at cursor.
+        mov rax, [r12];                      // jid
+        mov rdi, rax;
+        lea r11, [rip + _bi_jb_out_buf];
+        lea rsi, [r11 + r13 * 1];
+        call history_format_u64_dec;
+        add r13, rax;                        // cursor += digits
+
+        // (3) Copy state label. Select bi_jb_hdr_state_[rsw] by
+        //     row's state field low 32 (mask via `and rax, 0xFF` is
+        //     safe: JB_STATE_* values fit in 1 byte).
+        mov rax, [r12 + 16];
+        and rax, 0xFF;                       // state
+        cmp rax, 2;                          // JB_STATE_STOPPED
+        je  bi_jb_pick_stopped;
+        cmp rax, 3;                          // JB_STATE_WAITED
+        je  bi_jb_pick_waited;
+        // default: running (BG or unknown falls into Running)
+        lea r10, [rip + bi_jb_hdr_state_r];
+        jmp bi_jb_pick_done;
+      bi_jb_pick_stopped:
+        lea r10, [rip + bi_jb_hdr_state_s];
+        jmp bi_jb_pick_done;
+      bi_jb_pick_waited:
+        lea r10, [rip + bi_jb_hdr_state_w];
+      bi_jb_pick_done:
+        // Copy 11 bytes from r10 to buf[cursor].
+        xor rcx, rcx;
+      bi_jb_lbl_head:
+        cmp rcx, 11;
+        jae bi_jb_lbl_done;
+        xor rax, rax;
+        mov_b rax, [r10 + rcx * 1];
+        lea r11, [rip + _bi_jb_out_buf];
+        mov_b [r11 + r13 * 1], rax;
+        add r13, 1;
+        add rcx, 1;
+        jmp bi_jb_lbl_head;
+      bi_jb_lbl_done:
+
+        // (4) Copy " pid " (5 bytes).
+        xor rcx, rcx;
+      bi_jb_sep_head:
+        cmp rcx, 5;
+        jae bi_jb_sep_done;
+        lea r11, [rip + bi_jb_pid_sep];
+        xor rax, rax;
+        mov_b rax, [r11 + rcx * 1];
+        lea r11, [rip + _bi_jb_out_buf];
+        mov_b [r11 + r13 * 1], rax;
+        add r13, 1;
+        add rcx, 1;
+        jmp bi_jb_sep_head;
+      bi_jb_sep_done:
+
+        // (5) Render pid decimal.
+        mov rax, [r12 + 8];                  // pid
+        mov rdi, rax;
+        lea r11, [rip + _bi_jb_out_buf];
+        lea rsi, [r11 + r13 * 1];
+        call history_format_u64_dec;
+        add r13, rax;
+
+        // (6) Append '\n'.
+        mov rax, 0x0A;
+        lea r11, [rip + _bi_jb_out_buf];
+        mov_b [r11 + r13 * 1], rax;
+        add r13, 1;
+
+        // (7) sys_write(1, buf, cursor).
+        mov rdi, 1;
+        lea rsi, [rip + _bi_jb_out_buf];
+        mov rdx, r13;
+        call sys_write;
+
+      bi_jb_next:
+        add rbx, 1;
+        jmp bi_jb_walk;
+
+      bi_jb_walk_done:
+        // Empty-table message.
+        cmp r14, 0;
+        jne bi_jb_ok;
+        mov rdi, 1;
+        lea rsi, [rip + bi_jb_none_msg];
+        mov rdx, 8;
+        call sys_write;
+
+      bi_jb_ok:
+        xor rax, rax;                        // BI_OK
+        add rsp, 8;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bi_jb_parse_jid(argv_ptr, argc) -> u64
+  //
+  // Helper: parse argv[1] as a positive decimal jid in [1, JB_TABLE_MAX].
+  // Returns the jid on success; 0 on any failure (argc<2, first byte not
+  // a digit, parsed value 0 or > 16). Distinct callers (bi_bg / bi_fg)
+  // map the 0 sentinel to BI_ERR_JOB_BAD_JID via their own error path.
+  //
+  // Prologue: `sub rsp, 8` alone (leaf; no callee-saves needed since
+  // all state lives in caller-save r10/rax/rcx).
+  //
+  // Labels prefixed bi_pj_.
+  // ==========================================================================
+  pub let bi_jb_parse_jid : (u64, u64) -> u64 !{mem} @{} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell#23: parse argv[1] as positive decimal jid in [1, JB_TABLE_MAX=16]. Returns 0 on any failure (argc<2, first byte not '0'..'9', value 0 or > 16). Walks past argv[0]'s trailing NUL to land on argv[1] (idiom shared with bi_cd / bi_exit / bi_export). Parse loop stages `acc*10 + digit` via shl+add+add to avoid 2-op imul r,imm (feedback_pdx_encoder_pitfalls). Leaf function; `sub rsp, 8` alone keeps rsp%16==0 for a hypothetical future nested call (none today). Encoder-conservative: cmp/mov/xor/shl/add/sub/mov_b/lea/ret only. Labels prefixed bi_pj_.",
+      block: {
+        sub rsp, 8;
+
+        cmp rsi, 2;
+        jb  bi_pj_none;
+
+        // Walk past argv[0] NUL.
+        mov r10, rdi;
+      bi_pj_scan_a0:
+        xor rax, rax;
+        mov_b rax, [r10];
+        cmp rax, 0;
+        je  bi_pj_after_a0;
+        add r10, 1;
+        jmp bi_pj_scan_a0;
+      bi_pj_after_a0:
+        add r10, 1;                          // r10 = argv[1]
+
+        // First byte must be a digit.
+        xor rcx, rcx;
+        mov_b rcx, [r10];
+        cmp rcx, 0x30;
+        jb  bi_pj_none;
+        cmp rcx, 0x39;
+        ja  bi_pj_none;
+
+        // Parse.
+        xor rax, rax;
+      bi_pj_parse:
+        xor rcx, rcx;
+        mov_b rcx, [r10];
+        cmp rcx, 0x30;
+        jb  bi_pj_parse_done;
+        cmp rcx, 0x39;
+        ja  bi_pj_parse_done;
+        mov r8, rax;
+        shl r8, 3;                           // acc * 8
+        add r8, rax;                         // acc * 9
+        add r8, rax;                         // acc * 10
+        sub rcx, 0x30;
+        add r8, rcx;
+        mov rax, r8;
+        add r10, 1;
+        jmp bi_pj_parse;
+      bi_pj_parse_done:
+        // rax = parsed value. Range-check [1, 16].
+        cmp rax, 0;
+        je  bi_pj_none;
+        cmp rax, 16;                         // JB_TABLE_MAX
+        ja  bi_pj_none;
+        add rsp, 8;
+        ret;
+
+      bi_pj_none:
+        xor rax, rax;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bi_bg(argv_ptr, argc) -> u64
+  //
+  // Signature: bi_bg : (u64, u64) -> u64 !{mem, sysreg} @{sched}
+  //
+  // Continues a stopped job in the background. Requires argv[1] to be
+  // a positive decimal jid in [1, JB_TABLE_MAX]. Sends SIGCONT (18)
+  // to the mapped pid via sys_kill; on success updates the row's
+  // state to JB_STATE_BG. Does NOT wait for the child; control
+  // returns immediately.
+  //
+  // Errors: BI_ERR_JOB_BAD_JID / BI_ERR_JOB_NO_SUCH / BI_ERR_JOB_KILL_FAIL.
+  //
+  // Prologue: 2 callee-save pushes (rbx pid, r12 jid) + `sub rsp, 8`
+  // = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 at nested SysV.
+  // Labels prefixed bi_bg_.
+  // ==========================================================================
+  pub let bi_bg : (u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "shell#23 (R73.M1-003): bg builtin. Parses argv[1] as jid via bi_jb_parse_jid (0 return -> BI_ERR_JOB_BAD_JID). Maps jid -> pid via jb_pid_of_jid (0 return -> BI_ERR_JOB_NO_SUCH). Calls sys_kill(pid, SIGCONT=18) -- kernel sys_kill body accepts SIGCONT (18) unconditionally on any pid whose task state is STOPPED (5), no-op otherwise; negative return signed <0 -> BI_ERR_JOB_KILL_FAIL. On success rewrites the row's state field to JB_STATE_BG (fused state qword: low 32 = 1). Does NOT sys_wait4 (bg is asynchronous by definition). Prologue: 2 callee-save pushes (rbx pid, r12 jid) + sub rsp,8 = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 at nested SysV (bi_jb_parse_jid, jb_pid_of_jid, sys_kill). Effect/cap set matches sys_kill: {mem, sysreg} @{sched}. Labels prefixed bi_bg_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        call bi_jb_parse_jid;                // rax = jid or 0
+        cmp rax, 0;
+        je  bi_bg_bad_jid;
+        mov r12, rax;                        // jid
+
+        mov rdi, r12;
+        call jb_pid_of_jid;                  // rax = pid or 0
+        cmp rax, 0;
+        je  bi_bg_no_such;
+        mov rbx, rax;                        // pid
+
+        mov rdi, rbx;                        // pid
+        mov rsi, 18;                         // SIGCONT
+        call sys_kill;                       // rax = 0 or -errno
+        cmp rax, 0;
+        jl  bi_bg_kill_fail;
+
+        // Row state <- JB_STATE_BG (1). row_base = _jb_jobs_table +
+        // (jid-1)*24; row[+16] = 1 (low 32) | 0 (high 32).
+        mov rax, r12;
+        sub rax, 1;
+        shl rax, 3;
+        lea rax, [rax + rax * 2];
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;
+        mov rcx, 1;                          // JB_STATE_BG
+        mov [rax + 16], rcx;
+
+        xor rax, rax;                        // BI_OK
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_bg_bad_jid:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECE9;                 // BI_ERR_JOB_BAD_JID
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_bg_no_such:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECEA;                 // BI_ERR_JOB_NO_SUCH
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_bg_kill_fail:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECEB;                 // BI_ERR_JOB_KILL_FAIL
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // bi_fg(argv_ptr, argc) -> u64
+  //
+  // Signature: bi_fg : (u64, u64) -> u64 !{mem, sysreg} @{sched, fs}
+  //
+  // Reattaches a stopped or backgrounded job to the foreground. Sends
+  // SIGCONT to unpause the child, then sys_wait4 blocks until the
+  // child exits (or is re-stopped). On successful wait4 return the
+  // row is closed via jb_close_job (state <- WAITED, jid freed).
+  //
+  // Errors: BI_ERR_JOB_BAD_JID / BI_ERR_JOB_NO_SUCH / BI_ERR_JOB_KILL_FAIL
+  // / BI_ERR_JOB_WAIT_FAIL.
+  //
+  // Prologue: 3 callee-save pushes (rbx pid, r12 jid, r13 exit)
+  // + `sub rsp, 16` (8 for _bf_wstatus, 8 for alignment) = 40 bytes;
+  // entry rsp%16==8 + 40 = rsp%16==0 at nested SysV.
+  //
+  // _bf_wstatus lives on the stack (per-invocation) because bi_fg
+  // is single-caller-single-invocation but a future re-entrant path
+  // (a signal handler that also runs bi_fg) would need per-call
+  // storage. Labels prefixed bi_fg_.
+  // ==========================================================================
+  pub let bi_fg : (u64, u64) -> u64 !{mem, sysreg} @{sched, fs} =
+    fn (argv_ptr: u64) (argc: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched, fs},
+      justification: "shell#23 (R73.M1-003): fg builtin. Same jid parse + pid map as bi_bg, then sys_kill(pid, SIGCONT=18) to unpause + sys_wait4(pid, &wstatus, 0, 0) to block until the child exits. wait4 negative -> BI_ERR_JOB_WAIT_FAIL. On success closes the row via jb_close_job(pid, wstatus & 0xFF) which stamps state=WAITED, exit_status=low8, frees the row (jid=0), and emits the row-complete fingerprint. Returns the exit_code (low 8 of wstatus) so the REPL can surface it; distinct from BI_OK because a foreground return is a real exit code, not a builtin success/fail. Prologue: 3 callee-save pushes (rbx pid, r12 jid, r13 exit code) + sub rsp,16 = 40 bytes; entry rsp%16==8 + 40 = rsp%16==0. wstatus lives at [rsp+0]; [rsp+8] is alignment pad. Effect/cap set widens over bi_bg to include @{fs} because sys_wait4's effect body reads the child's task struct (kernel-side @{fs} on the wait handler). Labels prefixed bi_fg_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        sub rsp, 16;
+
+        call bi_jb_parse_jid;
+        cmp rax, 0;
+        je  bi_fg_bad_jid;
+        mov r12, rax;                        // jid
+
+        mov rdi, r12;
+        call jb_pid_of_jid;
+        cmp rax, 0;
+        je  bi_fg_no_such;
+        mov rbx, rax;                        // pid
+
+        mov rdi, rbx;
+        mov rsi, 18;                         // SIGCONT
+        call sys_kill;
+        cmp rax, 0;
+        jl  bi_fg_kill_fail;
+
+        // sys_wait4(pid=rbx, &wstatus=rsp, options=0, rusage=0).
+        // wstatus zero-init first so a wait4 that fails to write
+        // does not surface stale bytes.
+        xor rax, rax;
+        mov [rsp], rax;
+        mov rdi, rbx;
+        mov rsi, rsp;
+        mov rdx, 0;
+        mov rcx, 0;
+        call sys_wait4;
+        cmp rax, 0;
+        jl  bi_fg_wait_fail;
+
+        // exit_code = wstatus & 0xFF.
+        mov rax, [rsp];
+        and rax, 0xFF;
+        mov r13, rax;
+
+        // Close the row.
+        mov rdi, rbx;                        // pid
+        mov rsi, r13;                        // exit_status
+        call jb_close_job;                   // rax = 0 or JB_ERR_NO_ROW (harmless)
+
+        mov rax, r13;                        // return exit_code
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_fg_bad_jid:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECE9;                 // BI_ERR_JOB_BAD_JID
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_fg_no_such:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECEA;                 // BI_ERR_JOB_NO_SUCH
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_fg_kill_fail:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECEB;                 // BI_ERR_JOB_KILL_FAIL
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      bi_fg_wait_fail:
+        mov rdi, 4;
+        call shell_note;
+        mov rax, 0xFFFFECEC;                 // BI_ERR_JOB_WAIT_FAIL
+        add rsp, 16;
+        pop r13;
+        pop r12;
+        pop rbx;
         ret
       }
     }

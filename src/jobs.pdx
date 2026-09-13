@@ -125,6 +125,26 @@ module Jobs = structure {
   pub let JB_ROW_OFF_STATE       : u64 = 16
   pub let JB_ROW_OFF_EXIT_STATUS : u64 = 20
 
+  // ==========================================================================
+  // Return-code band 0xFFFFECFx (Jobs module: row access helpers)
+  //
+  // Distinct from the JB_STATE_* constants above (which live in the
+  // low 32 bits of the fused state qword). The 0xFFFFECFx band is for
+  // helper returns that the caller may want to distinguish from a
+  // successful (0) or state-valued (small positive) return.
+  //
+  //   JB_OK               = 0             success sentinel
+  //   JB_ERR_TABLE_FULL   = 0xFFFFECFA    jb_add_job: no free row
+  //   JB_ERR_BAD_PID      = 0xFFFFECFB    jb_add_job: pid == 0
+  //   JB_ERR_NO_ROW       = 0xFFFFECFC    jb_close_job: no row matched pid
+  //   JB_ERR_NO_JOB       = 0xFFFFECFD    bi_bg / bi_fg: jid not active
+  // ==========================================================================
+  pub let JB_OK              : u64 = 0
+  pub let JB_ERR_TABLE_FULL  : u64 = 0xFFFFECFA
+  pub let JB_ERR_BAD_PID     : u64 = 0xFFFFECFB
+  pub let JB_ERR_NO_ROW      : u64 = 0xFFFFECFC
+  pub let JB_ERR_NO_JOB      : u64 = 0xFFFFECFD
+
   // State vocabulary (placeholders; pinned when #22 lands signal path).
   //
   //   JB_STATE_FREE     row is unused (jid==0 also implies free)
@@ -336,6 +356,274 @@ module Jobs = structure {
         pop r13;
         pop r12;
         pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // JB_TABLE ROW ACCESS HELPERS (shell#22 / #23 / #24 partial)
+  //
+  // The row-add / row-complete / row-walk primitives are the writers +
+  // reader that the bg/fg/jobs builtins and exec_spawn_and_wait's
+  // parent-branch hook consume. Row byte offset for slot i is i*24
+  // (JB_ROW_SIZE); computed via `mov rax, i; shl rax, 3; lea rax,
+  // [rax + rax * 2]` = i*24 without a 2-op `imul r,imm` pitfall
+  // (feedback_pdx_encoder_pitfalls).
+  //
+  // Rows are u64-aligned via _jb_jobs_table's [u64; 48] declaration;
+  // JB_ROW_OFF_JID/PID land on u64 slots (offsets 0/8), while the
+  // fused state|exit_status pair at offset 16 also lands on a u64 slot
+  // (state in low 32, exit_status in high 32).
+  //
+  // Job identifiers (jid) run 1..JB_TABLE_MAX. jid==0 means "unused"
+  // per the header. Add allocates the lowest free slot; close finds
+  // the row by pid; walk visits rows in slot order and emits one text
+  // line per active row via a caller-supplied sys_write to fd 1.
+  //
+  // Alignment: every helper uses 4-push+sub prologues that keep
+  // rsp % 16 == 0 for the nested SysV / shell_note calls, per the
+  // paideia-as conformance ledger already established by
+  // shell_fp_job_ok above.
+  // ==========================================================================
+
+  // ==========================================================================
+  // jb_add_job(pid) -> u64
+  //
+  // Signature: jb_add_job : (u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI (input): pid  -- child pid (>= 1)
+  // RAX (output): allocated jid in 1..JB_TABLE_MAX on success, else
+  //               JB_ERR_TABLE_FULL (0xFFFFECFA) if every slot is
+  //               occupied, or JB_ERR_BAD_PID (0xFFFFECFB) if pid==0.
+  //
+  // Walks _jb_jobs_table[0..JB_TABLE_MAX) looking for the first row
+  // whose jid==0 (JB_STATE_FREE). Populates row with (jid=slot+1,
+  // pid, state=JB_STATE_BG, exit_status=0). Bumps SH_ST_JOBS (slot 14).
+  //
+  // Emits the fingerprint via shell_fp_job_ok after the row-write
+  // completes; caller-side counter bump is SH_ST_JOBS (slot 14) so a
+  // state-only transition using shell_fp_job_ok directly can bump
+  // SH_ST_JOBS_COMPLETED (slot 15) instead.
+  //
+  // Register plan (2 pushes + sub rsp,8 = 24 bytes; entry rsp%16==8
+  // + 24 = 32; 32 mod 16 == 0 for every nested SysV call):
+  //   rbx = pid cache (callee-save across shell_note + shell_fp_job_ok)
+  //   r12 = slot index / allocated jid (callee-save across shell_note)
+  //   r11 = .bss LEA scratch
+  //   rax, rcx, r10 = short-scratch
+  //
+  // Labels prefixed jb_aj_.
+  // ==========================================================================
+  pub let jb_add_job : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell#22 / #23 (partial): allocate the lowest free row in _jb_jobs_table and populate it with (jid, pid, state=JB_STATE_BG, exit_status=0). Return jid in 1..JB_TABLE_MAX or JB_ERR_TABLE_FULL / JB_ERR_BAD_PID. Row byte offset i*24 via shl 3 + lea [rax+rax*2] (no 2-op imul r,imm per feedback_pdx_encoder_pitfalls). Row layout: [+0]=jid u64, [+8]=pid u64, [+16]=state u64 (low 32 = state; high 32 = exit_status left zero at add-time). Bumps SH_ST_JOBS (slot 14) unconditionally on entry. Emits shell_fp_job_ok(jid, pid, JB_STATE_BG) on the success arm; the reject arms (bad pid, table full) bump SH_ST_ERRORS instead and skip the fingerprint. Prologue: 2 callee-save pushes (rbx pid, r12 slot) + sub rsp,8 = 24 bytes; entry rsp%16==8 + 24 = 32; 32 mod 16 == 0 at every nested SysV call (shell_note, shell_fp_job_ok). Labels prefixed jb_aj_.",
+      block: {
+        push rbx;
+        push r12;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // pid cache
+
+        mov rdi, 14;                         // SH_ST_JOBS
+        call shell_note;
+
+        cmp rbx, 0;
+        je  jb_aj_bad_pid;
+
+        xor r12, r12;                        // slot index = 0
+      jb_aj_scan:
+        cmp r12, 16;                         // JB_TABLE_MAX
+        jae jb_aj_table_full;
+        // rax = row_base = &_jb_jobs_table + r12 * 24
+        mov rax, r12;
+        shl rax, 3;                          // rax = r12 * 8
+        lea rax, [rax + rax * 2];            // rax = r12 * 24
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;                        // rax = row_base
+        mov rcx, [rax];                      // rcx = jid (0 == free)
+        cmp rcx, 0;
+        je  jb_aj_found;
+        add r12, 1;
+        jmp jb_aj_scan;
+
+      jb_aj_found:
+        // rax = row_base (still). Write jid, pid, state.
+        mov rcx, r12;
+        add rcx, 1;                          // jid = slot + 1
+        mov [rax], rcx;                      // row[+0] = jid
+        mov [rax + 8], rbx;                  // row[+8] = pid
+        mov rcx, 1;                          // JB_STATE_BG (exit_status = 0)
+        mov [rax + 16], rcx;                 // row[+16] = state fused
+
+        // Emit fingerprint. Order: (jid, pid, state).
+        mov rdi, r12;
+        add rdi, 1;                          // jid
+        mov rsi, rbx;                        // pid
+        mov rdx, 1;                          // JB_STATE_BG
+        call shell_fp_job_ok;
+
+        mov rax, r12;
+        add rax, 1;                          // return jid
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jb_aj_bad_pid:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECFB;                 // JB_ERR_BAD_PID
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jb_aj_table_full:
+        mov rdi, 4;                          // SH_ST_ERRORS
+        call shell_note;
+        mov rax, 0xFFFFECFA;                 // JB_ERR_TABLE_FULL
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jb_close_job(pid, exit_status) -> u64
+  //
+  // Signature: jb_close_job : (u64, u64) -> u64 !{mem, sysreg} @{fs}
+  // RDI (input): pid          -- child pid returned by sys_wait4
+  // RSI (input): exit_status  -- low 8 bits of wait4's wstatus
+  // RAX (output): JB_OK (0) on hit, JB_ERR_NO_ROW (0xFFFFECFC) if
+  //               no row matches the pid (silent-close is fine; caller
+  //               ignores the return).
+  //
+  // Walks _jb_jobs_table looking for the first row whose pid matches.
+  // On hit, sets state=JB_STATE_WAITED, stores exit_status in the
+  // high 32 bits of the fused qword2 slot, bumps SH_ST_JOBS_COMPLETED
+  // (slot 15), and emits shell_fp_job_ok(jid, pid, JB_STATE_WAITED).
+  //
+  // Row IS freed (jid=0) so a later jb_add_job re-uses the slot.
+  //
+  // Labels prefixed jb_cj_.
+  // ==========================================================================
+  pub let jb_close_job : (u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (pid: u64) (exit_status: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell#22 / #23 (partial): find the row matching pid in _jb_jobs_table, mark it WAITED (state=3), store exit_status in the high 32 bits of the fused state slot, bump SH_ST_JOBS_COMPLETED (slot 15), emit shell_fp_job_ok(jid, pid, JB_STATE_WAITED) as the row-complete witness, and free the slot (jid=0) so jb_add_job can reuse it. No-op (JB_ERR_NO_ROW, distinct from success 0) if no row's pid matches; caller (exec_spawn_and_wait's parent branch) ignores the return since a wait4 return on a pid we never registered as a job is a synchronous foreground-only exec (the current v0.1 shell path -- every exec today goes through the same fork+wait4 whether the job table is populated or not, so a no-row close is expected on the foreground path until jb_add_job is wired in at exec_spawn_and_wait too). Row byte offset i*24 via shl 3 + lea [rax+rax*2]. Fused state store: `mov rcx, exit_status; shl rcx, 32; or rcx, JB_STATE_WAITED (3)`; the OR imm is 3 which fits imm32 trivially. Prologue: 3 callee-save pushes (rbx pid, r12 slot, r13 exit_status) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0. Labels prefixed jb_cj_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // pid
+        mov r13, rsi;                        // exit_status
+
+        xor r12, r12;                        // slot = 0
+      jb_cj_scan:
+        cmp r12, 16;                         // JB_TABLE_MAX
+        jae jb_cj_no_row;
+        mov rax, r12;
+        shl rax, 3;                          // rax = r12 * 8
+        lea rax, [rax + rax * 2];            // rax = r12 * 24
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;                        // rax = row_base
+        mov rcx, [rax];                      // jid
+        cmp rcx, 0;
+        je  jb_cj_next;                      // free row, skip
+        mov rcx, [rax + 8];                  // row pid
+        cmp rcx, rbx;
+        je  jb_cj_found;
+      jb_cj_next:
+        add r12, 1;
+        jmp jb_cj_scan;
+
+      jb_cj_found:
+        // Store fused state | (exit_status << 32) at [rax + 16].
+        mov rcx, r13;
+        shl rcx, 32;
+        or  rcx, 3;                          // JB_STATE_WAITED
+        mov [rax + 16], rcx;
+
+        // Bump SH_ST_JOBS_COMPLETED.
+        mov rdi, 15;                         // SH_ST_JOBS_COMPLETED
+        call shell_note;
+
+        // Fingerprint: (jid, pid, JB_STATE_WAITED).
+        mov rdi, r12;
+        add rdi, 1;                          // jid = slot + 1
+        mov rsi, rbx;                        // pid
+        mov rdx, 3;                          // JB_STATE_WAITED
+        call shell_fp_job_ok;
+
+        // Free the row (jid=0). Recompute row_base from r12 since the
+        // shell_note + shell_fp_job_ok calls above are cross-module and
+        // do not preserve rax; r12 is callee-save and still holds slot.
+        mov rax, r12;
+        shl rax, 3;
+        lea rax, [rax + rax * 2];
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;
+        xor rcx, rcx;
+        mov [rax], rcx;                      // jid = 0
+
+        xor rax, rax;                        // JB_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jb_cj_no_row:
+        mov rax, 0xFFFFECFC;                 // JB_ERR_NO_ROW
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jb_pid_of_jid(jid) -> u64
+  //
+  // Signature: jb_pid_of_jid : (u64) -> u64 !{mem} @{}
+  // RDI (input): jid  -- job identifier (1..JB_TABLE_MAX)
+  // RAX (output): pid on success, or 0 if the jid is not active
+  //               (jid==0 requested, jid out of range, or the slot
+  //               at index jid-1 has jid==0 meaning free).
+  //
+  // Direct O(1) lookup: row = _jb_jobs_table + (jid-1)*24. Confirms
+  // the row's jid field equals the requested jid (row could be free
+  // or reassigned) before returning pid.
+  //
+  // Consumers: bi_bg / bi_fg (map builtin argv[1] jid -> pid before
+  // sys_kill / sys_wait4).
+  //
+  // Leaf function; no push/pop parity. Labels prefixed jb_pj_.
+  // ==========================================================================
+  pub let jb_pid_of_jid : (u64) -> u64 !{mem} @{} =
+    fn (jid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell#23: O(1) jid->pid resolver. Row byte offset (jid-1)*24 via shl 3 + lea [rax+rax*2]. Returns 0 for jid==0 (unused sentinel), jid > JB_TABLE_MAX (out of range), or a free row (jid field == 0). Leaf function; r11 as .bss LEA scratch. Encoder-conservative: cmp/mov/lea/shl/xor/ret only. Labels prefixed jb_pj_.",
+      block: {
+        cmp rdi, 0;
+        je  jb_pj_none;
+        cmp rdi, 16;                         // JB_TABLE_MAX
+        ja  jb_pj_none;
+        // slot = jid - 1
+        mov rax, rdi;
+        sub rax, 1;
+        shl rax, 3;                          // slot * 8
+        lea rax, [rax + rax * 2];            // slot * 24
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;                        // row_base
+        mov rcx, [rax];                      // stored jid
+        cmp rcx, rdi;
+        jne jb_pj_none;
+        mov rax, [rax + 8];                  // pid
+        ret;
+      jb_pj_none:
+        xor rax, rax;
         ret
       }
     }

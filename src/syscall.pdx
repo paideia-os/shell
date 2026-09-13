@@ -176,6 +176,7 @@ module Syscall = structure {
   pub let SYS_GETDENTS: u64 = 78
   pub let SYS_CHDIR   : u64 = 85
   pub let SYS_GETCWD  : u64 = 86
+  pub let SYS_KILL    : u64 = 95   // R73.M1-001 (paideia-os #1938): SIGSTOP/SIGCONT
 
   // ==========================================================================
   // sys_read(fd, buf, count) -> u64
@@ -514,6 +515,46 @@ module Syscall = structure {
       justification: "shell.ENH-001 (#28): SC+ ID 86 wrapper. SysV rdi/rsi pass through (arity 2). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_getcwd.pdx (landed R86.M1-003 paideia-os #1960). Effect and capability set match syscall_shim.pdx sys_getcwd: {mem, sysreg} + @{fs}; the mem effect covers the kernel writing at most `cap` bytes into the caller's buf ending in NUL. Two shell consumers at v2.0: builtin `pwd` (ENH-004) and the prompt render's cwd component (ENH-006 -- the shell prompt at v2.0 renders `<cwd> $ ` per README, so the run loop calls sys_getcwd once per prompt). Leaf function.",
       block: {
         mov rax, 86;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_kill(pid, signum) -> u64   (shell#23, #22 partial)
+  //
+  // Deliver `signum` to task `pid`. Returns 0 on success, or a negative
+  // errno: -EINVAL for an unsupported signum (kernel R73.M1-001 accepts
+  // only SIGSTOP=19 and SIGCONT=18 at this landing), -ESRCH for a pid
+  // that is not live in the pid table.
+  //
+  // ARITY 2 -- SysV rdi/rsi -> SYSCALL rdi/rsi (no r10 shuffle).
+  // Kernel body: paideia-os `src/kernel/core/syscall/handlers/sys_kill.pdx`
+  // (landed R73.M1-001, paideia-os #1938, closed).
+  //
+  // Effect/cap set matches syscall_shim.pdx sys_kill: {mem, sysreg}
+  // covers _pid_table load + state-field write; @{sched} for the
+  // runq_dequeue (SIGSTOP RUNNABLE arm) / sched_wake (SIGCONT STOPPED
+  // arm) tail-calls into the scheduler.
+  //
+  // Shell consumers at this landing: bi_bg (SIGCONT for backgrounding
+  // a stopped job -- shell#23) and bi_fg (SIGCONT + sys_wait4 for
+  // reattaching a background/stopped job -- shell#23). A future
+  // ^Z-in-raw-mode path (shell#22) would call this with signum=19
+  // SIGSTOP against the foreground pgrp, but that path is blocked
+  // pending sys_sigaction (kernel-side; the terminal driver cannot
+  // synthesize SIGTSTP without a per-process signal handler table)
+  // or a non-blocking sys_wait4 loop the shell can interrupt.
+  //
+  // Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save,
+  // harmless). Labels: none (linear body).
+  // ==========================================================================
+  pub let sys_kill : (u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (pid: u64) (signum: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "shell#23 / shell#22 (partial): SC+ ID 95 wrapper. SysV rdi/rsi pass through unchanged to SYSCALL rdi/rsi (arity 2 < 4; no r10 shuffle needed). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_kill.pdx (landed R73.M1-001, paideia-os #1938, closed 2026-08). Accepts SIGSTOP=19 and SIGCONT=18 at this landing; any other signum returns -EINVAL. -ESRCH for pid not live in _pid_table. Effect/cap set matches syscall_shim.pdx sys_kill: {mem, sysreg} for the _pid_table load + task state-field write; @{sched} for the runq_dequeue (SIGSTOP RUNNABLE arm) / sched_wake (SIGCONT STOPPED arm) tail-calls into the scheduler. Shell consumers: bi_bg (SIGCONT for backgrounded stopped job; shell#23), bi_fg (SIGCONT + sys_wait4 for reattach; shell#23). ^Z-in-raw-mode (shell#22) requires sys_sigaction (kernel) or a non-blocking sys_wait4 the shell can interrupt; both are gaps documented in design/architecture.md §4.5. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none.",
+      block: {
+        mov rax, 95;
         syscall;
         ret
       }

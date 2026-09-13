@@ -180,12 +180,19 @@ module Dispatch = structure {
   pub let bi_name_export : [u8; 7] = "export\0"
   pub let bi_name_pwd    : [u8; 4] = "pwd\0"
   pub let bi_name_help   : [u8; 5] = "help\0"
+  // shell#22 / #23 / #24 job-control builtin names.
+  pub let bi_name_jobs   : [u8; 5] = "jobs\0"
+  pub let bi_name_bg     : [u8; 3] = "bg\0"
+  pub let bi_name_fg     : [u8; 3] = "fg\0"
 
   pub let BI_NAME_LEN_CD     : u64 = 2
   pub let BI_NAME_LEN_EXIT   : u64 = 4
   pub let BI_NAME_LEN_EXPORT : u64 = 6
   pub let BI_NAME_LEN_PWD    : u64 = 3
   pub let BI_NAME_LEN_HELP   : u64 = 4
+  pub let BI_NAME_LEN_JOBS   : u64 = 4
+  pub let BI_NAME_LEN_BG     : u64 = 2
+  pub let BI_NAME_LEN_FG     : u64 = 2
 
   // ==========================================================================
   // Runtime-loaded triple table (.bss).
@@ -234,7 +241,7 @@ module Dispatch = structure {
       block: {
         sub rsp, 8;                          // align rsp % 16 for bi_env_reset call
 
-        // _bi_names[0..4]
+        // _bi_names[0..7]
         lea r11, [rip + _bi_names];
         lea rax, [rip + bi_name_cd];
         mov [r11 + 0], rax;
@@ -246,8 +253,14 @@ module Dispatch = structure {
         mov [r11 + 24], rax;
         lea rax, [rip + bi_name_help];
         mov [r11 + 32], rax;
+        lea rax, [rip + bi_name_jobs];
+        mov [r11 + 40], rax;
+        lea rax, [rip + bi_name_bg];
+        mov [r11 + 48], rax;
+        lea rax, [rip + bi_name_fg];
+        mov [r11 + 56], rax;
 
-        // _bi_name_lens[0..4]
+        // _bi_name_lens[0..7]
         lea r11, [rip + _bi_name_lens];
         mov rax, 2;                          // strlen("cd")
         mov [r11 + 0], rax;
@@ -259,8 +272,14 @@ module Dispatch = structure {
         mov [r11 + 24], rax;
         mov rax, 4;                          // strlen("help")
         mov [r11 + 32], rax;
+        mov rax, 4;                          // strlen("jobs")
+        mov [r11 + 40], rax;
+        mov rax, 2;                          // strlen("bg")
+        mov [r11 + 48], rax;
+        mov rax, 2;                          // strlen("fg")
+        mov [r11 + 56], rax;
 
-        // _bi_handlers[0..4]
+        // _bi_handlers[0..7]
         lea r11, [rip + _bi_handlers];
         lea rax, [rip + bi_cd];
         mov [r11 + 0], rax;
@@ -272,10 +291,16 @@ module Dispatch = structure {
         mov [r11 + 24], rax;
         lea rax, [rip + bi_help];
         mov [r11 + 32], rax;
+        lea rax, [rip + bi_jobs];
+        mov [r11 + 40], rax;
+        lea rax, [rip + bi_bg];
+        mov [r11 + 48], rax;
+        lea rax, [rip + bi_fg];
+        mov [r11 + 56], rax;
 
-        // _bi_count = 5
+        // _bi_count = 8
         lea r11, [rip + _bi_count];
-        mov rax, 5;
+        mov rax, 8;
         mov [r11], rax;
 
         // Reset shell-local env table so startup is a clean baseline.

@@ -264,6 +264,18 @@ module LineReader = structure {
   // sentinel dispatch shape.
   pub let LR_KEY_RECALL_NOP : u64 = 0xFFFFEC57
 
+  // shell#25 (R73.M1-005): TAB (0x09) is a GROUND-state escape from
+  // the byte-verbatim path so line_reader_read_line can invoke
+  // Completion::cp_complete_line without teaching every downstream
+  // reader to filter 0x09 out of the line buffer. The FSM emits
+  // LR_KEY_TAB when it sees 0x09 in GROUND state; ESC-family / CSI
+  // states pass 0x09 through the normal parameter-byte gate (0x09
+  // is 0x20-below so it never appears as a CSI parameter -- the
+  // ANSI grammar defines 0x00..0x1F as C0 which the CSI grammar
+  // rejects, so the FSM's existing `jb lr_rk_loop` in CSI state
+  // already drops it silently -- see lr_rk_csi below).
+  pub let LR_KEY_TAB : u64 = 0xFFFFEC58
+
   // R66.M1-003 (#19): redraw prefix `\r ESC [ K` written to fd 1 at the
   // start of every recall-hit emission. `\r` returns the cursor to
   // column 0; `ESC [ K` (CSI K, ECMA-48 EL 0) erases to end of line
@@ -615,6 +627,13 @@ module LineReader = structure {
         je  lr_rk_enter_esc;
         cmp rax, 0x7F;                       // DEL / backspace
         je  lr_rk_backspace_key;
+        // shell#25: TAB (0x09) in GROUND state emits LR_KEY_TAB so
+        // line_reader_read_line can hook cp_complete_line. Placed
+        // AFTER the ESC / DEL checks because those two are the
+        // canonical FSM entry points; TAB is a leaf sentinel with
+        // no follow-on state (returns immediately).
+        cmp rax, 0x09;                       // HT / TAB
+        je  lr_rk_tab_key;
         // Any other byte: return it verbatim (rax already holds it).
         jmp lr_rk_return;
 
@@ -624,6 +643,10 @@ module LineReader = structure {
 
       lr_rk_backspace_key:
         mov rax, 0xFFFFEC54;                 // LR_KEY_BACKSPACE
+        jmp lr_rk_return;
+
+      lr_rk_tab_key:
+        mov rax, 0xFFFFEC58;                 // LR_KEY_TAB
         jmp lr_rk_return;
 
       lr_rk_esc:
@@ -1586,6 +1609,20 @@ module LineReader = structure {
         cmp rax, r11;
         je  lr_rl_right;
 
+        // shell#25 (R73.M1-005): TAB dispatch to cp_complete_line.
+        // Contract: cp_complete_line(buf=r12, count=r14, buf_cap=r13)
+        //   returns the NEW byte count in rax (>= r14). If rax > r14
+        //   the driver already sys_wrote the inserted bytes to fd 1
+        //   AND stored them at buf[r14..rax). If rax == r14 no unique
+        //   completion was possible (no match, multiple ambiguous
+        //   matches, or the driver printed a menu on a fresh line and
+        //   redrew the prompt+buffer already).
+        // Cursor is set to the new end-of-buffer per the same
+        // recall-end semantics as UP/DOWN arrow.
+        mov r11, 0xFFFFEC58;                 // LR_KEY_TAB
+        cmp rax, r11;
+        je  lr_rl_tab;
+
         // UNKNOWN: recognised but ignored.
         mov r11, 0xFFFFEC55;                 // LR_KEY_UNKNOWN
         cmp rax, r11;
@@ -1793,6 +1830,22 @@ module LineReader = structure {
         pop r13;
         pop r12;
         ret;
+
+      lr_rl_tab:
+        // shell#25: hand off to Completion::cp_complete_line. The
+        // driver reads the current buffer prefix, determines argv
+        // position, walks /bin (argv[0]) or cwd (argv[1..]), inserts
+        // the uniquely-matching prefix + echoes to fd 1. Returns
+        // NEW count in rax (>= r14).
+        mov rdi, r12;                        // buf base
+        mov rsi, r14;                        // current count
+        mov rdx, r13;                        // buf_cap
+        call cp_complete_line;
+        mov r14, rax;                        // r14 := new count
+        // Cursor := new end (matches UP/DOWN recall semantics).
+        lea r11, [rip + _sm_line_cursor];
+        mov [r11], r14;
+        jmp lr_rl_loop;
 
       lr_rl_bad_buf:
         mov rdi, 4;                          // SH_ST_ERRORS

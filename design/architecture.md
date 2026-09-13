@@ -1134,6 +1134,52 @@ journal sees the OPEN record with a timestamp strictly before the
 child's first schedule. That is the invariant the test suite
 falsifies.
 
+#### 4.4 job-control writers (shell#22 / #23, v0.2.0)
+
+`exec_spawn_and_wait`'s parent branch now calls `Jobs::jb_add_job(pid)`
+between the `SHELL FORK OK` fingerprint and `sys_wait4`, and
+`Jobs::jb_close_job(pid, exit_code)` between the exit-code extraction
+and `command_record_close`. These are the row writers for
+`_jb_jobs_table` (the R73.M1-006 skeleton). Together with the reader
+in `bi_jobs` and the state-modifiers in `bi_bg` / `bi_fg` (both call
+`sys_kill(pid, SIGCONT=18)`; `bi_fg` also blocks on `sys_wait4`),
+these form the full observable half of job control.
+
+The writers are witness-only against the current REPL: the shell is
+single-threaded and `sys_wait4` blocks synchronously, so no concurrent
+`jobs` / `bg` / `fg` invocation can observe a live row between add
+and close. The scaffolding lands so the moment the upstream gap in
+§4.5 closes, no shell-side rewiring is needed.
+
+#### 4.5 `^Z` in raw mode — blocked (shell#22)
+
+`SIGSTOP`-on-foreground via `^Z` in raw-mode TTY requires one of:
+
+  (a) **Kernel `sys_sigaction` + terminal-driver delivery.** The
+      terminal driver in `paideia-os src/kernel/dev/tty/*` does not
+      today translate a `0x1A` byte from the input stream into a
+      `SIGTSTP` signal delivered to the foreground process group.
+      Neither `sys_sigaction` nor the driver hook exists in the
+      current kernel tree. Landing this route in the kernel would
+      let the shell process a `SIGCHLD` handler that observes the
+      stop transition and updates the jobs table accordingly.
+
+  (b) **Non-blocking `sys_wait4` (WNOHANG=1) + `sys_poll`.** The
+      shell would decouple the read-line loop from the wait loop:
+      after `sys_fork`, the parent returns to the REPL prompt and
+      polls `sys_wait4(pid, &wstatus, WNOHANG, 0)` at each keystroke
+      alongside `sys_read`. `^Z` would then be observed as an in-band
+      byte during `sys_read`, and the shell would `sys_kill(pid,
+      SIGSTOP=19)` from user space. `sys_wait4`'s `WNOHANG` arm is
+      undocumented in the current kernel body (`paideia-os
+      src/kernel/core/syscall/handlers/sys_wait.pdx`), and no
+      `sys_poll` wrapper exists in the SC+ floor.
+
+Either landing retires `shell#22` fully. `bi_bg` / `bi_fg` / `bi_jobs`
+and the row writers land in v0.2.0 so no further shell-side work
+gates on the upstream fix — the runtime becomes meaningful the
+moment either kernel gap closes.
+
 #### 4.3 pipeline
 
 The pipeline shape (`a | b | c`), minting one `KIND_IPC_ENDPOINT`
@@ -1560,7 +1606,21 @@ the smoke matrix pulls both sides into one build.
 0xFFFFECE5  BI_ERR_EXPORT_TABLE_FULL  Builtins.ENH-004: env table at BI_ENV_TABLE_MAX (32)
 0xFFFFECE6  BI_ERR_EXPORT_POOL_FULL   Builtins.ENH-004: env name+value > 4096-byte pool
 0xFFFFECE7  BI_ERR_PWD_TOO_LONG       Builtins.ENH-004: sys_getcwd returned negative errno
+0xFFFFECE8  BI_ERR_CD_NO_OLDPWD       Builtins.shell#14: `cd -` before any successful cd (OLDPWD unset)
+0xFFFFECE9  BI_ERR_JOB_BAD_JID        Builtins.shell#23: bg/fg argv[1] not a positive decimal in [1,16]
+0xFFFFECEA  BI_ERR_JOB_NO_SUCH        Builtins.shell#23: bg/fg jid inactive (no row)
+0xFFFFECEB  BI_ERR_JOB_KILL_FAIL      Builtins.shell#23: sys_kill returned negative errno
+0xFFFFECEC  BI_ERR_JOB_WAIT_FAIL      Builtins.shell#23: fg sys_wait4 returned negative errno
+0xFFFFECFA  JB_ERR_TABLE_FULL         Jobs.shell#22/23: no free row in _jb_jobs_table
+0xFFFFECFB  JB_ERR_BAD_PID            Jobs.shell#22/23: jb_add_job called with pid==0
+0xFFFFECFC  JB_ERR_NO_ROW             Jobs.shell#22/23: jb_close_job found no row matching pid
+0xFFFFECFD  JB_ERR_NO_JOB             Jobs.shell#23: bg/fg jid resolution returned no pid
 ```
+
+**`LR_KEY_TAB = 0xFFFFEC58`** — new (shell#25). LR_KEY_* sub-band was
+already documented at LR_KEY_UP..LR_KEY_RECALL_NOP; TAB is the eighth
+sentinel and does not collide with the retired LR_STUB (0xFFFFEC10) or
+any LR_ERR_* code.
 
 (Sub-bands `0xFFFFECAx` (ReleaseManifest) and `0xFFFFECBx` (BrokerBind)
 sit between CMDR and LX; see the M5 sections above for their full

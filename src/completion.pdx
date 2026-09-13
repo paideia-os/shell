@@ -557,4 +557,515 @@ module Completion = structure {
         ret
       }
     }
+
+  // ==========================================================================
+  // shell#25 (R73.M1-005) -- TAB completion driver
+  //
+  // The driver takes the current line buffer + count and either
+  //   (a) leaves it unchanged (no match / ambiguous with nothing to
+  //       usefully extend) and returns count verbatim, or
+  //   (b) appends the longest common prefix (LCP) shared by every
+  //       matching candidate, echoes the newly-appended bytes to fd 1
+  //       so the terminal cursor tracks the buffer, and returns the
+  //       new count.
+  //
+  // Argv-position discrimination is deliberately simple: if the raw
+  // buffer (bytes 0..count) contains no ' ' (0x20), we are at the
+  // argv[0] position and the candidate registry is /bin. Otherwise
+  // the prefix runs from the byte after the last ' ' to count, and
+  // the candidate registry is the current working directory. This
+  // matches the shell#25 issue body's "PATH-aware argv[0], cwd-aware
+  // argv[1..]" contract at the granularity Milestone 1 needs: PATH
+  // parsing lands when Builtins::_bi_env grows a first-class PATH
+  // slot (deferred to shell.M4 semantic-registry landing) and
+  // meanwhile /bin is the only entry every process is guaranteed to
+  // see.
+  //
+  // LCP semantics:
+  //   - match_count == 0: return count (no-op).
+  //   - match_count == 1: insert (LCP - prefix) + " " (trailing space
+  //                       so the next TAB begins argv[1] rather than
+  //                       extending argv[0]).
+  //   - match_count >  1: insert (LCP - prefix). No space; the user
+  //                       is at an ambiguous point and typing one
+  //                       more character disambiguates.
+  //
+  // Buffer-overflow guard: refuses to insert bytes that would exceed
+  // buf_cap; on refusal returns count unchanged (the terminal state
+  // stays consistent with the buffer state).
+  //
+  // Rodata + .bss:
+  //   cp_bin_path       : "/bin\0"           5 bytes  (argv[0] scan)
+  //   cp_cwd_path       : ".\0"              2 bytes  (argv[1..] scan)
+  //   _cp_dents_buf     : [u8; 4096]  @align(16)  sys_getdents scratch
+  //   _cp_lcp_buf       : [u8; 256]   @align(16)  running LCP storage
+  //
+  // Record layout (kernel-side sys_getdents, paideia-os
+  // design/user/dirent-record.md): 12-byte header {ino:u64,
+  // name_len:u16, reserved:u16} then name_len bytes of name (no NUL
+  // terminator); records packed back-to-back with no trailing pad.
+  // Terminator when name_len == 0.
+  //
+  // Length cap: names > 255 bytes are ignored (skipped by the walk);
+  // _cp_lcp_buf is 256 bytes. Under any real /bin or cwd the names
+  // fit trivially.
+  //
+  // Encoder conformance:
+  //   - No `test`; every zero-check is `cmp reg, 0`.
+  //   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF.
+  //   - Large-imm error sentinels stage via mov r32, imm32.
+  //   - r11 as .bss LEA scratch (paideia-as convention).
+  //   - Byte reads via `xor rax, rax; mov_b rax, [ptr + i*1]` per #1248.
+  //   - Byte stores via `mov_b [dst + i*1], rax` per U1606.
+  //   - `and rax, imm8` acceptable (imm8 fits imm32; 0xFF trivially).
+  //
+  // Labels prefixed cp_cl_ (main driver), cp_nm_ (name-match helper),
+  // cp_lr_ (LCP-reduce helper).
+  // ==========================================================================
+
+  pub let cp_bin_path : [u8; 5] = "/bin\0"
+  pub let cp_cwd_path : [u8; 2] = ".\0"
+
+  pub let mut _cp_dents_buf : [u8; 4096] = uninit @align(16)
+  pub let mut _cp_lcp_buf   : [u8; 256]  = uninit @align(16)
+
+  // ==========================================================================
+  // cp_name_match(name_ptr, name_len, prefix_ptr, prefix_len) -> u64
+  //
+  // Returns 1 if name[0..prefix_len] == prefix[0..prefix_len], else 0.
+  // A name shorter than prefix_len is a mismatch. A prefix_len of 0
+  // matches every name (TAB on empty argv position lists all).
+  //
+  // Leaf function; no push/pop parity. All state in caller-save regs.
+  // Labels prefixed cp_nm_.
+  // ==========================================================================
+  pub let cp_name_match : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (name_ptr: u64) (name_len: u64) (prefix_ptr: u64) (prefix_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell#25 (R73.M1-005): pure byte-compare helper. Returns 1 iff name[0..prefix_len] == prefix[0..prefix_len]. Empty prefix trivially matches every name (returned before the loop). Name shorter than prefix -> 0. Byte reads via xor+mov_b per #1248 with explicit *1 scale per U1606. Leaf function; no push/pop parity. Labels prefixed cp_nm_.",
+      block: {
+        cmp rcx, 0;                          // prefix_len
+        je  cp_nm_yes;                       // empty prefix matches all
+        cmp rsi, rcx;                        // name_len < prefix_len?
+        jb  cp_nm_no;
+
+        xor r8, r8;                          // i = 0
+      cp_nm_loop:
+        cmp r8, rcx;
+        jae cp_nm_yes;
+        xor rax, rax;
+        mov_b rax, [rdi + r8 * 1];           // name byte
+        xor r9,  r9;
+        mov_b r9,  [rdx + r8 * 1];           // prefix byte
+        cmp rax, r9;
+        jne cp_nm_no;
+        add r8, 1;
+        jmp cp_nm_loop;
+
+      cp_nm_yes:
+        mov rax, 1;
+        ret;
+      cp_nm_no:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cp_lcp_reduce(a_ptr, a_len, b_ptr, b_len) -> u64
+  //
+  // Returns the length of the longest common prefix between a and b.
+  // Result is capped at min(a_len, b_len).
+  //
+  // Leaf function. Labels prefixed cp_lr_.
+  // ==========================================================================
+  pub let cp_lcp_reduce : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (a_ptr: u64) (a_len: u64) (b_ptr: u64) (b_len: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell#25 (R73.M1-005): pure LCP-length reducer. Loop bound = min(a_len, b_len); early-exit on first byte difference. Byte reads via xor+mov_b per #1248. Leaf function; no push/pop parity. Labels prefixed cp_lr_.",
+      block: {
+        // r8 = bound = min(a_len, b_len)
+        mov r8, rsi;
+        cmp r8, rcx;
+        jbe cp_lr_bound_ok;
+        mov r8, rcx;
+      cp_lr_bound_ok:
+        xor r9, r9;                          // i = 0
+      cp_lr_loop:
+        cmp r9, r8;
+        jae cp_lr_done;
+        xor rax, rax;
+        mov_b rax, [rdi + r9 * 1];
+        xor r10, r10;
+        mov_b r10, [rdx + r9 * 1];
+        cmp rax, r10;
+        jne cp_lr_done;
+        add r9, 1;
+        jmp cp_lr_loop;
+      cp_lr_done:
+        mov rax, r9;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // cp_complete_line(buf, count, buf_cap) -> u64
+  //
+  // Signature: cp_complete_line : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs}
+  //
+  // See §"shell#25 driver" above for the semantics. Returns the new
+  // byte count; caller uses this to advance its own r14 (line count).
+  //
+  // Bumps SH_ST_COMPLETIONS (slot 9) on every entry regardless of
+  // whether a candidate is found.
+  //
+  // Register plan (5 callee-save pushes + sub rsp,8 = 48 bytes;
+  // entry rsp%16==8 + 48 = 56, 56 mod 16 = 8 -- WRONG. Use 4 pushes
+  // + sub rsp,8 = 40 bytes; 8 + 40 = 48 mod 16 = 0. Good):
+  //   rbx = buf                (callee-save)
+  //   r12 = count              (callee-save; mutable across insertion)
+  //   r13 = buf_cap            (callee-save)
+  //   r14 = prefix_off         (callee-save)
+  //   [rsp+0] = prefix_len     (stack slot; short-scratch spill)
+  //   [rsp+8..47] = alignment pad (not used)
+  //
+  // Actually simpler: fold prefix_off + prefix_len into two callee-
+  // save registers, keep buf_cap in r15, use 5 pushes + no sub =
+  // 40 bytes; 8 + 40 = 48 mod 16 = 0. Preferred (no stack slot).
+  //
+  //   rbx = buf, r12 = count, r13 = buf_cap, r14 = prefix_off,
+  //   r15 = prefix_len
+  //   (fd, match_count, lcp_len tracked in .bss singletons below).
+  //
+  // Labels prefixed cp_cl_.
+  // ==========================================================================
+
+  pub let mut _cp_fd          : u64 = uninit @align(8)
+  pub let mut _cp_match_count : u64 = uninit @align(8)
+  pub let mut _cp_lcp_len     : u64 = uninit @align(8)
+
+  pub let cp_complete_line : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (buf: u64) (count: u64) (buf_cap: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell#25 (R73.M1-005): tab-completion driver. Scans the buffer prefix (from last ' ' to count) as either an argv[0] (no space in buf) or argv[1..] (space exists) candidate. Walks the corresponding directory (/bin for argv[0], cwd '.' for argv[1..]) via sys_open + sys_getdents; for each entry, tests prefix match via cp_name_match + folds into a running LCP via cp_lcp_reduce (first match seeds the LCP with the full name; each subsequent match reduces LCP to the byte-prefix shared with the new name). Empty prefix (TAB at argv[0] position with buf empty, or TAB right after a space) matches all names -- LCP will still be the shared prefix of all directory entries, which may or may not be non-empty; the buffer-overflow guard covers both cases. On completion, appends LCP[prefix_len..lcp_len] to buf and echoes those bytes to fd 1 so the terminal cursor tracks the buffer. If exactly one match, appends a trailing space (POSIX bash-shape: single match ends argv[N], next TAB begins argv[N+1]). Buffer-overflow guard: refuses insertion if count + insert_len + (space?1:0) > buf_cap; returns count unchanged. sys_getdents record layout (paideia-os design/user/dirent-record.md): 12-byte header {ino u64 +0, name_len u16 +8, reserved u16 +10}, then name_len bytes of name (no NUL). Terminator when name_len==0. Names > 255 bytes are skipped (cap sized to fit _cp_lcp_buf); this covers every realistic /bin binary and cwd entry. sys_open flags==0 is O_RDONLY. fd >= 32 (kernel's fd_table_max) OR bit-63-set negative-errno gate replicates the ls.pdx / bi_help scheme (jae cp_cl_open_fail). Bumps SH_ST_COMPLETIONS (slot 9) on entry. Prologue: 5 callee-save pushes (rbx buf, r12 count, r13 buf_cap, r14 prefix_off, r15 prefix_len) = 40 bytes; entry rsp%16==8 + 40 = 48, 48 mod 16 == 0 at every nested SysV call (shell_note, sys_open, sys_getdents, sys_close, sys_write, cp_name_match, cp_lcp_reduce). All error/state tracking via .bss singletons (_cp_fd, _cp_match_count, _cp_lcp_len) to keep the register pressure fixed at 5 callee-save. Encoder conformance: cmp/mov/lea/xor/add/sub/shl/and/mov_b/call/ret/jmp/je/jne/jl/jae/jb/ja only. r11 as .bss LEA scratch. Labels prefixed cp_cl_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                        // buf base
+        mov r12, rsi;                        // count
+        mov r13, rdx;                        // buf_cap
+
+        mov rdi, 9;                          // SH_ST_COMPLETIONS
+        call shell_note;
+
+        // -----------------------------------------------------------
+        // (1) Find prefix_off: scan buf[0..count) for last ' ' (0x20).
+        //     If none found, prefix_off = 0 (argv[0]).
+        //     If found at index k, prefix_off = k+1 (argv[1..]).
+        // -----------------------------------------------------------
+        xor r14, r14;                        // prefix_off = 0 (default)
+        xor r8, r8;                          // i = 0
+      cp_cl_scan_head:
+        cmp r8, r12;
+        jae cp_cl_scan_done;
+        xor rax, rax;
+        mov_b rax, [rbx + r8 * 1];
+        cmp rax, 0x20;                       // ' '
+        jne cp_cl_scan_next;
+        mov r14, r8;
+        add r14, 1;                          // prefix_off = k + 1
+      cp_cl_scan_next:
+        add r8, 1;
+        jmp cp_cl_scan_head;
+      cp_cl_scan_done:
+
+        // prefix_len = count - prefix_off
+        mov r15, r12;
+        sub r15, r14;
+
+        // Bound-check prefix_len against _cp_lcp_buf size (256). A
+        // prefix longer than 256 is refused (return count unchanged);
+        // typing a token that long is a bash-quirk case anyway.
+        cmp r15, 256;
+        ja  cp_cl_bail;
+
+        // -----------------------------------------------------------
+        // (2) Open the candidate directory. r14==0 -> /bin, else cwd.
+        // -----------------------------------------------------------
+        cmp r14, 0;
+        jne cp_cl_open_cwd;
+        lea rdi, [rip + cp_bin_path];
+        jmp cp_cl_open_do;
+      cp_cl_open_cwd:
+        lea rdi, [rip + cp_cwd_path];
+      cp_cl_open_do:
+        xor rsi, rsi;                        // O_RDONLY = 0
+        xor rdx, rdx;                        // mode = 0
+        call sys_open;
+        // Same fd-validity gate as bi_help / ls.pdx (fd >= 32 OR
+        // bit-63-set errno both fail the unsigned `jae 32`).
+        cmp rax, 32;
+        jae cp_cl_bail;                      // open fail -> return count
+        lea r11, [rip + _cp_fd];
+        mov [r11], rax;                      // stash fd
+
+        // Initialise match_count = 0, lcp_len = 0.
+        xor rax, rax;
+        lea r11, [rip + _cp_match_count];
+        mov [r11], rax;
+        lea r11, [rip + _cp_lcp_len];
+        mov [r11], rax;
+
+        // -----------------------------------------------------------
+        // (3) sys_getdents loop.
+        // -----------------------------------------------------------
+      cp_cl_getdents_head:
+        lea r11, [rip + _cp_fd];
+        mov rdi, [r11];
+        lea rsi, [rip + _cp_dents_buf];
+        mov rdx, 4096;                       // GETDENTS_IO_MAX
+        call sys_getdents;
+        // rax == 0 -> directory drained. rax < 0 (bit-63 set -> > 4096
+        // as unsigned) -> error. rax > 4096 caught by the same gate.
+        cmp rax, 0;
+        je  cp_cl_getdents_done;
+        mov rcx, 4096;
+        cmp rax, rcx;
+        ja  cp_cl_getdents_done;             // -errno; bail as if drained
+
+        // Walk buf[0..rax) as packed dents. r8 = cursor into dents buf.
+        xor r8, r8;
+      cp_cl_dent_head:
+        cmp r8, rax;
+        jae cp_cl_getdents_head;             // batch drained; next batch
+        // Load name_len (u16 at cursor + 8) via two byte reads +
+        // shift + OR. paideia-as has no mov_w opcode (feedback_pdx_
+        // encoder_pitfalls); the same two-byte-plus-shift idiom is
+        // documented for the shell#29-help /bin walk in the
+        // Unreleased CHANGELOG note.
+        lea r11, [rip + _cp_dents_buf];
+        mov r10, r8;
+        add r10, 8;
+        xor r9, r9;
+        mov_b r9, [r11 + r10 * 1];           // name_len low byte
+        xor rcx, rcx;
+        add r10, 1;
+        mov_b rcx, [r11 + r10 * 1];          // name_len high byte
+        shl rcx, 8;
+        or  r9, rcx;                         // r9 = name_len (u16)
+        cmp r9, 0;
+        je  cp_cl_getdents_done;             // terminator record
+
+        // Skip names longer than 255 bytes (cap for _cp_lcp_buf).
+        cmp r9, 255;
+        ja  cp_cl_dent_advance;
+
+        // Test prefix match: cp_name_match(name_ptr, name_len,
+        //   prefix_ptr = rbx + r14, prefix_len = r15).
+        // Preserve r8, r9 across the call by stashing in .bss.
+        // Simpler: push to stack. But we need alignment. Instead:
+        // use callee-save r12 (count)... no, r12 is live. Use a bss
+        // slot for r8/r9 too.
+        // Simpler: stack push/pop pairs, keeping rsp%16 across the call.
+        push r8;
+        push r9;
+
+        lea rdi, [rip + _cp_dents_buf];
+        add rdi, r8;
+        add rdi, 12;                         // name_ptr = base + cursor + 12
+        mov rsi, r9;                         // name_len
+        mov rdx, rbx;
+        add rdx, r14;                        // prefix_ptr
+        mov rcx, r15;                        // prefix_len
+        call cp_name_match;
+
+        pop r9;
+        pop r8;
+
+        cmp rax, 0;
+        je  cp_cl_dent_advance;
+
+        // Match. Update LCP.
+        // If match_count == 0: copy first match into _cp_lcp_buf.
+        // Else: LCP := cp_lcp_reduce(_cp_lcp_buf, lcp_len, name, name_len).
+        lea r11, [rip + _cp_match_count];
+        mov rcx, [r11];
+        cmp rcx, 0;
+        jne cp_cl_lcp_reduce;
+
+        // First match: seed _cp_lcp_buf and lcp_len := name_len.
+        xor rdx, rdx;                        // j = 0
+      cp_cl_seed_head:
+        cmp rdx, r9;
+        jae cp_cl_seed_done;
+        lea r11, [rip + _cp_dents_buf];
+        add r11, r8;
+        add r11, 12;                         // name base
+        xor rax, rax;
+        mov_b rax, [r11 + rdx * 1];
+        lea r11, [rip + _cp_lcp_buf];
+        mov_b [r11 + rdx * 1], rax;
+        add rdx, 1;
+        jmp cp_cl_seed_head;
+      cp_cl_seed_done:
+        lea r11, [rip + _cp_lcp_len];
+        mov [r11], r9;
+        jmp cp_cl_bump_match;
+
+      cp_cl_lcp_reduce:
+        // Preserve r8 / r9 across the reduce call the same way.
+        push r8;
+        push r9;
+        lea rdi, [rip + _cp_lcp_buf];
+        lea r11, [rip + _cp_lcp_len];
+        mov rsi, [r11];
+        lea rdx, [rip + _cp_dents_buf];
+        add rdx, r8;
+        add rdx, 12;                         // name base
+        mov rcx, r9;
+        call cp_lcp_reduce;
+        pop r9;
+        pop r8;
+        lea r11, [rip + _cp_lcp_len];
+        mov [r11], rax;                      // lcp_len := reduced
+
+      cp_cl_bump_match:
+        lea r11, [rip + _cp_match_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+      cp_cl_dent_advance:
+        // Advance cursor by 12 (header) + name_len.
+        add r8, 12;
+        add r8, r9;
+        jmp cp_cl_dent_head;
+
+      cp_cl_getdents_done:
+        // Close the fd. Ignore return.
+        lea r11, [rip + _cp_fd];
+        mov rdi, [r11];
+        call sys_close;
+
+        // -----------------------------------------------------------
+        // (4) Assess results and perform insertion.
+        // -----------------------------------------------------------
+        lea r11, [rip + _cp_match_count];
+        mov r9, [r11];                       // match_count
+        cmp r9, 0;
+        je  cp_cl_bail;                      // no match, no-op
+
+        lea r11, [rip + _cp_lcp_len];
+        mov r10, [r11];                      // lcp_len
+
+        // insert_len = lcp_len - prefix_len
+        mov rcx, r10;
+        sub rcx, r15;
+        cmp rcx, 0;
+        // If insert_len is 0 AND match_count > 1, the caller is at an
+        // ambiguous point with nothing to extend. If insert_len is 0
+        // AND match_count == 1, the buffer already holds the full
+        // name -- we still add a trailing space so bash-shape "next
+        // TAB begins argv[N+1]" holds.
+        jne cp_cl_have_insert;
+        cmp r9, 1;
+        jne cp_cl_bail;
+        // Fall through with rcx=0: single-match, insert only space.
+
+      cp_cl_have_insert:
+        // Compute total insertion (with optional trailing space).
+        // rdx = space? 1 : 0
+        xor rdx, rdx;
+        cmp r9, 1;
+        jne cp_cl_no_space;
+        mov rdx, 1;
+      cp_cl_no_space:
+        // Room check: count + insert_len + space? <= buf_cap.
+        mov r8, r12;
+        add r8, rcx;
+        add r8, rdx;
+        cmp r8, r13;
+        ja  cp_cl_bail;
+
+        // Copy _cp_lcp_buf[prefix_len..lcp_len] into buf[count..).
+        xor r8, r8;                          // j = 0
+      cp_cl_ins_head:
+        cmp r8, rcx;
+        jae cp_cl_ins_done;
+        lea r11, [rip + _cp_lcp_buf];
+        // src = &_cp_lcp_buf[prefix_len + j]
+        mov r10, r15;
+        add r10, r8;
+        xor rax, rax;
+        mov_b rax, [r11 + r10 * 1];
+        // dst = &buf[count + j]  (buf in rbx, count in r12)
+        mov r10, r12;
+        add r10, r8;
+        mov_b [rbx + r10 * 1], rax;
+        add r8, 1;
+        jmp cp_cl_ins_head;
+      cp_cl_ins_done:
+
+        // Append trailing space if single match.
+        cmp rdx, 0;
+        je  cp_cl_after_space;
+        mov rax, 0x20;
+        mov r10, r12;
+        add r10, rcx;
+        mov_b [rbx + r10 * 1], rax;
+      cp_cl_after_space:
+
+        // Echo the newly-inserted bytes to fd 1.
+        // sys_write(1, buf + count, rcx + rdx)
+        mov rdi, 1;
+        mov rsi, rbx;
+        add rsi, r12;
+        mov r8, rcx;
+        add r8, rdx;
+        mov rdx, r8;
+        call sys_write;
+
+        // Update count: r12 += rcx + rdx. rcx/rdx clobbered by
+        // sys_write, so recompute from state we still trust:
+        // - r15 (prefix_len) unchanged (callee-save).
+        // - lcp_len re-load from .bss.
+        // - match_count re-load from .bss.
+        lea r11, [rip + _cp_lcp_len];
+        mov r10, [r11];
+        mov rcx, r10;
+        sub rcx, r15;                        // insert_len
+        add r12, rcx;
+        lea r11, [rip + _cp_match_count];
+        mov r10, [r11];
+        cmp r10, 1;
+        jne cp_cl_no_trail;
+        add r12, 1;                          // count += space
+      cp_cl_no_trail:
+
+        mov rax, r12;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      cp_cl_bail:
+        // No insertion. Return count unchanged. Note: if we bail
+        // AFTER opening fd, the sys_close above already ran; if we
+        // bail before opening fd (prefix > 256), no fd was opened.
+        // Either way rax = r12 (original count).
+        mov rax, r12;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
 }

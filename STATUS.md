@@ -48,8 +48,8 @@
 > executes a command is numbered `v2.0`, not `v0.2` (shell#37 /
 > ENH-010).
 
-**Current milestone:** R106 — shell scaffolding + tokenizer novel semantics
-**Version:** 0.1.0 (see `CHANGELOG.md`)
+**Current milestone:** R73 — job control (bg/fg/jobs) + tab completion
+**Version:** 0.2.0 (see `CHANGELOG.md`)
 **Wave plan:** paideia-os `design/roadmap/persistent-home-wave.md` §R106
 **Identity model:** paideia-os `design/user/content-addressed-identity.md`
 
@@ -63,6 +63,11 @@ Placeholder — each row lands as its issue closes.
 | R106.SHELL-002  | tokenizer novel-tilde + bare-cd errors + dispatch entrypoint (#41) | pending |
 | R106.SHELL-003  | tokenizer + dispatcher test infrastructure (#42)       | LANDED  |
 | shell#44        | sys_fork syscall floor bump + live spawn fingerprint (unblocks #32 close) | LANDED  |
+| shell#32        | ENH-005 real exec path (EX_STUB retirement)             | LANDED  |
+| shell#24        | R73.M1-004 jobs builtin                                 | LANDED  |
+| shell#23        | R73.M1-003 bg/fg builtins (sys_kill SIGCONT + wait4)    | LANDED  |
+| shell#22        | R73.M1-002 process-group ^Z in raw mode                 | partial (job-table wired, ^Z blocked pending kernel sys_sigaction or non-blocking wait4) |
+| shell#25        | R73.M1-005 tab completion (/bin argv[0], cwd argv[1..]) | LANDED  |
 
 Cross-repo pair: paideia-os R106.M4-KERNEL (kernel-side integration
 surface).

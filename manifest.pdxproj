@@ -24,7 +24,7 @@
 # to `tool` here. See design/enhancement-plan.md §6.
 
 name        = shell
-version     = 0.1.0
+version     = 0.2.0
 kind        = tool
 entry       = Shell::shell_main         # defined at src/shell.pdx (ENH-006, #33)
 output      = build-out/shell

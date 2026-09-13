@@ -4,6 +4,157 @@ All notable changes to this project. The format follows Keep a
 Changelog conventions; the project follows Semantic Versioning per
 `design/tooling/plan.md` §6.
 
+## 0.2.0 — R73 job-control + shell#25 tab completion + shell#32 close
+
+**Job control (partial) — shell#22 / #23 / #24.**
+
+- **`Syscall::sys_kill` (SC+ ID 95).** Thin arity-2 wrapper matching
+  `paideia-os src/kernel/core/syscall/handlers/sys_kill.pdx` (landed
+  R73.M1-001, paideia-os #1938, closed). Accepts `SIGSTOP=19` and
+  `SIGCONT=18` at this landing per the kernel body; any other signum
+  returns `-EINVAL`. Effect/cap set `{mem, sysreg} @{sched}`.
+
+- **`Jobs::jb_add_job(pid) -> jid`** and **`Jobs::jb_close_job(pid,
+  exit_status) -> u64`.** Row writers over the empty `_jb_jobs_table`
+  skeleton R73.M1-006 (#26) shipped; both emit `shell_fp_job_ok`.
+  Row layout is unchanged: 3-qword row `{jid:u64, pid:u64, state|
+  exit_status:u64}`. Row byte offset `i*24` via `shl 3 + lea [rax +
+  rax*2]` to avoid the 2-op `imul r,imm` pitfall documented in
+  `feedback_pdx_encoder_pitfalls`.
+
+- **`Jobs::jb_pid_of_jid(jid) -> pid | 0`.** O(1) direct row lookup
+  for the bg/fg builtins to resolve their `argv[1]` jid into the
+  child pid before `sys_kill` / `sys_wait4`.
+
+- **`Builtins::bi_jobs`.** Walks `_jb_jobs_table[0..JB_TABLE_MAX)`;
+  for each active row emits `[job <jid>] <label> pid <pid>\n` in
+  one `sys_write` to fd 1. Label is `Running  ` / `Stopped  ` /
+  `Waited   ` per the row's state field. Empty table emits
+  `no jobs\n`. Registered in `Dispatch` at slot 5.
+
+- **`Builtins::bi_bg`** (shell#23). Parses `argv[1]` as decimal jid
+  in `[1, JB_TABLE_MAX]` via `bi_jb_parse_jid`, resolves the pid
+  via `jb_pid_of_jid`, calls `sys_kill(pid, SIGCONT=18)`. On
+  success rewrites the row's state field to `JB_STATE_BG`. Errors
+  in the `0xFFFFECE9..EC` band. Registered at slot 6.
+
+- **`Builtins::bi_fg`** (shell#23). Same jid parse + pid map as
+  `bi_bg`, then `sys_kill(pid, SIGCONT)` + `sys_wait4(pid, &wstatus,
+  0, 0)` to block until the child exits. Closes the row via
+  `jb_close_job` on success. Returns the exit code (low 8 of
+  wstatus) rather than `BI_OK` so the REPL sees the real exit.
+  Registered at slot 7.
+
+- **`Exec::exec_spawn_and_wait` wired to jobs table.** Parent
+  branch now calls `jb_add_job(pid)` after the SHELL FORK OK
+  fingerprint (before `sys_wait4`) and `jb_close_job(pid,
+  exit_code)` after the exit-code extraction (before `command_
+  record_close`). Witness-only wire today: the shell is single-
+  threaded and the wait is synchronous, so `jobs` / `bg` / `fg`
+  observe the row only in an interleaving that does not exist
+  in the current REPL. The scaffolding lands ahead of the
+  non-blocking `sys_wait4` path so no rework is needed then.
+
+**Blocked (documented, not landed): shell#22 ^Z in raw mode.**
+
+The `^Z` foreground-stop path needs one of two upstream landings
+that do not exist today:
+
+  (a) Kernel `sys_sigaction` + terminal driver delivery of `SIGTSTP`
+      to the foreground pgrp on `^Z`. Neither is in
+      `paideia-os src/kernel/`.
+
+  (b) A non-blocking `sys_wait4` (options=`WNOHANG=1`) + `sys_poll`
+      loop the shell can interrupt from its own line-reader path.
+      `sys_wait4`'s WNOHANG arm is undocumented in the kernel body
+      today; `sys_poll` has no SC+ wrapper.
+
+`bi_bg` / `bi_fg` / `bi_jobs` and the writers land regardless,
+because their run-time is meaningful the moment either upstream
+gap closes (no additional shell-side wiring). See
+`design/architecture.md` §4.5 for the ledger. (Design doc note
+added under `design/architecture.md` at the same landing.)
+
+**Tab completion — shell#25.**
+
+- **`LR_KEY_TAB = 0xFFFFEC58`.** New key sentinel returned by
+  `lr_read_key` when it sees `0x09` (HT) in GROUND state. Placed
+  after ESC / DEL in the FSM ground dispatch so the existing
+  key-recognition tests are unchanged. CSI-state `0x09` is dropped
+  by the existing `jb lr_rk_loop` at the parameter-byte gate (per
+  ANSI grammar; C0 bytes are never valid CSI parameters).
+
+- **`line_reader_read_line` TAB dispatch.** On `LR_KEY_TAB`, calls
+  `Completion::cp_complete_line(buf, count, buf_cap)` and updates
+  `r14` (count) + `_sm_line_cursor` from the return value. Matches
+  the up/down recall semantics (cursor := end of new content).
+
+- **`Completion::cp_complete_line(buf, count, buf_cap) -> u64`.**
+  Full driver:
+
+  1. Scans `buf[0..count)` backwards for the last `' '` to find
+     the token prefix. No space -> `argv[0]`; space at index `k`
+     -> `argv[1..]` with `prefix_off = k+1`.
+
+  2. Opens `/bin` (argv[0]) or `.` (argv[1..]) via `sys_open(path,
+     O_RDONLY=0, 0)`. Failure -> return count unchanged.
+
+  3. Runs the standard `sys_getdents` batch loop with the
+     `_cp_dents_buf : [u8; 4096] @align(16)` scratch. Parses the
+     12-byte record header (`ino u64 +0`, `name_len u16 +8`,
+     `reserved u16 +10`, name at +12; terminator when
+     `name_len==0`). u16 name_len read via two `mov_b` + shift +
+     `or` because `paideia-as` has no `mov_w` opcode
+     (`feedback_pdx_encoder_pitfalls`).
+
+  4. For each entry passing `cp_name_match(name, name_len, prefix,
+     prefix_len)`, folds into a running LCP via `cp_lcp_reduce`.
+     First match seeds `_cp_lcp_buf`; subsequent matches reduce
+     `lcp_len` to the shared prefix length.
+
+  5. `sys_close(fd)`.
+
+  6. If `match_count == 0`: return count. If `match_count > 1`:
+     insert `LCP[prefix_len..lcp_len]` (the ambiguity-reducing
+     extension). If `match_count == 1`: same, plus a trailing
+     space so the next TAB begins `argv[N+1]`. Buffer-overflow
+     guard refuses insertion that would exceed `buf_cap`.
+
+  7. Echoes the inserted bytes to fd 1 so the terminal cursor
+     tracks the buffer. Returns the new count.
+
+  Bumps `SH_ST_COMPLETIONS` (slot 9) on entry. `cp_name_match`
+  and `cp_lcp_reduce` are leaf helpers (no push/pop parity;
+  all state in caller-save regs).
+
+**shell#32 closed: EX_STUB retirement documented.**
+
+`Exec::exec_spawn_and_wait` has not returned `EX_STUB` since
+ENH-005 (#33 pair) + shell#44 landed the real fork+execve+wait4
+path. The stale header comment in `src/exec.pdx` line 285 that
+said "still returns EX_STUB on its happy path" is refreshed to
+name the sequence that actually runs today (fork -> parent-wait /
+child-exec -> audit close -> return exit code). `EX_STUB
+(0xFFFFEC20)` is retained in `shell.pdx` as a HISTORICAL band
+entry — no live instruction stores it.
+
+**Dispatch table extension.**
+
+`Dispatch::dispatch_init` now populates 8 slots (`_bi_count = 8`)
+in the fixed order:
+
+  0. `cd`      (bi_cd)
+  1. `exit`    (bi_exit)
+  2. `export`  (bi_export)
+  3. `pwd`     (bi_pwd)
+  4. `help`    (bi_help)      *(landing pending; unresolved externally)*
+  5. `jobs`    (bi_jobs)      *(new — shell#24)*
+  6. `bg`      (bi_bg)        *(new — shell#23)*
+  7. `fg`      (bi_fg)        *(new — shell#23)*
+
+Order stability preserved for slots 0..4 so any existing hard-
+coded index reference resolves the same handler.
+
 ## Unreleased
 
 - `bi_cd` gains bash-style `cd -` OLDPWD support (shell#14): pre-chdir cwd snapshot into `_bi_oldpwd_buf`, `cd -` swaps + echoes the new cwd, unset-OLDPWD path emits `SHELL CD ERR no oldpwd` fingerprint and returns new sentinel `BI_ERR_CD_NO_OLDPWD` (0xFFFFECE8); `tbi_case_cd_dash_no_oldpwd` locks the reject shape.

@@ -282,7 +282,17 @@ module Exec = structure {
   // per-child sidecar at sys_execve time.
   //
   // As with M1, the ACTUAL sys_execve call is a substrate deferral --
-  // exec_spawn_and_wait still returns EX_STUB on its happy path.
+  // (shell#32 retired at ENH-005 + shell#44: exec_spawn_and_wait NO
+  // LONGER returns EX_STUB. The happy path is fork+execve+wait4+audit-
+  // close returning the child's exit code -- the sequence in the M2
+  // §CALL GRAPH block above. The EX_STUB (0xFFFFEC20) sentinel is
+  // preserved in shell.pdx as a HISTORICAL constant so downstream
+  // consumers that still reference it in reject-shape tables keep
+  // compiling; it is UNREACHABLE from any live control flow in the
+  // current exec_spawn_and_wait body. shell#32 verification: `grep
+  // -n 'EX_STUB' src/exec.pdx` returns only comment / doc lines and
+  // one shell.pdx band table entry; no `mov rax, 0xFFFFEC20`
+  // instruction remains in this file's live body.)
   // exec_narrow_child_caps is a pure narrowing helper that does not
   // touch the substrate boundary at all; it operates entirely on
   // caller-owned buffers.
@@ -1280,6 +1290,20 @@ module Exec = structure {
         mov rdx, 1;
         call sys_write;
 
+        // shell#22/#23 (partial): register the child in the jobs table
+        // BEFORE wait4 so a concurrent reader (post non-blocking wait
+        // landing) can observe the row while the child is live. rbx
+        // (child pid) is callee-save across jb_add_job. The return
+        // (jid or JB_ERR_TABLE_FULL / JB_ERR_BAD_PID) is deliberately
+        // discarded: a table-full arm is a purely observational miss --
+        // the exec continues normally, only the jobs/bg/fg builtins
+        // will not see this run. shell#22 has no ^Z interrupt path
+        // today, so the row is always closed on the same call by
+        // jb_close_job below without any user-visible windowing.
+        mov rdi, rbx;                        // pid
+        call jb_add_job;
+        // Ignore return; witness-only wire until non-blocking wait4.
+
         // Fall through to sys_wait4 on the parent's timeline.
         jmp ex_sw_wait_head;
 
@@ -1330,6 +1354,17 @@ module Exec = structure {
         mov rax, [r11];
         and rax, 0xFF;
         mov r15, rax;                        // r15 = exit_code
+
+        // shell#22/#23 (partial): close the jobs-table row now that
+        // wait4 has returned. rbx (child pid) is still live from the
+        // parent branch; r15 (exit code) preserved across the call by
+        // callee-save discipline. jb_close_job's return (0 or
+        // JB_ERR_NO_ROW) is ignored: NO_ROW is expected if jb_add_job
+        // above failed (table full) or was never called (child_pid
+        // never registered), and neither case must fail the exec path.
+        mov rdi, rbx;                        // pid
+        mov rsi, r15;                        // exit_status
+        call jb_close_job;
 
         // (6a) shell#39 (R90-XREPO.013.M2-001): publish the child's
         // reconciled cap-set count. Today the count == child_decl_
