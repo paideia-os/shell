@@ -55,10 +55,12 @@ mkdir -p "$BUILD_DIR"
 
 FAIL=0
 COUNT=0
+OWN_OBJECTS=()
 for pdx in src/*.pdx; do
     [ -f "$pdx" ] || continue
     COUNT=$((COUNT + 1))
     obj="$BUILD_DIR/$(basename "$pdx" .pdx).o"
+    OWN_OBJECTS+=("$obj")
     if ! "$PA" build --emit elf64 "$pdx" -o "$obj" 2>&1; then
         FAIL=$((FAIL + 1))
     fi
@@ -78,3 +80,23 @@ fi
 echo "[build] $COUNT source(s), $FAIL failure(s)"
 [ "$FAIL" -eq 0 ] || exit 1
 echo "[build] OK"
+
+# paideia-os#2440: link every module .o (main.pdx's _start entry pulls
+# in the rest via cross-module `call`) into a real ELF via link.ld --
+# same shape as tools/user/mkfs.pdxfs/tools/build.sh's own link step
+# (both scripts share the monorepo's canonical src/user/link.ld,
+# copied verbatim into this repo's root as ./link.ld). This is the
+# artifact paideia-os's own tools/build.sh r64v2-tools-shaped shell
+# block stages into build/user/shell-satellite.elf for the kernel's
+# bin_seeds witness to prefer over the legacy embedded shell.elf.
+if [ "$FAIL" -eq 0 ] && [ "${#OWN_OBJECTS[@]}" -gt 0 ]; then
+    echo "[link] ld -T link.ld -> $BUILD_DIR/shell.elf"
+    ld -nostdlib --warn-common --fatal-warnings --gc-sections -z noexecstack \
+        -T link.ld \
+        -o "$BUILD_DIR/shell.elf" \
+        "${OWN_OBJECTS[@]}"
+    echo "[link] OK -> $BUILD_DIR/shell.elf"
+
+    objcopy -O binary "$BUILD_DIR/shell.elf" "$BUILD_DIR/shell.bin"
+    echo "[link] OK -> $BUILD_DIR/shell.bin"
+fi

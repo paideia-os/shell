@@ -763,7 +763,7 @@ bumps on every entry, `SH_ST_LINES` on every bytes-written return,
 `PROMPTS - LINES - ERRORS == 0` holds across a full session; a
 divergence is a live-counter regression.
 
-### 3.3 Cap-typed `KIND_TTY(read)` deferral (refreshed for #46)
+### 3.3 Cap-typed `KIND_TTY(read)` migration (landed, fallback-guarded — #46)
 
 The read syscall lives in exactly one helper — `lr_read_one_byte` —
 so the transport can be swapped at ONE site without touching the
@@ -835,26 +835,49 @@ inaccurate; this section is refreshed under paideia-os/shell#46.
    part of #46's outbound work; a follow-up companion issue should
    accompany this refresh.
 
-**Why the fd-0 fallback stays for now.** The paideia-os monorepo's
-own shell continues to read stdin via `sys_read` for the same reason.
-Blocking the shell REPL on the substrate work would leave every
-interactive path non-functional for the entire time the follow-up
-sits open. The single-seam design at `lr_read_one_byte` guarantees
-that when both (3a) and (3b) land, the migration is still one
-function edit: replace the `sys_read` shim with
+**Landed shape (2026-09-13).** Rather than wait for both (3a) and
+(3b) to close on the kernel side, `lr_read_one_byte` now carries BOTH
+paths behind a runtime gate on a new shell-owned slot,
+`_lr_tty_cap_slot` (`.bss`, zero-initialized, meaning UNBOUND):
 
 ```
-loop:
-    rax = sys_cap_invoke(tty_cap_slot, TTY_OP_READ)     // op_arg = 6
-    if rax == TTY_READ_EMPTY (0xFFFFEC35): sys_yield; jmp loop
-    if rax > 0xFF: return rax                            // propagate cap err
-    mov_b [byte_ptr], al
-    return 1
+lr_read_one_byte(byte_ptr):
+    if _lr_tty_cap_slot != 0:
+        rax = kind_tty_read_one(_lr_tty_cap_slot)   // blocks internally
+        mov_b [byte_ptr], al
+        return 1
+    else:
+        return sys_read(0, byte_ptr, 1)             // pre-#46 fallback
 ```
+
+`kind_tty_read_one(cap_slot)` is exactly the busy-poll-with-yield loop
+this section previously sketched:
+
+```
+kind_tty_read_one(cap_slot):
+loop:
+    rax = sys_cap_invoke(cap_slot, TTY_OP_READ)     // op_arg = 6
+    if rax == TTY_READ_EMPTY (0xFFFFEC35): sys_yield; jmp loop
+    return rax                                       // 0..255 byte value
+```
+
+`sys_cap_invoke` (SC+ ID 4) was added to the shell's `Syscall` module
+at this same landing (`src/syscall.pdx`) — the wrapper the #46 state
+ledger above still listed as absent. `_lr_tty_cap_slot` stays at its
+`.bss` zero default until a future boot-time landing calls the new
+setter `lr_tty_bind_cap(cap_slot)` with a real slot id — which cannot
+happen until BOTH (3a) and (3b) close on the paideia-os side (a
+follow-up paideia-os issue tracks that pair; see the ledger above).
+Until then this gate makes the fallback arm the ONLY reachable path,
+so boot behaviour is byte-identical to pre-#46: this landing wires the
+migration ahead of its kernel prerequisite without regressing the
+live REPL, matching the floor-first / consumer-later staging pattern
+`sys_yield` (shell#47) and `sys_fork` (shell#44) both used.
 
 Every other call site — the read loop in `line_reader_read_line`,
 the future line-editing polish under ENH-011 (#38) — sits behind the
-seam untouched.
+`lr_read_one_byte` seam untouched; only that one function and its two
+new siblings (`kind_tty_read_one`, `lr_tty_bind_cap`) changed.
 
 **Manifest-side prep landed in #46.** `caps.decl` now names
 `KIND_TTY(read)` alongside the extant `KIND_TTY(write)` requirement,

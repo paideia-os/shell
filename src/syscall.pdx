@@ -168,6 +168,7 @@ module Syscall = structure {
   pub let SYS_WRITE   : u64 = 1
   pub let SYS_OPEN    : u64 = 2
   pub let SYS_CLOSE   : u64 = 3
+  pub let SYS_CAP_INVOKE : u64 = 4  // shell#46: KIND_TTY(read) migration seam
   pub let SYS_YIELD   : u64 = 5
   pub let SYS_FORK    : u64 = 56
   pub let SYS_EXECVE  : u64 = 59
@@ -177,6 +178,19 @@ module Syscall = structure {
   pub let SYS_CHDIR   : u64 = 85
   pub let SYS_GETCWD  : u64 = 86
   pub let SYS_KILL    : u64 = 95   // R73.M1-001 (paideia-os #1938): SIGSTOP/SIGCONT
+
+  // Wave U (2026-09-13): sys_sigaction / sys_exec_reconcile_caps land at
+  // 117/118 to match the SAME sysnos the monorepo canonical shim
+  // (paideia-os src/user/syscall_shim.pdx) assigns them, so both repos
+  // agree on the wire number ahead of the kernel dispatch arm that a
+  // follow-up wires for each (both are floor-only at this landing --
+  // no `cmp rdi, 117`/`118` arm exists in core/syscall/dispatch.pdx
+  // yet, same staging SYS_YIELD used at shell#47). See paideia-os
+  // syscall_shim.pdx's own Wave U header comment for why 117/118 were
+  // chosen over the issue-originally-proposed 13/96 (both already
+  // claimed: 13 = SYS_DMESG, 96 = sys_sendto).
+  pub let SYS_SIGACTION            : u64 = 117  // paideia-os #2449 / #2454
+  pub let SYS_EXEC_RECONCILE_CAPS  : u64 = 118  // paideia-os/shell#39
 
   // ==========================================================================
   // sys_read(fd, buf, count) -> u64
@@ -555,6 +569,92 @@ module Syscall = structure {
       justification: "shell#23 / shell#22 (partial): SC+ ID 95 wrapper. SysV rdi/rsi pass through unchanged to SYSCALL rdi/rsi (arity 2 < 4; no r10 shuffle needed). Kernel body at paideia-os src/kernel/core/syscall/handlers/sys_kill.pdx (landed R73.M1-001, paideia-os #1938, closed 2026-08). Accepts SIGSTOP=19 and SIGCONT=18 at this landing; any other signum returns -EINVAL. -ESRCH for pid not live in _pid_table. Effect/cap set matches syscall_shim.pdx sys_kill: {mem, sysreg} for the _pid_table load + task state-field write; @{sched} for the runq_dequeue (SIGSTOP RUNNABLE arm) / sched_wake (SIGCONT STOPPED arm) tail-calls into the scheduler. Shell consumers: bi_bg (SIGCONT for backgrounded stopped job; shell#23), bi_fg (SIGCONT + sys_wait4 for reattach; shell#23). ^Z-in-raw-mode (shell#22) requires sys_sigaction (kernel) or a non-blocking sys_wait4 the shell can interrupt; both are gaps documented in design/architecture.md §4.5. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none.",
       block: {
         mov rax, 95;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_cap_invoke(slot, op_arg) -> u64   (shell#46)
+  //
+  // Generic capability-invocation trampoline. Returns whatever the
+  // kernel-side per-kind handler returns in rax: for KIND_TTY op 6
+  // (TTY_OP_READ) that is one polled byte (0..255) or the TTY_READ_
+  // EMPTY sentinel (0xFFFFEC35, paideia-os src/kernel/core/cap/
+  // kind_tty.pdx L248); for other kinds/ops the handler's own return
+  // shape applies (see paideia-os src/kernel/core/cap/invoke.pdx
+  // cap_invoke_dispatch for the per-kind fan-out).
+  //
+  // ARITY 2 -- SysV rdi/rsi -> SYSCALL rdi/rsi (no r10 shuffle).
+  // Kernel body: paideia-os src/kernel/core/cap/invoke.pdx cap_invoke
+  // (SC+ ID 4, R13 legacy still frozen in dispatch_cap_invoke).
+  //
+  // shell#46 sole consumer: LineReader::kind_tty_read_one, the KIND_TTY
+  // (read) migration seam for lr_read_one_byte. Matches paideia-os
+  // syscall_shim.pdx sys_cap_invoke byte-for-byte in body + effect/cap
+  // set: {sysreg} @{cap} -- the kernel-side per-kind handler's own
+  // effects (mem, sched, fs, ...) propagate through the call graph at
+  // its own annotation rather than being redeclared here (same
+  // convention Dispatch::dispatch_line documents for its widest-handler
+  // union).
+  //
+  // Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save,
+  // harmless). Labels: none (linear body).
+  // ==========================================================================
+  pub let sys_cap_invoke : (u64, u64) -> u64 !{sysreg} @{cap} =
+    fn (slot: u64) (op_arg: u64) -> unsafe {
+      effects: {sysreg}, capabilities: {cap},
+      justification: "shell#46: SC+ ID 4 wrapper (R13 legacy, still frozen in paideia-os dispatch_cap_invoke). SysV rdi/rsi pass through unchanged to SYSCALL rdi/rsi (arity 2 < 4; no r10 shuffle). Kernel body at paideia-os src/kernel/core/cap/invoke.pdx cap_invoke -> cap_invoke_dispatch, which loads the cap_table row at `slot` and delegates to the per-kind handler with op_arg carried as the handler's own third SysV arg (rdx). Matches syscall_shim.pdx sys_cap_invoke byte-for-byte. Sole shell consumer at this landing: LineReader::kind_tty_read_one, which invokes KIND_TTY op 6 (TTY_OP_READ, paideia-os src/kernel/core/cap/kind_tty.pdx) and interprets the kernel's per-op return convention itself (0..255 byte value, or TTY_READ_EMPTY 0xFFFFEC35) -- this trampoline is a pure pass-through and does not interpret the return value. Effect/cap set {sysreg} @{cap} matches the R13-era wrapper; the invoked kind's own effects (mem for TTY's ring read, etc.) propagate through the call graph at the kernel handler's own annotation, not redeclared here. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none.",
+      block: {
+        mov rax, 4;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_sigaction(signum, handler_va, old_handler_out_va) -> u64   (#2454)
+  //
+  // Installs a signal handler for `signum`. Sole shell consumer at this
+  // Wave: shell#2454's SIGINT (Ctrl-C) no-op handler install so an
+  // aborted foreground child does not also take the shell down with
+  // it. See paideia-os src/user/syscall_shim.pdx sys_sigaction (same
+  // SC+ ID 117, added in the same Wave U landing) for the full
+  // floor-only-landing rationale (no kernel dispatch arm exists yet).
+  //
+  // ARITY 3 -- SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle).
+  // ==========================================================================
+  pub let sys_sigaction : (u64, u64, u64) -> u64 !{mem, sysreg} @{sched} =
+    fn (signum: u64) (handler_va: u64) (old_handler_out_va: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {sched},
+      justification: "shell#2454: SC+ ID 117 wrapper, matching paideia-os syscall_shim.pdx sys_sigaction byte-for-byte (same Wave U landing shifted this off the issue-requested 13, which collides with SYS_DMESG). SysV rdi/rsi/rdx pass through (arity 3 < 4). Sole shell consumer: bi-level SIGINT install at shell startup so Ctrl-C during a foreground child's run does not deliver a fatal default disposition to the shell task itself. Floor-only landing: no kernel dispatch arm exists yet for sysno 117, so a caller observes -ENOSYS until a follow-up wires dispatch_sigaction + a per-task disposition table. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none.",
+      block: {
+        mov rax, 117;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // sys_exec_reconcile_caps(child_pid, child_caps_decl_ptr, child_caps_decl_len) -> u64   (shell#39)
+  //
+  // Userspace trampoline over the already-landed kernel substrate
+  // (paideia-os R90-XREPO.013.M0-001, src/kernel/core/cap/reconcile.pdx
+  // cap_reconcile_at_exec). Returns the reconciled cap-set count for
+  // the just-exec'd child, or a negative errno. Sole consumer:
+  // exec_spawn_and_wait's post-wait4 publish step (src/exec.pdx),
+  // replacing the stubbed count that step previously synthesized.
+  //
+  // ARITY 3 -- SysV rdi/rsi/rdx -> SYSCALL rdi/rsi/rdx (no shuffle).
+  // Matches paideia-os syscall_shim.pdx sys_exec_reconcile_caps (same
+  // SC+ ID 118, added in the same Wave U landing) byte-for-byte.
+  // ==========================================================================
+  pub let sys_exec_reconcile_caps : (u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (child_pid: u64) (child_caps_decl_ptr: u64) (child_caps_decl_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "shell#39 (R90-XREPO.013.M2-001): SC+ ID 118 wrapper, matching paideia-os syscall_shim.pdx sys_exec_reconcile_caps byte-for-byte (same Wave U landing shifted this off the issue-requested 96, which collides with sys_sendto). SysV rdi/rsi/rdx pass through (arity 3 < 4). Kernel body at paideia-os src/kernel/core/cap/reconcile.pdx cap_reconcile_at_exec, landed at R90-XREPO.013.M0-001 -- only the SC+ ID allocation + userspace wrapper were pending, which is exactly what this landing supplies. Sole shell consumer: exec_spawn_and_wait's parent-branch publish step, called with (child_pid, child's caps.decl blob ptr, len) after a successful wait4 reap and before the ex_fp_reconcile fingerprint emission. `cap` capability because the body walks / narrows the child task's cap_table against its declared manifest. Floor-only in the sense that sysno 118's kernel dispatch arm is a follow-up (design/architecture.md style staging, matching sys_yield's own precedent) -- until it lands, this wrapper returns -ENOSYS and the call site's existing stub-count fallback stays load-bearing. Leaf function; SYSCALL clobbers rcx/r11 (both SysV caller-save, harmless). Labels: none.",
+      block: {
+        mov rax, 118;
         syscall;
         ret
       }

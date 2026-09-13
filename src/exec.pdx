@@ -885,84 +885,111 @@ module Exec = structure {
     }
 
   // ==========================================================================
-  // exec_reconcile_publish(count) -> u64  (shell#39 — R90-XREPO.013.M2-001)
+  // exec_reconcile_publish(child_pid, child_caps_decl_ptr, child_caps_decl_len) -> u64
+  //   (shell#39 — R90-XREPO.013.M2-001, wired 2026-09-13)
   //
-  // Signature: exec_reconcile_publish : (u64) -> u64 !{mem, sysreg} @{fs}
-  // RDI (input): count -- reconciled cap-set count for the just-reaped
-  //                       child (today == child_decl_count at
-  //                       exec_narrow_child_caps step (2); when the
-  //                       real sys_exec_reconcile_caps syscall lands,
-  //                       this is the kernel-reported narrowed count).
-  // RAX (output): 0 on success (always today; reserves
-  //                EX_ERR_RECONCILE_FAIL for the future real-syscall
-  //                landing that can genuinely fail).
+  // Signature: exec_reconcile_publish : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap}
+  // RDI (input): child_pid            -- just-reaped child's pid
+  // RSI (input): child_caps_decl_ptr  -- VA of the child's caps.decl wire
+  //                                      blob (0 under today's ENH-005
+  //                                      placeholder inputs; real data
+  //                                      lands when libpdx-cap's caps_decl
+  //                                      parser is wired into exec_
+  //                                      narrow_child_caps step (2))
+  // RDX (input): child_caps_decl_len  -- byte length of that blob (0
+  //                                      today, same reason)
+  // RAX (output): 0 on success, EX_ERR_RECONCILE_FAIL (0xFFFFEC2A) on a
+  //                genuine kernel-side refusal.
   //
   // Body:
-  //   (a) Store `count` at _ex_reconciled_caps_count -- the shell's
-  //       per-job publish slot. A future audit_commit variant or the
-  //       R90-XREPO.013.M4-* boot-smoke can read this without wiring
-  //       a fresh cross-repo channel.
+  //   (0) call sys_exec_reconcile_caps(child_pid, child_caps_decl_ptr,
+  //       child_caps_decl_len). Two outcomes:
+  //         - rax == -ENOSYS (0xFFFFFFFFFFFFFFDA): the kernel dispatch
+  //           arm for SC+ ID 118 is not wired yet (a documented,
+  //           expected gap -- see paideia-os src/user/syscall_shim.pdx
+  //           sys_exec_reconcile_caps's own header). Falls back to
+  //           count = child_caps_decl_len (0 today), which is EXACTLY
+  //           the pre-#39-wiring stubbed behaviour -- no regression.
+  //         - any other negative rax: a genuine kernel-side refusal
+  //           once the dispatch arm is live -> EX_ERR_RECONCILE_FAIL.
+  //         - rax >= 0: the real reconciled cap-set count.
+  //   (a) Store the resolved count at _ex_reconciled_caps_count.
   //   (b) Emit the fingerprint `SHELL RECONCILE n=<count>\n` as three
   //       sys_write(1, ...) calls (prefix, decimal count, newline).
-  //       This is the parent-visible proof the reconciliation gate
-  //       was reached on every child; the paideia-os QEMU boot smoke
-  //       grep-asserts it once the shell is wired into `bin_seeds.pdx`
-  //       (paideia-os-side, sequenced against R90-XREPO.013.M2-001
-  //       adoption of the ls / cat / cp / mv / rm / mkdir / doc
-  //       tools per §5 of design/round-retrospectives/r90-xrepo-
-  //       wave3-plan.md).
   //   (c) Return 0.
   //
-  // What is DEFERRED (documented in §DEFERRALS): the real
-  // sys_exec_reconcile_caps syscall wrapper. The kernel-side
-  // cap_reconcile_at_exec substrate landed at paideia-os R90-XREPO.
-  // 013.M0-001 as a kernel-internal function; its user-space syscall
-  // wrapper waits on a follow-up SC+ ID allocation. When that lands,
-  // this body inserts a `mov rdi, child_pid; call sys_exec_
-  // reconcile_caps` between (a) and (b), then substitutes the
-  // returned count for the caller-supplied `count` (which becomes
-  // the request-count for the wrapper). No caller of this helper
-  // changes; the publish-slot + fingerprint shape stay identical.
-  //
   // Register plan:
-  //   r12 = count (callee-save; carried across sys_write + history_
-  //         format_u64_dec so the fingerprint reads a stable value)
-  //   rbx = pushed only for 16-byte alignment (rsp % 16 == 0 for
-  //         nested SysV calls); unused by the body
+  //   rbx = child_pid       (callee-save; survives the sys_exec_
+  //         reconcile_caps call, then unused)
+  //   r13 = child_caps_decl_len (callee-save; ENOSYS-fallback source,
+  //         also needed after the syscall call clobbers rdx)
+  //   r12 = resolved count  (callee-save; carried across sys_write +
+  //         history_format_u64_dec so the fingerprint reads a stable
+  //         value)
   //
-  // Prologue: 2 callee-save pushes (rbx, r12) + `sub rsp, 8` = 24
-  // bytes. Entry rsp % 16 == 8; after 2 pushes rsp % 16 == 8; `sub
-  // rsp, 8` -> 0. rsp % 16 == 0 at every nested SysV call. Matched
-  // epilogue.
+  // Prologue: 3 callee-save pushes (rbx, r12, r13) + `sub rsp, 8` = 32
+  // bytes. Entry rsp % 16 == 8; after 3 pushes rsp % 16 == 0 already
+  // ((8 - 24) mod 16 == 0); `sub rsp, 8` keeps it at 0 (adds a multiple
+  // of 16... actually moves to 8 - wait: 3 pushes = 24 bytes, (8-24)
+  // mod 16 = 0, so rsp%16==0 BEFORE the sub; `sub rsp, 8` would break
+  // it back to 8. The extra 8-byte pad is therefore dropped in favour
+  // of a bare 3-push prologue (24 bytes) which already lands rsp%16==0
+  // for every nested SysV call with no local scratch needed.
   //
-  // Effect / capability set: {mem, sysreg} + @{fs}. `mem` for the
-  // .bss store at (a) and for the byte-level fingerprint compose at
-  // (b); `sysreg` for the nested sys_write SYSCALLs; @{fs} for
-  // sys_write's kernel-side write path (matches the fork-fingerprint
-  // sys_write sequence in exec_spawn_and_wait). history_format_u64_
-  // dec contributes only !{mem} @{} (leaf, no syscall) -- subsumed.
+  // Effect / capability set widens over the pre-#39-wiring stub: {mem,
+  // sysreg} + @{fs, cap} -- `cap` added because the body now issues a
+  // real (if today ENOSYS-stubbed) sys_exec_reconcile_caps call whose
+  // kernel-side annotation carries @{cap}.
   //
-  // shell_note is NOT bumped in this helper: this is a publish step,
-  // not a spawn attempt / error. The caller (exec_spawn_and_wait)
-  // already bumped SH_ST_SPAWNS at entry and will bump SH_ST_EXITS
-  // on the happy tail after this call returns; a non-zero return
-  // (reserved for the future real-syscall landing) routes to the
-  // EX_ERR_RECONCILE_FAIL reject arm which does its own SH_ST_ERRORS
-  // bump.
+  // shell_note is NOT bumped in the ENOSYS-fallback or success arms
+  // (a publish step, not a spawn attempt); the genuine-refusal arm
+  // does NOT bump SH_ST_ERRORS here either -- the caller's
+  // ex_sw_reconcile_fail arm already does that, matching the existing
+  // EX_ERR_WAIT_FAIL / EX_ERR_FORK_FAIL discipline of bumping errors
+  // at the reject site, not inside the helper that detected them.
   //
   // Labels prefixed ex_rp_.
   // ==========================================================================
-  pub let exec_reconcile_publish : (u64) -> u64 !{mem, sysreg} @{fs} =
-    fn (count: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell#39 (R90-XREPO.013.M2-001): publish the reconciled cap-set count for the just-reaped child to the shell's per-job record and emit the parent-visible fingerprint. Today the helper stubs the real sys_exec_reconcile_caps query -- the kernel-side substrate (paideia-os R90-XREPO.013.M0-001, src/kernel/core/cap/reconcile.pdx cap_reconcile_at_exec) is landed but its user-space syscall wrapper waits on a follow-up SC+ ID allocation; when that lands, the wrapper body inserts a `call sys_exec_reconcile_caps` between the publish and the fingerprint and substitutes the kernel-returned count. Body: (a) store `count` at _ex_reconciled_caps_count; (b) emit three sys_write(1, ...) calls -- ex_fp_reconcile_str+18 bytes, history_format_u64_dec pid rendering into _ex_fp_reconcile_scratch then sys_write(1, scratch, digit_count), ex_fp_nl_str+1 byte; (c) return 0. r12 carries `count` across the sys_write + history_format_u64_dec sequence so the .bss store and the fingerprint read the same value; both syscall wrappers and history_format_u64_dec preserve r12 per SysV callee-save. 2 pushes (rbx, r12) + `sub rsp, 8` = 24 bytes prologue; rsp % 16 == 0 at every nested SysV call. rbx is pushed only for 16-byte alignment (unused by the body); a 1-push + sub 8 shape would also align but 2 pushes matches the shell.pdx convention for helpers that call four SysV siblings in sequence. No shell_note bumps -- this is a publish step, not a spawn / error; the caller already bumped SH_ST_SPAWNS at entry and bumps SH_ST_EXITS on the happy tail. Every compare uses `cmp reg, 0` (paideia-as reserved -- no `test rN, rN`); no `cmp reg, imm` needed in this leaf-ish body. Large immediates absent from the body (sys_write count 18 fits imm32, EX_FP_RECONCILE_LEN 18 same, fingerprint scratch buffer VA via lea rip-relative). Labels prefixed ex_rp_ per reserved-label discipline (loop/if forbidden).",
+  pub let exec_reconcile_publish : (u64, u64, u64) -> u64 !{mem, sysreg} @{fs, cap} =
+    fn (child_pid: u64) (child_caps_decl_ptr: u64) (child_caps_decl_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, cap},
+      justification: "shell#39 (R90-XREPO.013.M2-001), wired 2026-09-13: publish the reconciled cap-set count for the just-reaped child. Calls sys_exec_reconcile_caps(child_pid, child_caps_decl_ptr, child_caps_decl_len) (SC+ ID 118, paideia-os src/user/syscall_shim.pdx same-Wave-U landing). The kernel dispatch arm for 118 does not exist yet, so today's call always returns -ENOSYS (0xFFFFFFFFFFFFFFDA, staged via `mov r11, imm64; cmp rax, r11` per the large-immediate convention); that arm falls back to count = child_caps_decl_len (0 under the current ENH-005 placeholder inputs), which is byte-identical to the pre-#39-wiring stubbed behaviour -- zero regression until the kernel side lands. Any OTHER negative return (a future genuine kernel-side refusal once the dispatch arm exists) routes to EX_ERR_RECONCILE_FAIL. A non-negative return is the real reconciled count. Body: (0) the syscall call + three-way outcome dispatch above; (a) store the resolved count at _ex_reconciled_caps_count; (b) emit three sys_write(1, ...) calls (ex_fp_reconcile_str+18 bytes, decimal count via history_format_u64_dec into _ex_fp_reconcile_scratch then sys_write, ex_fp_nl_str+1 byte); (c) return 0. rbx carries child_pid across the syscall call (needed only for that one call; SysV caller-save rdi/rsi/rdx are clobbered by the call so child_pid/decl_len must live in callee-save regs beforehand). r13 caches child_caps_decl_len for the ENOSYS-fallback arm (rdx is clobbered by the syscall). r12 caches the resolved count across the sys_write + history_format_u64_dec sequence. 3 callee-save pushes (rbx, r12, r13) = 24 bytes; entry rsp%16==8, after 3 pushes rsp%16==0 ((8-24) mod 16 == 0) -- no `sub rsp` needed, unlike the pre-wiring 2-push+sub-8 shape (removing the extra pad because 3 pushes alone already reach the correct alignment; adding a further sub 8 would misalign). Every nested call (sys_exec_reconcile_caps, sys_write, history_format_u64_dec) sees rsp%16==0. Large-immediate ENOSYS sentinel staged via r11 per the reserved-scratch convention. Labels prefixed ex_rp_ per reserved-label discipline.",
       block: {
         push rbx;
         push r12;
-        sub rsp, 8;                          // 24-byte prologue; rsp%16==0
+        push r13;
 
-        mov r12, rdi;                        // count survives sys_write
+        mov rbx, rdi;                        // child_pid
+        mov r13, rdx;                        // child_caps_decl_len (ENOSYS fallback)
 
+        // (0) sys_exec_reconcile_caps(child_pid, child_caps_decl_ptr, child_caps_decl_len)
+        mov rdi, rbx;
+        // rsi already holds child_caps_decl_ptr (untouched SysV arg1)
+        mov rdx, r13;
+        call sys_exec_reconcile_caps;
+
+        mov r11, 0xFFFFFFFFFFFFFFDA;          // -ENOSYS
+        cmp rax, r11;
+        je  ex_rp_enosys_fallback;
+
+        cmp rax, 0;
+        jl  ex_rp_refused;
+
+        mov r12, rax;                        // real reconciled count
+        jmp ex_rp_publish;
+
+      ex_rp_enosys_fallback:
+        mov r12, r13;                        // count = child_caps_decl_len (0 today)
+        jmp ex_rp_publish;
+
+      ex_rp_refused:
+        mov rax, 0xFFFFEC2A;                 // EX_ERR_RECONCILE_FAIL
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      ex_rp_publish:
         // (a) Publish count to _ex_reconciled_caps_count.
         lea r11, [rip + _ex_reconciled_caps_count];
         mov [r11 + 0], r12;
@@ -998,7 +1025,7 @@ module Exec = structure {
 
         // (c) Return 0.
         xor rax, rax;
-        // (add rsp, 8 removed with sub rsp, 8 above — no stack slots in use)
+        pop r13;
         pop r12;
         pop rbx;
         ret
@@ -1025,8 +1052,11 @@ module Exec = structure {
   //                found" convention). Otherwise one of the 0xFFFFEC2x
   //                sentinels (EX_ERR_BAD_ARGV, EX_ERR_ARGV_OVERFLOW,
   //                EX_ERR_AUDIT_BEGIN_FAIL, EX_ERR_FORK_FAIL,
-  //                EX_ERR_WAIT_FAIL, EX_ERR_RECONCILE_FAIL [shell#39
-  //                reserved -- unreachable in the M0-stub landing]) or
+  //                EX_ERR_WAIT_FAIL, EX_ERR_RECONCILE_FAIL [shell#39 --
+  //                reachable only once sys_exec_reconcile_caps' kernel
+  //                dispatch arm (SC+ 118) lands and genuinely refuses;
+  //                today's -ENOSYS response takes the fallback path
+  //                instead]) or
   //                a propagated exec_narrow_child_caps sentinel
   //                (EX_ERR_MISSING_CAP, EX_ERR_WIDENING,
   //                EX_ERR_SIDECAR_FULL). EX_ERR_EXECVE_FAIL is retired
@@ -1366,19 +1396,26 @@ module Exec = structure {
         mov rsi, r15;                        // exit_status
         call jb_close_job;
 
-        // (6a) shell#39 (R90-XREPO.013.M2-001): publish the child's
-        // reconciled cap-set count. Today the count == child_decl_
-        // count from step (2) (0 under the ENH-005 placeholder
-        // inputs); when the real sys_exec_reconcile_caps syscall
-        // lands, exec_reconcile_publish substitutes a kernel-
-        // reported count without changing this call site.
+        // (6a) shell#39 (R90-XREPO.013.M2-001), wired 2026-09-13: call
+        // sys_exec_reconcile_caps(child_pid, child_caps_decl_ptr,
+        // child_caps_decl_len) through exec_reconcile_publish. rbx
+        // (child_pid) is still live from the parent branch. Reuses the
+        // SAME (_ex_child_decl, 0) placeholder pair step (2) passed to
+        // exec_narrow_child_caps -- until libpdx-cap's caps_decl parser
+        // is wired into that step, there is no real per-child manifest
+        // blob to point at, so the reconcile call degrades to the
+        // documented ENOSYS-fallback path inside exec_reconcile_publish
+        // (count = child_caps_decl_len = 0), matching today's pre-
+        // wiring behaviour exactly.
         //
         // Non-zero return -> EX_ERR_RECONCILE_FAIL after an exit=127
         // audit close (same discipline as EX_ERR_WAIT_FAIL). Success
         // preserves r15 (the child's exit_code) across the publish
-        // call: exec_reconcile_publish is a leaf-shaped SysV callee
-        // that preserves r15 per callee-save rules.
-        xor rdi, rdi;                        // count = 0 (child_decl_count today)
+        // call: exec_reconcile_publish preserves r15 per callee-save
+        // rules (it never touches r14/r15).
+        mov rdi, rbx;                        // child_pid
+        lea rsi, [rip + _ex_child_decl];     // child_caps_decl_ptr (placeholder)
+        mov rdx, 0;                          // child_caps_decl_len (placeholder)
         call exec_reconcile_publish;
         cmp rax, 0;
         jne ex_sw_reconcile_fail;

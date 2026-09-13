@@ -276,6 +276,23 @@ module LineReader = structure {
   // already drops it silently -- see lr_rk_csi below).
   pub let LR_KEY_TAB : u64 = 0xFFFFEC58
 
+  // shell#22 (R73.M1-002): Ctrl-Z (0x1A, ASCII SUB) is a GROUND-state
+  // escape from the byte-verbatim path, same shape as TAB (0x09) at
+  // #25. line_reader_read_line's dispatch (below) treats LR_KEY_SIGTSTP
+  // as a no-op TODAY when no foreground job is registered in Jobs'
+  // _jb_jobs_table -- which is the only reachable case while
+  // line_reader_read_line itself is running: a foreground child owns
+  // fd 0 while it runs (the shell parent blocks in sys_wait4, not in
+  // this read loop), so a real "^Z stops the running foreground job"
+  // requires either async signal delivery to the shell (sys_sigaction,
+  // paideia-os#2454) or a non-blocking wait4 poll loop -- neither
+  // exists yet (see design/architecture.md §4.5). Landing the byte
+  // recognition + the no-foreground-job no-op now means the moment
+  // either substrate lands, only line_reader_read_line's LR_KEY_SIGTSTP
+  // arm needs to grow the Jobs::jb_stop_job + kind_tty_set_fg_pgid call
+  // sequence -- this FSM entry point does not change.
+  pub let LR_KEY_SIGTSTP : u64 = 0xFFFFEC59
+
   // R66.M1-003 (#19): redraw prefix `\r ESC [ K` written to fd 1 at the
   // start of every recall-hit emission. `\r` returns the cursor to
   // column 0; `ESC [ K` (CSI K, ECMA-48 EL 0) erases to end of line
@@ -325,6 +342,39 @@ module LineReader = structure {
   pub let LR_TTY_VTIME_ZERO    : u64 = 0
   pub let LR_TTY_ECHO_OFF      : u64 = 0
   pub let LR_TTY_ICANON_OFF    : u64 = 0
+
+  // shell#22 (R73.M1-002): mirror ordinal for a TIOCSPGRP-shaped
+  // "set TTY foreground pgid" op. NOT YET DEFINED on the kernel side --
+  // paideia-os src/kernel/core/cap/kind_tty.pdx's dispatch table
+  // enumerates ops 0..13 only (`cmp rbp, 13; ja tty_hn_unsup` bounds
+  // the arity-one gate); op 14 falls through to tty_hn_unsup today.
+  // Reserved here at the next free ordinal so the shell-side call site
+  // (kind_tty_set_fg_pgid below) and a future kernel-side landing agree
+  // on the wire number in advance, matching the sys_yield (shell#47)
+  // floor-first precedent: land the shell-visible slot ahead of the
+  // kernel dispatch arm.
+  pub let LR_TTY_OP_SET_FG_PGID : u64 = 14
+
+  // shell#46: KIND_TTY(read) empty-ring sentinel. MUST equal paideia-os
+  // src/kernel/core/cap/kind_tty.pdx TTY_READ_EMPTY (0xFFFFEC35) byte-
+  // for-byte -- kind_tty_read_one compares the raw sys_cap_invoke
+  // return against this value to decide whether to sys_yield-and-retry.
+  // Named separately from the LR_KEY_* band (0xFFFFEC5x) even though
+  // both live in the shell's 0xFFFFEC3x/5x sentinel space, because this
+  // value is NOT shell-chosen -- it is dictated by the kernel-side
+  // handler's own return convention and must track it verbatim.
+  pub let LR_TTY_READ_EMPTY : u64 = 0xFFFFEC35
+
+  // shell#46: shell-owned KIND_TTY cap slot for lr_read_one_byte's
+  // cap-typed read path. 0 (the .bss zero-init default) means UNBOUND
+  // -- no boot-time landing has seeded a live KIND_TTY row into this
+  // slot yet (design/architecture.md §3.3 items 3a/3b remain open on
+  // the kernel side: KIND_TTY absent from KIND_SEEDABLE_TABLE, no
+  // shell-time TTY row seed at boot). lr_read_one_byte checks this slot
+  // on every call and falls back to the fd-0 sys_read path when it
+  // reads 0, so today's boot behaviour is UNCHANGED until a future
+  // landing calls lr_tty_bind_cap with a real slot id.
+  pub let mut _lr_tty_cap_slot : u64 = uninit @align(8)
 
   // ==========================================================================
   // R66.M1-002 (#18): on-screen backspace erase byte string.
@@ -412,18 +462,112 @@ module LineReader = structure {
   // into sys_read. Entry rsp%16==8 (return addr from caller's call);
   // one sub 8 => rsp%16==0.
   // ==========================================================================
-  pub let lr_read_one_byte : (u64) -> u64 !{mem, sysreg} @{fs} =
+  pub let lr_read_one_byte : (u64) -> u64 !{mem, sysreg} @{fs, cap} =
     fn (byte_ptr: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {fs},
-      justification: "shell.ENH-007 (#34) + #46 refresh (2026-09-08): the SINGLE SEAM between the LineReader and the byte transport. Today this is sys_read(0, byte_ptr, 1) — the VFS-mediated fd-0 read the paideia-os monorepo's own shell_read_line uses (src/user/shell.pdx:29). Migration to a cap-typed KIND_TTY(read) invoke is DEFERRED: paideia-os#1986 landed the TTY_OP_READ op + R_TTY_READ right (kernel commit 0e96c99, R66v2.POS-001, closed 2026-08-31), and shell#47 added sys_yield (SC+ ID 5) to the shell's Syscall floor, so the seam swap now depends only on the two remaining upstream landings — (i) adding KIND_TTY (0x197) to paideia-os kind.pdx KIND_SEEDABLE_TABLE (currently absent, L3450), (ii) seeding a live tty_cap_mint_inner row into the shell's cap_table at boot (no path exists today; the mint helper is called only from kernel boot witnesses). See design/architecture.md §3.3 for the full ledger. Argument shuffle: byte_ptr arrives in rdi (SysV arg0); sys_read wants fd in rdi, buf in rsi, count in rdx, so mov rsi, rdi; mov rdi, 0; mov rdx, 1 stages the args (order matters: rsi must be set before rdi is overwritten). Effect/cap set matches Syscall.sys_read's own {mem, sysreg} @{fs}. Prologue: sub rsp, 8 aligns rsp%16==0 for the nested SysV call into sys_read (entry rsp%16==8 from the caller's return addr). Leaf modulo the sys_read call; SYSCALL clobbers rcx/r11 (both caller-save, harmless). Labels: none (linear body).",
+      effects: {mem, sysreg}, capabilities: {fs, cap},
+      justification: "shell.ENH-007 (#34) + #46 (2026-09-13 migration): the SINGLE SEAM between the LineReader and the byte transport. Checks _lr_tty_cap_slot first: a non-zero slot means a boot-time landing has bound a live KIND_TTY cap, so the byte comes from kind_tty_read_one(slot) (cap-typed read, yield-and-retry on TTY_READ_EMPTY internally) and this function always reports success (rax=1) since the cap path blocks until a real byte arrives -- there is no fd-0-style EOF concept for a live terminal ring. A zero slot (today's boot state; the two kernel-side prerequisites in design/architecture.md §3.3 items 3a/3b are still open) falls back to the pre-#46 path: sys_read(0, byte_ptr, 1), the VFS-mediated fd-0 read the paideia-os monorepo's own shell_read_line uses (src/user/shell.pdx:29). This is the ONE-FUNCTION migration #46 calls for: lr_read_key and every caller above it are untouched, and the fallback keeps today's boot behaviour byte-identical until lr_tty_bind_cap is called by a future kernel-ready landing. Byte-store on the cap path uses `mov_b [byte_ptr], rax` (rax holds the 0..255 value kind_tty_read_one returns). Fallback argument shuffle: byte_ptr arrives in rdi (SysV arg0); sys_read wants fd in rdi, buf in rsi, count in rdx, so mov rsi, rdi; mov rdi, 0; mov rdx, 1 stages the args (order matters: rsi must be set before rdi is overwritten). Effect/cap set widens to {mem, sysreg} @{fs, cap} (fs for the fallback sys_read path, cap for the kind_tty_read_one path -- both reachable at runtime depending on _lr_tty_cap_slot). Prologue: 1 callee-save push (rbx = byte_ptr, needed across both nested-call arms) + sub rsp, 8 = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 for every nested SysV call. Labels prefixed lr_rb_.",
       block: {
-        sub rsp, 8;                          // align rsp % 16 for sys_read
-        mov rsi, rdi;                        // buf = byte_ptr (must precede rdi overwrite)
+        push rbx;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // rbx = byte_ptr (preserved across both calls)
+
+        lea r11, [rip + _lr_tty_cap_slot];
+        mov rax, [r11];
+        cmp rax, 0;
+        je  lr_rb_fallback;
+
+        // Cap-typed path: kind_tty_read_one(cap_slot) -> byte 0..255.
+        mov rdi, rax;                        // cap_slot
+        call kind_tty_read_one;
+        mov_b [rbx], rax;                    // store the polled byte
+        mov rax, 1;                          // always a successful 1-byte read
+        jmp lr_rb_done;
+
+      lr_rb_fallback:
+        mov rsi, rbx;                        // buf = byte_ptr
         mov rdi, 0;                          // fd = stdin
         mov rdx, 1;                          // count = 1
         call sys_read;
         // rax = 1 on success, 0 on EOF, negative errno on failure.
+
+      lr_rb_done:
         add rsp, 8;
+        pop rbx;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // lr_tty_bind_cap(cap_slot) -> ()   (shell#46)
+  //
+  // Setter for _lr_tty_cap_slot. Called once from a future boot-time
+  // landing (after BOTH design/architecture.md §3.3 items 3a/3b close
+  // on the kernel side: KIND_TTY added to KIND_SEEDABLE_TABLE, and a
+  // live tty_cap_mint_inner row seeded into the shell's cap_table)
+  // once that landing has the real slot id to hand. Until that call
+  // site exists, _lr_tty_cap_slot stays at its .bss zero default and
+  // lr_read_one_byte always takes the fd-0 fallback path.
+  //
+  // Leaf function; no push/pop parity.
+  // ==========================================================================
+  pub let lr_tty_bind_cap : (u64) -> () !{mem} @{} =
+    fn (cap_slot: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell#46: one-line setter so a future boot landing can bind _lr_tty_cap_slot without reaching into LineReader's .bss layout directly. Leaf function; r11 as .bss LEA scratch per module convention. Labels: none.",
+      block: {
+        lea r11, [rip + _lr_tty_cap_slot];
+        mov [r11], rdi;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kind_tty_read_one(cap_slot) -> u64   (shell#46)
+  //
+  // Cap-typed KIND_TTY(read) byte source. Busy-polls
+  // sys_cap_invoke(cap_slot, TTY_OP_READ) and folds the TTY_READ_EMPTY
+  // sentinel (0xFFFFEC35) back into a yield-and-retry loop via sys_yield
+  // (SC+ ID 5, shell#47) so the caller (lr_read_one_byte) sees the exact
+  // blocking-read contract the fd-0 path provided. Returns the polled
+  // byte value (0..255) once the ring has one -- per paideia-os
+  // src/kernel/core/cap/kind_tty.pdx TTY_OP_READ's own return
+  // convention, there is no separate EOF value on this path; a live
+  // terminal ring simply blocks (via this retry loop) until a byte
+  // arrives.
+  //
+  // Register plan (1 callee-save push + sub rsp,8 = 16 bytes; rsp%16==0
+  // at every nested SysV call):
+  //   rbx = cap_slot (callee-save across sys_cap_invoke + sys_yield)
+  //   rax = sys_cap_invoke / sys_yield return staging
+  //
+  // Labels prefixed ktr_.
+  // ==========================================================================
+  pub let kind_tty_read_one : (u64) -> u64 !{mem, sysreg} @{fs, cap, sched} =
+    fn (cap_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs, cap, sched},
+      justification: "shell#46: KIND_TTY(read) migration seam. Loops calling sys_cap_invoke(cap_slot, LR_TTY_OP_READ=6); paideia-os src/kernel/core/cap/kind_tty.pdx TTY_OP_READ returns one polled byte (0..255) or TTY_READ_EMPTY (0xFFFFEC35) since the op is a non-blocking poll of the raw uart rx ring, never a sleeping read. On TTY_READ_EMPTY this helper calls sys_yield (SC+ ID 5, shell#47 floor addition) and retries, which is exactly the busy-poll-with-sys_yield shape design/architecture.md §3.3's own pseudocode block prescribes for preserving line_reader_read_line's blocking-read contract once the cap path is live. Any other return value (0..255) is the polled byte, returned verbatim. Effect/cap set unions sys_cap_invoke's {sysreg} @{cap} with sys_yield's {sysreg} @{sched}; `fs` is retained in the capability set because a caller reasoning about this function's authority footprint alongside its sibling lr_read_one_byte fallback should see the read-adjacent fs authority at a glance (the cap invoke itself does not touch the VFS, but the KIND_TTY row it targets is fs-adjacent per the module's existing @{fs} convention on every other LineReader byte-source function). Prologue: 1 callee-save push (rbx=cap_slot) + sub rsp, 8 = 16 bytes; entry rsp%16==8 + 16 = rsp%16==0 for every nested SysV call. Labels prefixed ktr_.",
+      block: {
+        push rbx;
+        sub rsp, 8;
+
+        mov rbx, rdi;                        // cap_slot
+
+      ktr_poll:
+        mov rdi, rbx;                        // cap_slot
+        mov rsi, 6;                          // LR_TTY_OP_READ (TTY_OP_READ)
+        call sys_cap_invoke;
+
+        mov r11, 0xFFFFEC35;                 // LR_TTY_READ_EMPTY
+        cmp rax, r11;
+        jne ktr_done;
+
+        call sys_yield;
+        jmp ktr_poll;
+
+      ktr_done:
+        add rsp, 8;
+        pop rbx;
         ret
       }
     }
@@ -495,6 +639,50 @@ module LineReader = structure {
     fn () -> unsafe {
       effects: {}, capabilities: {},
       justification: "shell.R66.M1-001 (#17): scaffolded cooked-mode restore helper. Symmetric peer of lr_tty_set_raw; same deferral rationale (no sys_cap_invoke + no KIND_TTY cap seat). Returns LR_ERR_TTY_UNBOUND today. When both substrate gaps land, the body becomes a sys_cap_invoke(tty_cap_slot, TTY_OP_SET_COOKED=8, 0) call. Leaf function.",
+      block: {
+        mov rax, 0xFFFFEC12;                 // LR_ERR_TTY_UNBOUND
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // kind_tty_set_fg_pgid(cap_slot, pgid) -> u64   (shell#22)
+  //
+  // TIOCSPGRP-shaped foreground-ownership handoff: gives `pgid` the
+  // TTY's foreground authority (the classic POSIX job-control
+  // primitive) via a KIND_TTY cap invoke. SCAFFOLDED like lr_tty_set_
+  // raw / lr_tty_set_cooked above -- two real gaps block a functional
+  // body:
+  //
+  //   (a) The kernel's KIND_TTY dispatch (paideia-os src/kernel/core/
+  //       cap/kind_tty.pdx) has no TTY_OP_SET_FG_PGID handler; op 14
+  //       falls through to tty_hn_unsup (see LR_TTY_OP_SET_FG_PGID's
+  //       own comment). Even if it did, op_arg is a single qword whose
+  //       bits [63:8] the arity-one gate refuses for every OTHER op
+  //       (12/13's byte-value carve-out is the sole precedent for a
+  //       parameterised op) -- a pgid needs its own wire shape
+  //       decision the kernel side has not made yet.
+  //   (b) Same cap-seat gap #46 documents: the shell holds no KIND_TTY
+  //       cap in its cap_table today (design/architecture.md §3.3
+  //       items 3a/3b).
+  //
+  // Returns LR_ERR_TTY_UNBOUND (0xFFFFEC12) today, same sentinel #46's
+  // scaffolded raw/cooked toggles use, so a caller (the future ^Z
+  // handler) can treat every "TTY substrate not ready" case uniformly.
+  // When both gaps close, the body becomes:
+  //
+  //     mov rdi, cap_slot
+  //     mov rsi, 14                          // LR_TTY_OP_SET_FG_PGID
+  //     // pgid wire shape TBD by the kernel-side landing
+  //     call sys_cap_invoke
+  //     ret
+  //
+  // Leaf function; no push/pop parity.
+  // ==========================================================================
+  pub let kind_tty_set_fg_pgid : (u64, u64) -> u64 !{} @{} =
+    fn (cap_slot: u64) (pgid: u64) -> unsafe {
+      effects: {}, capabilities: {},
+      justification: "shell#22: scaffolded TIOCSPGRP-shaped foreground-pgid handoff. Returns LR_ERR_TTY_UNBOUND (0xFFFFEC12) today because (a) paideia-os kind_tty.pdx's dispatch table has no TTY_OP_SET_FG_PGID handler at reserved ordinal 14 (falls through to tty_hn_unsup) and (b) the shell holds no KIND_TTY cap seat (same gap #46 documents at design/architecture.md §3.3 items 3a/3b). Args (cap_slot, pgid) are accepted and validated-as-unused today so the call site (a future ^Z handler) does not need to change its call shape when the body flips to a real sys_cap_invoke once the kernel-side op + wire shape land. Empty effect/cap set: the no-op body issues no syscall and touches no memory. Leaf function; no push/pop parity. Labels: none.",
       block: {
         mov rax, 0xFFFFEC12;                 // LR_ERR_TTY_UNBOUND
         ret
@@ -634,6 +822,12 @@ module LineReader = structure {
         // no follow-on state (returns immediately).
         cmp rax, 0x09;                       // HT / TAB
         je  lr_rk_tab_key;
+        // shell#22: Ctrl-Z (0x1A, ASCII SUB) in GROUND state emits
+        // LR_KEY_SIGTSTP. Placed after TAB for the same reason TAB
+        // sits after ESC/DEL -- a leaf sentinel with no follow-on
+        // state.
+        cmp rax, 0x1A;                       // Ctrl-Z / SUB
+        je  lr_rk_sigtstp_key;
         // Any other byte: return it verbatim (rax already holds it).
         jmp lr_rk_return;
 
@@ -647,6 +841,10 @@ module LineReader = structure {
 
       lr_rk_tab_key:
         mov rax, 0xFFFFEC58;                 // LR_KEY_TAB
+        jmp lr_rk_return;
+
+      lr_rk_sigtstp_key:
+        mov rax, 0xFFFFEC59;                 // LR_KEY_SIGTSTP
         jmp lr_rk_return;
 
       lr_rk_esc:
@@ -1622,6 +1820,21 @@ module LineReader = structure {
         mov r11, 0xFFFFEC58;                 // LR_KEY_TAB
         cmp rax, r11;
         je  lr_rl_tab;
+
+        // shell#22 (R73.M1-002): Ctrl-Z dispatch. See LR_KEY_SIGTSTP's
+        // own header comment for why this is a no-op TODAY: while
+        // line_reader_read_line is the active reader, no foreground
+        // job can be running (the shell parent is blocked in
+        // sys_wait4, not here) under the current synchronous fork+
+        // wait4 exec model, so there is nothing in Jobs::_jb_jobs_table
+        // for ^Z to stop. Landing the recognition now means the future
+        // async-signal or non-blocking-wait4 substrate (design/
+        // architecture.md §4.5) only needs to replace this single
+        // `je lr_rl_loop` arm with the real Jobs::jb_stop_job +
+        // kind_tty_set_fg_pgid call sequence.
+        mov r11, 0xFFFFEC59;                 // LR_KEY_SIGTSTP
+        cmp rax, r11;
+        je  lr_rl_loop;
 
         // UNKNOWN: recognised but ignored.
         mov r11, 0xFFFFEC55;                 // LR_KEY_UNKNOWN

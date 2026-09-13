@@ -174,6 +174,38 @@ module Jobs = structure {
   pub let mut _jb_jobs_table : [u64; 48] = uninit @align(64)
 
   // ==========================================================================
+  // R73.M1-002 (shell#22): per-job process-group tracking.
+  //
+  // Parallel array (same idiom as Dispatch::_bi_names / _bi_name_lens /
+  // _bi_handlers) rather than widening _jb_jobs_table's 24-byte row --
+  // widening the row would ripple the i*24 offset math into every
+  // existing consumer (builtins.pdx bi_jb_list / bi_bg / bi_fg, this
+  // module's own jb_add_job / jb_close_job / jb_pid_of_jid), all of
+  // which are already landed and tested. _jb_jobs_pgid[slot] mirrors
+  // _jb_jobs_table's slot indexing 1:1 (slot = jid - 1); a slot's pgid
+  // is meaningful exactly when the corresponding _jb_jobs_table row is
+  // active (jid != 0).
+  //
+  // At this landing every job is a single process (no pipeline support
+  // yet -- that lands with #2451's pipe/fork-per-stage work), so a
+  // job's pgid equals its own leader pid: jb_add_job populates
+  // _jb_jobs_pgid[slot] = pid at add-time. jb_set_pgid exists as a
+  // separate mutator so a future multi-process-per-job landing (a
+  // pipeline where only the FIRST forked child becomes the pgid leader
+  // and subsequent stages join it) can override the auto-populated
+  // value without changing jb_add_job's signature.
+  // ==========================================================================
+  pub let mut _jb_jobs_pgid : [u64; 16] = uninit @align(64)
+
+  // The pgid currently holding TTY foreground ownership, or 0 meaning
+  // "the shell itself" (no job has been given the foreground via
+  // kind_tty_set_fg_pgid). Read by a future bi_fg landing to decide
+  // whether an fg target is already foreground; written by the ^Z
+  // stop path (jb_stop_job) and by fg/bg builtins (#23) when they hand
+  // foreground ownership back and forth.
+  pub let mut _jb_foreground_pgid : u64 = uninit @align(8)
+
+  // ==========================================================================
   // Fingerprint rodata blobs
   //
   // Each `[u8; N]` = strlen + 1 per the paideia-as fingerprint-string
@@ -455,6 +487,15 @@ module Jobs = structure {
         mov rcx, 1;                          // JB_STATE_BG (exit_status = 0)
         mov [rax + 16], rcx;                 // row[+16] = state fused
 
+        // shell#22: pgid defaults to the job's own leader pid (single-
+        // process-per-job model; #2451 pipelines override via
+        // jb_set_pgid). Slot index still in r12.
+        mov rax, r12;
+        shl rax, 3;                          // slot * 8 (pgid array is u64-indexed)
+        lea r11, [rip + _jb_jobs_pgid];
+        add rax, r11;
+        mov [rax], rbx;                      // _jb_jobs_pgid[slot] = pid
+
         // Emit fingerprint. Order: (jid, pid, state).
         mov rdi, r12;
         add rdi, 1;                          // jid
@@ -624,6 +665,184 @@ module Jobs = structure {
         ret;
       jb_pj_none:
         xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jb_pgid_of_jid(jid) -> u64   (shell#22)
+  //
+  // Signature: jb_pgid_of_jid : (u64) -> u64 !{mem} @{}
+  // RDI (input): jid  -- job identifier (1..JB_TABLE_MAX)
+  // RAX (output): pgid on success, or 0 if the jid is not active (same
+  //               validity rule as jb_pid_of_jid: jid==0, out of range,
+  //               or a free row all return 0).
+  //
+  // O(1) lookup into the parallel _jb_jobs_pgid array, gated by the
+  // SAME jid-active check jb_pid_of_jid performs against
+  // _jb_jobs_table (a free row's pgid slot is stale, not
+  // authoritative, until jb_add_job repopulates it).
+  //
+  // Leaf function; no push/pop parity. Labels prefixed jb_pg_.
+  // ==========================================================================
+  pub let jb_pgid_of_jid : (u64) -> u64 !{mem} @{} =
+    fn (jid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell#22: O(1) jid->pgid resolver over the parallel _jb_jobs_pgid array. Validity gate mirrors jb_pid_of_jid exactly (jid==0, jid > JB_TABLE_MAX, or _jb_jobs_table row's jid field == 0 all return 0) so a caller cannot read a stale pgid left behind by a freed row. Slot byte offset (jid-1)*8 via a single shl 3 (pgid array is u64-indexed, no *24 row-size multiply needed). Leaf function; r11 as .bss LEA scratch. Labels prefixed jb_pg_.",
+      block: {
+        cmp rdi, 0;
+        je  jb_pg_none;
+        cmp rdi, 16;                         // JB_TABLE_MAX
+        ja  jb_pg_none;
+
+        // Confirm the row is active (jid field matches) before trusting
+        // the pgid slot.
+        mov rax, rdi;
+        sub rax, 1;
+        shl rax, 3;                          // slot * 8
+        lea rax, [rax + rax * 2];            // slot * 24 -> _jb_jobs_table row_base offset
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;
+        mov rcx, [rax];                      // stored jid
+        cmp rcx, rdi;
+        jne jb_pg_none;
+
+        // Active: read _jb_jobs_pgid[jid - 1].
+        mov rax, rdi;
+        sub rax, 1;
+        shl rax, 3;                          // slot * 8 (pgid array is u64-indexed)
+        lea r11, [rip + _jb_jobs_pgid];
+        add rax, r11;
+        mov rax, [rax];
+        ret;
+      jb_pg_none:
+        xor rax, rax;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jb_set_pgid(jid, pgid) -> ()   (shell#22)
+  //
+  // Signature: jb_set_pgid : (u64, u64) -> () !{mem} @{}
+  // RDI (input): jid   -- job identifier (1..JB_TABLE_MAX)
+  // RSI (input): pgid  -- new process-group id for the job
+  //
+  // Unconditional overwrite of _jb_jobs_pgid[jid - 1]; no validity
+  // gate against _jb_jobs_table (a caller that races a set against a
+  // row free is a caller bug, same as jb_add_job's own no-gate row
+  // write pattern). jid outside 1..JB_TABLE_MAX is a silent no-op
+  // (defensive: never writes outside the 16-slot array).
+  //
+  // Sole consumer today: a future #2451 pipeline landing, where the
+  // first forked stage becomes the pgid leader and later stages call
+  // this to join it. Reserved now so #22's job-table shape does not
+  // need a second migration when pipelines land.
+  //
+  // Leaf function; no push/pop parity. Labels prefixed jb_sp_.
+  // ==========================================================================
+  pub let jb_set_pgid : (u64, u64) -> () !{mem} @{} =
+    fn (jid: u64) (pgid: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "shell#22: mutator for the parallel _jb_jobs_pgid array, reserved for #2451's pipeline landing (first-stage-is-leader join). jid outside 1..JB_TABLE_MAX is a silent no-op (defensive bound check, avoids an out-of-array write); no _jb_jobs_table activity gate since a caller races a set against a row free at its own risk (same discipline jb_add_job's row write already accepts). Leaf function; r11 as .bss LEA scratch. Labels prefixed jb_sp_.",
+      block: {
+        cmp rdi, 0;
+        je  jb_sp_done;
+        cmp rdi, 16;                         // JB_TABLE_MAX
+        ja  jb_sp_done;
+
+        mov rax, rdi;
+        sub rax, 1;
+        shl rax, 3;                          // slot * 8
+        lea r11, [rip + _jb_jobs_pgid];
+        add rax, r11;
+        mov [rax], rsi;                      // _jb_jobs_pgid[slot] = pgid
+      jb_sp_done:
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // jb_stop_job(pid) -> u64   (shell#22)
+  //
+  // Signature: jb_stop_job : (u64) -> u64 !{mem, sysreg} @{fs} =
+  // RDI (input): pid  -- foreground child pid the ^Z path is stopping
+  // RAX (output): JB_OK (0) on hit, JB_ERR_NO_ROW (0xFFFFECFC) if no
+  //               row matches pid.
+  //
+  // Peer of jb_close_job for the ^Z (SIGTSTP-shaped) transition: marks
+  // the row JB_STATE_STOPPED WITHOUT freeing it (unlike jb_close_job's
+  // WAITED transition, a stopped job stays live in the table so a
+  // later `bg`/`fg` (#23) can resume it). exit_status is left
+  // untouched (a stopped job has not exited; the high-32 bits of the
+  // fused state qword keep whatever was there, which is 0 for a job
+  // that has never completed). Emits shell_fp_job_ok(jid, pid,
+  // JB_STATE_STOPPED) and bumps SH_ST_JOBS_COMPLETED is deliberately
+  // NOT bumped here (the job has not completed) -- callers that want a
+  // stop-specific counter can add one when the ^Z call site lands
+  // above the current documented gap (kernel-side SIGTSTP delivery /
+  // async wait4 interruption; see design/architecture.md §4.5).
+  //
+  // Row byte offset i*24 via shl 3 + lea [rax+rax*2], same shape as
+  // jb_close_job. Labels prefixed jb_sj_.
+  // ==========================================================================
+  pub let jb_stop_job : (u64) -> u64 !{mem, sysreg} @{fs} =
+    fn (pid: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "shell#22: ^Z (SIGTSTP-shaped) row transition. Peer of jb_close_job but sets state=JB_STATE_STOPPED (2) instead of WAITED (3) and does NOT free the row (jid stays nonzero) since a stopped job remains resumable via #23's bg/fg builtins. Walks _jb_jobs_table for the row matching pid (same scan shape as jb_close_job); JB_ERR_NO_ROW on no match. On hit, ORs the fused state slot's low 32 bits to 2 while preserving the high-32 exit_status bits (which are meaningless for a never-exited job but preserved for symmetry): `mov rcx, [row+16]; mov r10, 0xFFFFFFFF00000000; and rcx, r10; or rcx, 2; mov [row+16], rcx`. Emits shell_fp_job_ok(jid, pid, JB_STATE_STOPPED) as the transition witness. Does not bump SH_ST_JOBS_COMPLETED (job has not completed); a future stop-specific counter is a documented follow-up, not added here to avoid inventing a counter slot ahead of design/architecture.md §5's ledger. Prologue: 3 callee-save pushes (rbx pid, r12 slot, r13 row_base) = 24 bytes; entry rsp%16==8 + 24 = rsp%16==0 at nested SysV calls (shell_fp_job_ok). Labels prefixed jb_sj_.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                        // pid
+
+        xor r12, r12;                        // slot = 0
+      jb_sj_scan:
+        cmp r12, 16;                          // JB_TABLE_MAX
+        jae jb_sj_no_row;
+        mov rax, r12;
+        shl rax, 3;
+        lea rax, [rax + rax * 2];
+        lea r11, [rip + _jb_jobs_table];
+        add rax, r11;
+        mov r13, rax;                         // r13 = row_base
+        mov rcx, [rax];                       // jid
+        cmp rcx, 0;
+        je  jb_sj_next;
+        mov rcx, [rax + 8];                   // row pid
+        cmp rcx, rbx;
+        je  jb_sj_found;
+      jb_sj_next:
+        add r12, 1;
+        jmp jb_sj_scan;
+
+      jb_sj_found:
+        // Preserve high-32 exit_status bits; set low-32 state to 2.
+        mov rcx, [r13 + 16];
+        mov r10, 0xFFFFFFFF00000000;
+        and rcx, r10;
+        or  rcx, 2;                           // JB_STATE_STOPPED
+        mov [r13 + 16], rcx;
+
+        // Fingerprint: (jid, pid, JB_STATE_STOPPED).
+        mov rdi, r12;
+        add rdi, 1;                           // jid
+        mov rsi, rbx;                         // pid
+        mov rdx, 2;                           // JB_STATE_STOPPED
+        call shell_fp_job_ok;
+
+        xor rax, rax;                         // JB_OK
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      jb_sj_no_row:
+        mov rax, 0xFFFFECFC;                  // JB_ERR_NO_ROW
+        pop r13;
+        pop r12;
+        pop rbx;
         ret
       }
     }
